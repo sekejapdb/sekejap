@@ -509,6 +509,49 @@ pub(crate) fn parse_interval(text: &str) -> SqlResult2<i64> {
 }
 
 // ── §4.1 string functions ─────────────────────────────────────────────────
+//
+// One implementation each, called by the SQL row functions
+// (`compile/row.rs`) and the GQL expression pack (`gql/scalar.rs`) alike;
+// each side only reads its own values as text first.
+
+/// `lower(s)`: Unicode lower case, as PostgreSQL's under a UTF-8 database.
+pub(crate) fn lower(s: &str) -> String {
+    s.to_lowercase()
+}
+
+/// `upper(s)`: Unicode upper case.
+pub(crate) fn upper(s: &str) -> String {
+    s.to_uppercase()
+}
+
+/// `trim(s)`: spaces off both ends -- PostgreSQL's one-argument `trim`
+/// removes spaces only, not tabs or newlines.
+pub(crate) fn trim(s: &str) -> String {
+    s.trim_matches(' ').to_owned()
+}
+
+/// `concat(a, b, ...)`: the arguments' texts in order; a NULL argument
+/// (`None`) adds nothing, as PostgreSQL's `concat` skips it.
+pub(crate) fn concat(parts: impl IntoIterator<Item = Option<String>>) -> String {
+    parts.into_iter().flatten().collect()
+}
+
+/// PostgreSQL's boolean input (`boolin`): around any white space and in any
+/// case, `1` or `0`, `on`, a prefix of `off` of two letters or more, or any
+/// prefix of `true`, `false`, `yes` or `no`. `None` for anything else,
+/// including `o`, which is `on` and `off` both.
+pub(crate) fn parse_bool(text: &str) -> Option<bool> {
+    let word = text.trim().to_ascii_lowercase();
+    match word.as_str() {
+        "" => None,
+        "1" | "on" => Some(true),
+        "0" => Some(false),
+        _ if word.len() >= 2 && "off".starts_with(&word) => Some(false),
+        _ if "true".starts_with(&word) || "yes".starts_with(&word) => Some(true),
+        _ if "false".starts_with(&word) || "no".starts_with(&word) => Some(false),
+        _ => None,
+    }
+}
 
 /// `length(s)`: CHARACTERS, as Postgres counts them for `text`, not bytes.
 pub(crate) fn length(s: &str) -> i64 {
@@ -655,7 +698,39 @@ pub(crate) fn like_prefix(pattern: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    /// PostgreSQL's one-argument `trim` removes spaces only: a tab or a
+    /// newline at either end stays.
+    #[test]
+    fn trim_removes_spaces_only_as_postgresql_does() {
+        assert_eq!(super::trim("  beach  "), "beach");
+        assert_eq!(super::trim("\tbeach \n"), "\tbeach \n");
+        assert_eq!(super::trim(" \tbeach\t "), "\tbeach\t");
+    }
+
     use super::*;
+
+    #[test]
+    fn the_shared_string_functions() {
+        assert_eq!(lower("ÜnÏ Case"), "ünï case");
+        assert_eq!(upper("ünï case"), "ÜNÏ CASE");
+        assert_eq!(trim("  a b  "), "a b");
+        assert_eq!(concat([Some("a".to_owned()), None, Some("1".to_owned())]), "a1");
+        assert_eq!(concat([None, None]), "");
+    }
+
+    #[test]
+    fn parse_bool_reads_postgresql_boolean_input() {
+        for text in ["t", "tr", "TRUE", "y", "ye", "yes", "on", "ON", "1", "  true\t"] {
+            assert_eq!(parse_bool(text), Some(true), "`{text}`");
+        }
+        for text in ["f", "fal", "FALSE", "n", "no", "of", "off", "0", " no "] {
+            assert_eq!(parse_bool(text), Some(false), "`{text}`");
+        }
+        // `o` is `on` and `off` both; the rest spell nothing.
+        for text in ["", "  ", "o", "truee", "yess", "onn", "offf", "2", "10", "-1", "maybe"] {
+            assert_eq!(parse_bool(text), None, "`{text}`");
+        }
+    }
 
     #[test]
     fn civil_round_trips_across_the_epoch() {

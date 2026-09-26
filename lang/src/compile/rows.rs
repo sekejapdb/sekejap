@@ -100,21 +100,11 @@ fn compare(left: &SqlValue, right: &SqlValue) -> Option<std::cmp::Ordering> {
         (SqlValue::Int(a), SqlValue::Text(b)) => b.parse::<i64>().ok().map(|b| a.cmp(&b)),
         (SqlValue::Text(a), SqlValue::Int(b)) => a.parse::<i64>().ok().map(|a| a.cmp(b)),
         (SqlValue::Bool(a), SqlValue::Text(b)) => {
-            parse_bool(b).map(|b| a.cmp(&b)).or(Some(Ordering::Less))
+            functions::parse_bool(b).map(|b| a.cmp(&b)).or(Some(Ordering::Less))
         }
         (SqlValue::Text(a), SqlValue::Bool(b)) => {
-            parse_bool(a).map(|a| a.cmp(b)).or(Some(Ordering::Less))
+            functions::parse_bool(a).map(|a| a.cmp(b)).or(Some(Ordering::Less))
         }
-        _ => None,
-    }
-}
-
-/// PostgreSQL's boolean input spellings, which is what a catalog filter
-/// written as a string carries (`WHERE attnotnull = 't'`).
-fn parse_bool(text: &str) -> Option<bool> {
-    match text.to_ascii_lowercase().as_str() {
-        "t" | "true" | "yes" | "on" | "1" => Some(true),
-        "f" | "false" | "no" | "off" | "0" => Some(false),
         _ => None,
     }
 }
@@ -296,22 +286,16 @@ impl RowsPlan {
     /// The answer, as rows with a synthetic identity.
     ///
     /// A virtual row has no `EntityId`: it is not in any collection and
-    /// there is nothing to read it back by. The id reported is
-    /// `(collection 0, ordinal)`, which is the position in the answer -- a
-    /// caller that treats it as a row identity and asks for it back gets
-    /// nothing, which is the truthful outcome for a row that is not stored.
+    /// there is nothing to read it back by. It carries
+    /// [`EntityId::NO_OWNER`], so `SqlRow::owner` answers `None`.
     pub(crate) fn answer(&self) -> SqlResult {
         SqlResult::Rows {
             columns: self.columns.clone(),
             rows: self
                 .rows
                 .iter()
-                .enumerate()
-                .map(|(at, values)| SqlRow {
-                    id: EntityId {
-                        collection: CollectionId(0),
-                        sequence: at as u64,
-                    },
+                .map(|values| SqlRow {
+                    id: EntityId::NO_OWNER,
                     values: values.clone(),
                 })
                 .collect(),

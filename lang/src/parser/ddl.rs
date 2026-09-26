@@ -480,8 +480,9 @@ impl Parser {
         }
     }
 
-    /// The declared SQL type, and the `Kind` it is stored as.
-    fn column_type(&mut self) -> SqlResult2<(Kind, String)> {
+    /// The declared SQL type, and the `Kind` it is stored as. A GQL cast
+    /// reads its type name here too (`gql/parse/expr.rs`).
+    pub(crate) fn column_type(&mut self) -> SqlResult2<(Kind, String)> {
         let at = self.here();
         let Some(word) = self.word() else {
             return Err(SqlError::syntax(

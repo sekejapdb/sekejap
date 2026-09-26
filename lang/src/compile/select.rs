@@ -30,8 +30,8 @@ impl Compiler<'_> {
             statement.limit = Some(0);
         }
         let statement = statement;
-        let (c, graph_filter, graph_columns) = match &statement.source {
-            Source::Table(name) => (collection(self.db, name)?, None, None),
+        let c = match &statement.source {
+            Source::Table(name) => collection(self.db, name)?,
             Source::All => {
                 return Err(SqlError::Refused {
                     keyword: "FROM ALL".into(),
@@ -39,77 +39,29 @@ impl Compiler<'_> {
                     reason: super::dml::FROM_ALL,
                 })
             }
-            Source::Graph(graph) => {
-                let (target, filter) = self.graph_table(graph)?;
-                (target, Some(filter), Some(graph.columns.clone()))
+            // `Compiler::statement` compiles a bare `SELECT *` over a GQL
+            // relation; any outer select list or clause lands here.
+            Source::Gql(_) => {
+                return Err(SqlError::unsupported(
+                    "an outer SELECT list or clause over a GQL relation is built with GQL profile M3-D, which compiles it as one more stage of the plan; until then write `SELECT * FROM GRAPH_TABLE (...)` and name the columns in RETURN",
+                ))
             }
         };
 
         let mut filters: Vec<OwnedFilter> = Vec::new();
-        if let Some(filter) = graph_filter {
-            filters.push(filter);
-        }
         for expr in &statement.predicates {
             filters.push(self.where_filter(c, expr)?);
         }
 
-        // An alias a `COLUMNS` entry gave to an EDGE property. `ORDER BY` and
-        // the select list resolve against this before they look for a column
-        // of the far node, because the two namespaces are distinct and the
-        // pattern is what bound the edge one.
-        let edge_aliases: Vec<(String, String)> = graph_columns
-            .iter()
-            .flatten()
-            .filter_map(|(item, alias)| match item {
-                GraphColumn::Edge(property) => Some((alias.clone(), property.clone())),
-                GraphColumn::Node(_) => None,
-            })
-            .collect();
-
         let order = match &statement.order {
             None => OwnedOrder::Driver,
-            Some(OrderKey::Column { column, descending }) => {
-                match edge_aliases
-                    .iter()
-                    .find(|(alias, _)| alias == column)
-                    .map(|(_, property)| property.clone())
-                {
-                    Some(property) => OwnedOrder::Edge {
-                        property,
-                        direction: if *descending {
-                            SortDirection::Descending
-                        } else {
-                            SortDirection::Ascending
-                        },
-                    },
-                    None => self.order(c, &OrderKey::Column {
-                        column: column.clone(),
-                        descending: *descending,
-                    })?,
-                }
-            }
             Some(key) => self.order(c, key)?,
         };
 
         // The select list. `_id` is free (a row carries its id); a named
         // column is a projected field; an expression is this statement's own
-        // ranking value.
-        // `COLUMNS` entries that read the EDGE become projection fields under
-        // the `@edge.` spelling the engine resolves from the traversal; the
-        // rest are ordinary select items over the far node's row. Both keep
-        // the position the statement wrote them in.
-        let items: Vec<(GraphColumn, Option<String>)> = match graph_columns {
-            Some(columns) => columns
-                .into_iter()
-                .map(|(item, alias)| (item, Some(alias)))
-                .collect(),
-            None => statement
-                .items
-                .clone()
-                .into_iter()
-                .map(|(item, alias)| (GraphColumn::Node(item), alias))
-                .collect(),
-        };
+        // ranking value. Items keep the position the statement wrote them in.
+        let items = statement.items.clone();
         let mut columns = Vec::new();
         let mut outputs = Vec::new();
         let mut fields: Vec<String> = Vec::new();
@@ -124,18 +76,6 @@ impl Compiler<'_> {
             }
         };
         for (item, alias) in items {
-            let item = match item {
-                GraphColumn::Node(item) => item,
-                GraphColumn::Edge(property) => {
-                    // `@edge.<property>` is the engine's projection spelling
-                    // for the reaching edge (`query::EDGE_FIELD_PREFIX`); it
-                    // reads no row and collides with no declared field.
-                    let field = format!("{EDGE_FIELD_PREFIX}{property}");
-                    columns.push(alias.unwrap_or_else(|| property.clone()));
-                    outputs.push(push_field(field, &mut fields));
-                    continue;
-                }
-            };
             match item {
                 SelectItem::Star => {
                     for field in self.declared_fields(c)? {
@@ -238,24 +178,7 @@ impl Compiler<'_> {
                 "selecting `{KEY_COLUMN}` costs one `get_by_id` per returned row: a page cannot project the reserved field the external key lives in, so the key is fetched after the walk. `{ID_COLUMN}` is free"
             ));
         }
-        // `docs/core/GRAPH_CONTRACT.md` §4.2: the reaching edge is carried only by
-        // the traversal's own candidate stream, so a statement that reads it
-        // must run on the graph driver. When a `_key` predicate is a POST-
-        // FILTER beside such a traversal, the traversal keeps the driver and
-        // the key range is answered from the external key the row carries
-        // (`plan.rs`, `filters.rs`) -- the alternative would be an answer
-        // ordered by nothing with every edge column `Missing`.
-        let reads_the_edge = matches!(order, OwnedOrder::Edge { .. })
-            || fields
-                .iter()
-                .any(|field| field.starts_with(EDGE_FIELD_PREFIX));
-        let drives_the_graph = reads_the_edge
-            && filters
-                .iter()
-                .any(|filter| matches!(filter, OwnedFilter::Graph(_)));
-        let driver = if drives_the_graph {
-            CandidateDriver::Auto
-        } else if filters
+        let driver = if filters
             .iter()
             .any(|filter| matches!(filter, OwnedFilter::Key { .. }))
         {

@@ -35,7 +35,10 @@ impl Parser {
         }
         self.expect_word("FROM")?;
         let source = if self.word().as_deref() == Some("GRAPH_TABLE") {
-            Source::Graph(Box::new(self.graph_table()?))
+            // A `GRAPH_TABLE (...)` body is parsed as GQL only (owner
+            // decision 1, M2-E): the SQL/PGQ `COLUMNS (...)` body has no
+            // compatibility alias.
+            Source::Gql(Box::new(self.gql_graph_table()?))
         } else if self.word().as_deref() == Some("ALL") && !matches!(self.peek_at(1), Tok::Dot) {
             self.bump();
             Source::All

@@ -66,23 +66,21 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     // `multi_range` below, which is not a keyword row.
     ("AT TIME ZONE", Tier::Three, "QL_CONTRACT §4.2 and §5 deviation 8: a declared TIMESTAMPTZ is stored as UTC microseconds in an Int; there is no time-zone storage, only display conversion."),
     // ── §4.3 graph ───────────────────────────────────────────────────────
-    ("ANY SHORTEST", Tier::Two, "QL_CONTRACT §4.3: ANY SHORTEST / ALL SHORTEST need the unweighted shortest-path atomic."),
-    ("ALL SHORTEST", Tier::Two, "QL_CONTRACT §4.3: ANY SHORTEST / ALL SHORTEST need the unweighted shortest-path atomic."),
-    ("PATH_LENGTH", Tier::Two, "QL_CONTRACT §4.3: path_length() is a frontier depth accumulator."),
-    ("PATH_SUM", Tier::Two, "QL_CONTRACT §4.3: path accumulators are GRAPH_CONTRACT 5.1."),
-    ("PATH_PRODUCT", Tier::Two, "QL_CONTRACT §4.3: path accumulators are GRAPH_CONTRACT 5.1."),
-    ("PATH_MIN", Tier::Two, "QL_CONTRACT §4.3: path accumulators are GRAPH_CONTRACT 5.1."),
-    ("PATH_MAX", Tier::Two, "QL_CONTRACT §4.3: path accumulators are GRAPH_CONTRACT 5.1."),
-    ("PATH_AVG", Tier::Two, "QL_CONTRACT §4.3: path accumulators are GRAPH_CONTRACT 5.1."),
-    ("PATH_FIRST", Tier::Two, "QL_CONTRACT §4.3: path accumulators are GRAPH_CONTRACT 5.1."),
-    ("PATH_LAST", Tier::Two, "QL_CONTRACT §4.3: path accumulators are GRAPH_CONTRACT 5.1."),
-    ("NODES", Tier::Two, "QL_CONTRACT §4.3: nodes(p) needs the path rebuild for returned rows."),
-    ("EDGES", Tier::Two, "QL_CONTRACT §4.3: edges(p) needs the path rebuild for returned rows."),
-    ("VERTEX_ID", Tier::Two, "QL_CONTRACT §4.3: VERTEX_ID(v) is the entity id, after element identity."),
-    ("EDGE_ID", Tier::Two, "QL_CONTRACT §4.3: EDGE_ID(e) is the edge id, after element identity."),
-    ("TRAIL", Tier::Three, "QL_CONTRACT §4.3: IS ACYCLIC is the default and the only mode; TRAIL, WALK and SIMPLE have no atomic."),
-    ("WALK", Tier::Three, "QL_CONTRACT §4.3: IS ACYCLIC is the default and the only mode; TRAIL, WALK and SIMPLE have no atomic."),
-    ("SIMPLE", Tier::Three, "QL_CONTRACT §4.3: IS ACYCLIC is the default and the only mode; TRAIL, WALK and SIMPLE have no atomic."),
+    // Graph syntax parses only inside a GQL body, `GRAPH_TABLE (g MATCH ...
+    // RETURN ...)`, which reads `GQL_TABLE` below, never this one. There
+    // `ANY SHORTEST`, `WALK`, `TRAIL`, `PATH_LENGTH`, `PATH_FIRST`,
+    // `PATH_LAST`, `NODES` and `EDGES` are built (M4), so they left this
+    // table. What is left names the constructs a GQL body still refuses,
+    // for a plain SQL statement that writes one.
+    ("ALL SHORTEST", Tier::Two, "QL_CONTRACT §4.3: a path selector stands inside a GQL body, `GRAPH_TABLE (g MATCH ... RETURN ...)`, where ANY SHORTEST is built and ALL SHORTEST is a P1 construct."),
+    ("PATH_SUM", Tier::Three, "QL_CONTRACT §4.3: path accumulators are not adopted; inside `GRAPH_TABLE (g MATCH ... RETURN ...)` a path sum is SUM over the path's group variable in a LET (horizontal aggregation, `LET total = SUM(e.cost)`)."),
+    ("PATH_PRODUCT", Tier::Three, "QL_CONTRACT §4.3: path accumulators are not adopted; inside `GRAPH_TABLE (g MATCH ... RETURN ...)` a path product is EXP(SUM(LN(x))) over the path's group variable in a LET (horizontal aggregation)."),
+    ("PATH_MIN", Tier::Three, "QL_CONTRACT §4.3: path accumulators are not adopted; inside `GRAPH_TABLE (g MATCH ... RETURN ...)` it is MIN over the path's group variable in a LET (horizontal aggregation)."),
+    ("PATH_MAX", Tier::Three, "QL_CONTRACT §4.3: path accumulators are not adopted; inside `GRAPH_TABLE (g MATCH ... RETURN ...)` it is MAX over the path's group variable in a LET (horizontal aggregation)."),
+    ("PATH_AVG", Tier::Three, "QL_CONTRACT §4.3: path accumulators are not adopted; inside `GRAPH_TABLE (g MATCH ... RETURN ...)` it is AVG over the path's group variable in a LET (horizontal aggregation)."),
+    ("VERTEX_ID", Tier::Three, "QL_CONTRACT §4.3: not adopted; inside `GRAPH_TABLE (g MATCH ... RETURN ...)` an element's id is ELEMENT_ID(x)."),
+    ("EDGE_ID", Tier::Three, "QL_CONTRACT §4.3: not adopted; inside `GRAPH_TABLE (g MATCH ... RETURN ...)` an element's id is ELEMENT_ID(x)."),
+    ("SIMPLE", Tier::Two, "QL_CONTRACT §4.3: a path mode stands inside a GQL body, `GRAPH_TABLE (g MATCH ... RETURN ...)`, where WALK, TRAIL and ACYCLIC are built and SIMPLE is a P1 construct."),
     // ── §4.4 spatial ─────────────────────────────────────────────────────
     ("ST_BUFFER", Tier::Three, "QL_CONTRACT §4.4: GEOS overlay; no pure-Rust substitute accepted."),
     ("ST_UNION", Tier::Three, "QL_CONTRACT §4.4: GEOS overlay; no pure-Rust substitute accepted."),
@@ -150,6 +148,72 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("PG_STAT_ACTIVITY", Tier::Three, "QL_CONTRACT §2 (catalog): there is no connection table -- a connection is a process here."),
 ];
 
+/// The refusals INSIDE a GQL body (`docs/lang/GQL_PROFILE_DESIGN.md` §5.3
+/// and §5.4): construct -> tier -> reason, the reason naming the milestone
+/// that builds the construct.
+///
+/// This table, not [`TABLE`], is the one a GQL body consults, and [`TABLE`]
+/// is never consulted there: `OFFSET`, `CASE` or `NODES` mean something else
+/// in GQL, and a word the profile does not use is an ordinary name (a
+/// property called `offset` is legal). A keyword is the words a statement
+/// writes (`ANY SHORTEST`) or, for a construct spelled with punctuation, a
+/// short description (`nested quantifier`, `label conjunction`).
+///
+/// Tier 2 is a construct a named milestone builds; Tier 3 is one the profile
+/// does not adopt because another spelling already says it.
+pub(crate) const GQL_TABLE: &[(&str, Tier, &str)] = &[
+    // ── M5: brief §11 step 5 ─────────────────────────────────────────────
+    ("OPTIONAL MATCH with comma patterns", Tier::Two, "GQL profile M5: an OPTIONAL MATCH holds one path pattern in this release (design Q3); several comma patterns, optional together, are brief §11 step 5. Write one OPTIONAL MATCH per pattern when each is optional on its own."),
+    ("EXISTS", Tier::Two, "GQL profile M5: EXISTS { ... } is brief §11 step 5."),
+    ("CALL", Tier::Two, "GQL profile M5: CALL (...) { ... } is brief §11 step 5."),
+    ("UNION", Tier::Two, "GQL profile M5: UNION inside a GRAPH_TABLE body is brief §11 step 5."),
+    // ── M6: host functions inside a GQL body ─────────────────────────────
+    ("host function", Tier::Two, "GQL profile M6: the spatial, vector and full-text host functions and casts (`ST_*`, `::geometry`, `::vector`, `to_tsvector`, `to_tsquery`, `bm25`) are evaluated inside a GQL body with index lineage in M6. The scalar pack (M3-C) is `ABS`, `SQRT`, `POWER`, `EXP`, `LN`, `LOWER`, `UPPER`, `TRIM`, `LENGTH`, `SUBSTRING`, `CONCAT`, `COALESCE`, `NULLIF`, `CAST`/`::`, `CASE`, arithmetic, `||`, `IN` and `IS [NOT] NULL`."),
+    // ── P1: after the P0 release ─────────────────────────────────────────
+    ("ALL SHORTEST", Tier::Two, "GQL profile P1: ALL SHORTEST is a P1 construct, after the P0 release."),
+    ("SIMPLE", Tier::Two, "GQL profile P1: the SIMPLE path mode is a P1 construct, after the P0 release."),
+    ("selector with a path mode", Tier::Two, "GQL profile P1: a path pattern takes a selector (ANY, ANY SHORTEST, ANY CHEAPEST, which search walks) OR a path mode (WALK, TRAIL, ACYCLIC), not both; the combined form needs a separately verified nested pattern, a P1 construct."),
+    ("nested quantifier", Tier::Two, "GQL profile P1: a quantifier inside a quantified subpath is a P1 construct (design Q10): v1 keeps one active counter per path search. Quantifiers written one after another are accepted."),
+    ("label conjunction", Tier::Two, "GQL profile P1: label conjunction `&` is a P1 construct; a label test is a name or an alternation `A|B`."),
+    ("label negation", Tier::Two, "GQL profile P1: label negation `!` is a P1 construct; a label test is a name or an alternation `A|B`."),
+    ("label wildcard", Tier::Two, "GQL profile P1: the label wildcard `%` is a P1 construct; write no label to match any element."),
+    ("INTERSECT", Tier::Two, "GQL profile P1: INTERSECT inside a GRAPH_TABLE body is a P1 construct."),
+    ("EXCEPT", Tier::Two, "GQL profile P1: EXCEPT inside a GRAPH_TABLE body is a P1 construct."),
+    // ── not adopted ──────────────────────────────────────────────────────
+    ("PATH_SUM", Tier::Three, "GQL profile, not adopted: a path accumulator is SUM over the path's group variable in a LET (horizontal aggregation, `LET total = SUM(e.cost)`)."),
+    ("PATH_PRODUCT", Tier::Three, "GQL profile, not adopted: a path product is EXP(SUM(LN(x))) over the path's group variable in a LET (horizontal aggregation), for strictly positive values."),
+    ("PATH_MIN", Tier::Three, "GQL profile, not adopted: a path accumulator is MIN over the path's group variable in a LET (horizontal aggregation)."),
+    ("PATH_MAX", Tier::Three, "GQL profile, not adopted: a path accumulator is MAX over the path's group variable in a LET (horizontal aggregation)."),
+    ("PATH_AVG", Tier::Three, "GQL profile, not adopted: a path accumulator is AVG over the path's group variable in a LET (horizontal aggregation)."),
+    ("VERTEX_ID", Tier::Three, "GQL profile, not adopted: an element's id is ELEMENT_ID."),
+    ("EDGE_ID", Tier::Three, "GQL profile, not adopted: an element's id is ELEMENT_ID."),
+    ("COLUMNS", Tier::Three, "GQL profile, not adopted: the SQL/PGQ GRAPH_TABLE ... COLUMNS (...) body is removed, with no compatibility alias (owner decision, docs/lang/GQL_PROFILE_DESIGN.md). GRAPH_TABLE takes a GQL body: write RETURN ... instead of COLUMNS (...)."),
+];
+
+fn gql_row(keyword: &str) -> Option<SqlError> {
+    GQL_TABLE
+        .iter()
+        .find(|(name, _, _)| *name == keyword)
+        .map(|(name, tier, reason)| SqlError::Refused {
+            keyword: (*name).to_owned(),
+            tier: *tier,
+            reason,
+        })
+}
+
+/// The GQL refusal a WORD the statement wrote carries, if [`GQL_TABLE`]
+/// lists it. Only the upper-case rows can match: a descriptive row such as
+/// `nested quantifier` is never a word, so a variable called `quantifier` is legal.
+pub(crate) fn gql_lookup(word: &str) -> Option<SqlError> {
+    gql_row(&word.to_ascii_uppercase())
+}
+
+/// The GQL refusal of a construct a parse site names; every site names a row
+/// of [`GQL_TABLE`] (`lang/tests/gql_parse.rs` reaches each one).
+pub(crate) fn gql_refuse(keyword: &str) -> SqlError {
+    gql_row(keyword).unwrap_or_else(|| panic!("`{keyword}` is not a row of refuse::GQL_TABLE"))
+}
+
 /// The reason a rewrite whose pre-image is a SET of ranges carries.
 ///
 /// `EXTRACT(MONTH FROM t) = 6` is one interval per year in the corpus and
@@ -192,5 +256,25 @@ pub(super) fn refuse(keyword: &str) -> SqlError {
             tier: Tier::Three,
             reason: "QL_CONTRACT: not a Tier-1 construct and not in the Tier-2/3 table; no atomic is named for it.",
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GQL_TABLE;
+    use crate::gql::ast::Func;
+
+    /// The `host function` reason lists the scalar pack by hand, since a
+    /// table row is a constant: it names every function the pack holds.
+    #[test]
+    fn the_host_function_reason_names_the_whole_scalar_pack() {
+        let (_, _, reason) = GQL_TABLE
+            .iter()
+            .find(|(keyword, _, _)| *keyword == "host function")
+            .expect("a row");
+        for func in Func::ALL {
+            let name = format!("`{}`", func.written());
+            assert!(reason.contains(&name), "{name} is not in: {reason}");
+        }
     }
 }

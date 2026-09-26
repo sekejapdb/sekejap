@@ -59,6 +59,38 @@ pub mod oid {
     pub const GEOMETRY: i32 = 18_000;
     /// Synthetic: pgvector `vector`.
     pub const VECTOR: i32 = 18_001;
+
+    // The one-dimensional arrays a list column or a list parameter uses
+    // (`docs/lang/GQL_PROFILE_DESIGN.md` §6.3): PostgreSQL's fixed `_type`
+    // OIDs for the element types a list holds: text, int8, float8, bool,
+    // jsonb, and the two declared times, date and timestamptz. Any other
+    // `T[]` spelling names no wire type.
+    pub const BOOL_ARRAY: i32 = 1000;
+    pub const TEXT_ARRAY: i32 = 1009;
+    pub const INT8_ARRAY: i32 = 1016;
+    pub const FLOAT8_ARRAY: i32 = 1022;
+    pub const DATE_ARRAY: i32 = 1182;
+    pub const TIMESTAMPTZ_ARRAY: i32 = 1185;
+    pub const JSONB_ARRAY: i32 = 3807;
+}
+
+/// `(array OID, element OID)` for every array in [`oid`].
+const ARRAYS: &[(i32, i32)] = &[
+    (oid::BOOL_ARRAY, oid::BOOL),
+    (oid::TEXT_ARRAY, oid::TEXT),
+    (oid::INT8_ARRAY, oid::INT8),
+    (oid::FLOAT8_ARRAY, oid::FLOAT8),
+    (oid::DATE_ARRAY, oid::DATE),
+    (oid::TIMESTAMPTZ_ARRAY, oid::TIMESTAMPTZ),
+    (oid::JSONB_ARRAY, oid::JSONB),
+];
+
+/// The element OID of an array OID, or `None` when `type_oid` is not one.
+fn element_oid(type_oid: i32) -> Option<i32> {
+    ARRAYS
+        .iter()
+        .find(|(array, _)| *array == type_oid)
+        .map(|(_, element)| *element)
 }
 
 /// `pg_type.typlen` for an OID: the fixed width, or `-1` for a varlena.
@@ -104,8 +136,19 @@ pub fn type_name(type_oid: i32) -> &'static str {
 /// answer: `TIMESTAMPTZ` and `DATE` are both `Kind::Int` (UTC microseconds,
 /// `docs/lang/QL_CONTRACT.md` §5 deviation 8), so only the catalog's
 /// declared pair says which a column is.
+///
+/// A list spelling, `T[]`, maps to the array OID of `T`'s OID (`TEXT[]` is
+/// `_text`, `DOUBLE PRECISION[]` is `_float8`), and to `None` when that type
+/// has no array OID here.
 pub fn oid_for_declared(declared: &str) -> Option<i32> {
     let upper = declared.trim().to_ascii_uppercase();
+    if let Some(element) = upper.strip_suffix("[]") {
+        let element = oid_for_declared(element)?;
+        return ARRAYS
+            .iter()
+            .find(|(_, of)| *of == element)
+            .map(|(array, _)| *array);
+    }
     let head = upper.split(['(', ' ']).next().unwrap_or("");
     Some(match head {
         "TEXT" | "VARCHAR" | "CHAR" | "UUID" => oid::TEXT,
@@ -198,6 +241,15 @@ const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 /// know the type either, so the bytes it receives are the bytes it would
 /// have received, and nothing is silently mis-typed.
 pub fn encode_cell(value: &SqlValue, type_oid: i32, format: i16) -> Option<Vec<u8>> {
+    // A list is a JSON array (`docs/lang/GQL_PROFILE_DESIGN.md` §6.3); under
+    // an array OID it is written as a PostgreSQL array in either format.
+    if let (Some(element), SqlValue::Json(Value::Array(items))) = (element_oid(type_oid), value) {
+        return Some(if format == 0 {
+            array_text(items, element)
+        } else {
+            array_binary(items, element)
+        });
+    }
     if format == 0 {
         return text_of(value);
     }
@@ -224,10 +276,13 @@ pub fn encode_cell(value: &SqlValue, type_oid: i32, format: i16) -> Option<Vec<u
             Some(micros) => (micros - PG_EPOCH_MICROS).to_be_bytes().to_vec(),
             None => iso.clone().into_bytes(),
         },
-        (oid::DATE, SqlValue::Int(micros)) => {
-            let days = (micros - PG_EPOCH_MICROS).div_euclid(86_400_000_000) as i32;
-            days.to_be_bytes().to_vec()
-        }
+        (oid::DATE, SqlValue::Int(micros)) => date_days(*micros),
+        // A declared DATE is printed back by `sekejap_lang` as ISO-8601
+        // text, as a TIMESTAMPTZ is.
+        (oid::DATE, SqlValue::Text(iso)) => match iso_to_micros(iso) {
+            Some(micros) => date_days(micros),
+            None => iso.clone().into_bytes(),
+        },
         // A `bytea` is printed by `sekejap_lang` in PostgreSQL's hex form,
         // `\x` and the digits; its binary form is the bytes themselves. This
         // is how QGIS reads `ST_AsBinary` through a binary cursor.
@@ -248,6 +303,12 @@ pub fn encode_cell(value: &SqlValue, type_oid: i32, format: i16) -> Option<Vec<u
     })
 }
 
+/// A binary `date`: days since the PostgreSQL epoch.
+fn date_days(micros: i64) -> Vec<u8> {
+    let days = (micros - PG_EPOCH_MICROS).div_euclid(86_400_000_000) as i32;
+    days.to_be_bytes().to_vec()
+}
+
 /// The text a binary encoder reaches for when it needs the value spelled.
 fn binary_text(value: &SqlValue) -> String {
     match value {
@@ -255,6 +316,97 @@ fn binary_text(value: &SqlValue) -> String {
         SqlValue::Text(t) => t.clone(),
         other => String::from_utf8(text_of(other).unwrap_or_default()).unwrap_or_default(),
     }
+}
+
+/// One JSON list element as the cell value its element type encodes. A
+/// `jsonb` element is the JSON itself (a string element is the JSON string
+/// `"s"`, not the text `s`); every other element is the scalar it spells.
+fn element_value(item: &Value, element: i32) -> SqlValue {
+    match item {
+        Value::Null => SqlValue::Null,
+        _ if element == oid::JSONB => SqlValue::Json(item.clone()),
+        Value::Bool(b) => SqlValue::Bool(*b),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => SqlValue::Int(i),
+            None => SqlValue::Float(n.as_f64().unwrap_or(f64::NAN)),
+        },
+        Value::String(s) => SqlValue::Text(s.clone()),
+        other => SqlValue::Json(other.clone()),
+    }
+}
+
+/// A list in `array_out`'s text form: `{a,"b c",NULL}`, `{}` when empty.
+/// An element is double-quoted when it is empty, when it reads as `NULL` in
+/// any case, or when it holds a brace, a comma, a quote, a backslash or
+/// white space; inside the quotes a quote and a backslash are escaped with
+/// a backslash.
+fn array_text(items: &[Value], element: i32) -> Vec<u8> {
+    let mut out = String::from("{");
+    for (at, item) in items.iter().enumerate() {
+        if at > 0 {
+            out.push(',');
+        }
+        let Some(bytes) = text_of(&element_value(item, element)) else {
+            out.push_str("NULL");
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let quote = text.is_empty()
+            || text.eq_ignore_ascii_case("NULL")
+            || text
+                .chars()
+                .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || is_array_space(c));
+        if quote {
+            out.push('"');
+            for c in text.chars() {
+                if matches!(c, '"' | '\\') {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out.push('"');
+        } else {
+            out.push_str(&text);
+        }
+    }
+    out.push('}');
+    out.into_bytes()
+}
+
+/// The white space `array_in` skips around an unquoted element.
+fn is_array_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}')
+}
+
+/// A list in `array_send`'s binary form: ndim, has-null flag, element OID,
+/// then (length, lower bound 1) and each element length-prefixed, `-1` for
+/// NULL. An empty list has zero dimensions and no dimension pair, as
+/// PostgreSQL sends `'{}'`.
+fn array_binary(items: &[Value], element: i32) -> Vec<u8> {
+    let cells: Vec<Option<Vec<u8>>> = items
+        .iter()
+        .map(|item| encode_cell(&element_value(item, element), element, 1))
+        .collect();
+    let has_null = cells.iter().any(Option::is_none);
+    let mut out = Vec::new();
+    out.extend_from_slice(&i32::from(!cells.is_empty()).to_be_bytes());
+    out.extend_from_slice(&i32::from(has_null).to_be_bytes());
+    out.extend_from_slice(&element.to_be_bytes());
+    if cells.is_empty() {
+        return out;
+    }
+    out.extend_from_slice(&(cells.len() as i32).to_be_bytes());
+    out.extend_from_slice(&1i32.to_be_bytes());
+    for cell in cells {
+        match cell {
+            None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(bytes) => {
+                out.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                out.extend_from_slice(&bytes);
+            }
+        }
+    }
+    out
 }
 
 /// `YYYY-MM-DDTHH:MM:SS[.ffffff][Z]` and the space-separated spelling, to
@@ -322,6 +474,9 @@ pub fn decode_param(bytes: Option<&[u8]>, type_oid: i32, format: i16) -> Result<
         return decode_binary_param(bytes, type_oid);
     }
     let text = String::from_utf8_lossy(bytes).into_owned();
+    if let Some(element) = element_oid(type_oid) {
+        return decode_array_text(&text, element);
+    }
     Ok(match type_oid {
         oid::BOOL => Param::Bool(matches!(
             text.as_str(),
@@ -346,6 +501,9 @@ pub fn decode_param(bytes: Option<&[u8]>, type_oid: i32, format: i16) -> Result<
 
 fn decode_binary_param(bytes: &[u8], type_oid: i32) -> Result<Param, SqlError> {
     let short = || SqlError::Parameter(format!("binary parameter of type {type_oid} is truncated"));
+    if let Some(element) = element_oid(type_oid) {
+        return decode_array_binary(bytes, type_oid, element);
+    }
     Ok(match type_oid {
         oid::BOOL => Param::Bool(bytes.first().copied().unwrap_or(0) != 0),
         oid::INT2 => Param::Int(i16::from_be_bytes(bytes.try_into().map_err(|_| short())?).into()),
@@ -381,6 +539,190 @@ fn decode_binary_param(bytes: &[u8], type_oid: i32) -> Result<Param, SqlError> {
         // text.
         _ => Param::Text(String::from_utf8_lossy(bytes).into_owned()),
     })
+}
+
+/// A decoded list element as the JSON element of `Param::Json(array)`.
+fn element_json(param: Param) -> Result<Value, SqlError> {
+    Ok(match param {
+        Param::Null => Value::Null,
+        Param::Bool(b) => Value::Bool(b),
+        Param::Int(i) => Value::from(i),
+        Param::Float(f) => serde_json::Number::from_f64(f).map(Value::Number).ok_or_else(|| {
+            SqlError::Parameter(format!("array element {f} is not a finite number"))
+        })?,
+        Param::Text(s) => Value::String(s),
+        Param::Json(v) => v,
+        Param::Vector(v) => Value::from(v),
+    })
+}
+
+/// An array parameter in `array_in`'s text form, `{a,"b c",NULL}`, to
+/// `Param::Json(array)`. Each element is decoded as a parameter of the
+/// element type would be; an unquoted `NULL` in any case is a null element.
+/// Only one dimension is accepted, because a list is one-dimensional.
+fn decode_array_text(text: &str, element: i32) -> Result<Param, SqlError> {
+    let malformed = || {
+        SqlError::Parameter(format!(
+            "`{text}` is not a PostgreSQL array literal of the form {{a,\"b c\",NULL}}"
+        ))
+    };
+    let chars: Vec<char> = text.trim().chars().collect();
+    if chars.first() != Some(&'{') {
+        return Err(malformed());
+    }
+    let mut at = 1;
+    let skip_space = |at: &mut usize| {
+        while *at < chars.len() && is_array_space(chars[*at]) {
+            *at += 1;
+        }
+    };
+    let mut items = Vec::new();
+    skip_space(&mut at);
+    if chars.get(at) == Some(&'}') {
+        at += 1;
+    } else {
+        loop {
+            skip_space(&mut at);
+            let (raw, quoted_or_escaped) = match chars.get(at) {
+                None => return Err(malformed()),
+                Some('{') => {
+                    return Err(SqlError::Parameter(format!(
+                        "`{text}` has more than one dimension; a list parameter is a \
+                         one-dimensional array"
+                    )))
+                }
+                Some('"') => {
+                    at += 1;
+                    let mut raw = String::new();
+                    loop {
+                        match chars.get(at) {
+                            None => return Err(malformed()),
+                            Some('"') => break,
+                            Some('\\') => {
+                                raw.push(*chars.get(at + 1).ok_or_else(malformed)?);
+                                at += 2;
+                                continue;
+                            }
+                            Some(c) => raw.push(*c),
+                        }
+                        at += 1;
+                    }
+                    at += 1;
+                    skip_space(&mut at);
+                    (raw, true)
+                }
+                Some(_) => {
+                    let mut raw = String::new();
+                    let mut escaped = false;
+                    // The length of `raw` up to its last character that is not
+                    // trailing white space (an escaped space is kept).
+                    let mut kept = 0;
+                    loop {
+                        match chars.get(at) {
+                            None => return Err(malformed()),
+                            Some(',' | '}') => break,
+                            Some('{' | '"') => return Err(malformed()),
+                            Some('\\') => {
+                                raw.push(*chars.get(at + 1).ok_or_else(malformed)?);
+                                kept = raw.len();
+                                escaped = true;
+                                at += 2;
+                                continue;
+                            }
+                            Some(c) => {
+                                raw.push(*c);
+                                if !is_array_space(*c) {
+                                    kept = raw.len();
+                                }
+                            }
+                        }
+                        at += 1;
+                    }
+                    raw.truncate(kept);
+                    if raw.is_empty() {
+                        return Err(malformed());
+                    }
+                    (raw, escaped)
+                }
+            };
+            items.push(if !quoted_or_escaped && raw.eq_ignore_ascii_case("NULL") {
+                Value::Null
+            } else {
+                element_json(decode_param(Some(raw.as_bytes()), element, 0)?)?
+            });
+            match chars.get(at) {
+                Some(',') => at += 1,
+                Some('}') => {
+                    at += 1;
+                    break;
+                }
+                _ => return Err(malformed()),
+            }
+        }
+    }
+    if at != chars.len() {
+        return Err(malformed());
+    }
+    Ok(Param::Json(Value::Array(items)))
+}
+
+/// An array parameter in `array_send`'s binary form to `Param::Json(array)`:
+/// ndim (0 or 1), has-null flag, element OID (must be the declared one),
+/// then for one dimension (length, lower bound) and each element
+/// length-prefixed, `-1` for NULL.
+fn decode_array_binary(bytes: &[u8], type_oid: i32, element: i32) -> Result<Param, SqlError> {
+    let short = || SqlError::Parameter(format!("binary parameter of type {type_oid} is truncated"));
+    let mut at = 0usize;
+    let word = |at: &mut usize| -> Result<i32, SqlError> {
+        let slice = bytes.get(*at..*at + 4).ok_or_else(short)?;
+        *at += 4;
+        Ok(i32::from_be_bytes(slice.try_into().map_err(|_| short())?))
+    };
+    let ndim = word(&mut at)?;
+    let _has_null = word(&mut at)?;
+    let sent_element = word(&mut at)?;
+    if sent_element != element {
+        return Err(SqlError::Parameter(format!(
+            "binary array parameter of type {type_oid} carries element type {sent_element}, \
+             not {element}"
+        )));
+    }
+    let mut items = Vec::new();
+    match ndim {
+        0 => {}
+        1 => {
+            let len = word(&mut at)?;
+            let _lower_bound = word(&mut at)?;
+            // Every element costs at least its four-byte length, so a count
+            // the frame cannot hold is refused before anything is reserved.
+            if len < 0 || (len as usize).saturating_mul(4) > bytes.len() - at {
+                return Err(short());
+            }
+            items.reserve(len as usize);
+            for _ in 0..len {
+                let size = word(&mut at)?;
+                if size < 0 {
+                    items.push(Value::Null);
+                    continue;
+                }
+                let cell = bytes.get(at..at + size as usize).ok_or_else(short)?;
+                at += size as usize;
+                items.push(element_json(decode_binary_param(cell, element)?)?);
+            }
+        }
+        _ => {
+            return Err(SqlError::Parameter(format!(
+                "binary array parameter of type {type_oid} has {ndim} dimensions; a list \
+                 parameter is a one-dimensional array"
+            )))
+        }
+    }
+    if at != bytes.len() {
+        return Err(SqlError::Parameter(format!(
+            "binary array parameter of type {type_oid} has bytes after its last element"
+        )));
+    }
+    Ok(Param::Json(Value::Array(items)))
 }
 
 /// An undeclared text parameter, read by shape.
@@ -522,6 +864,8 @@ fn sql_error(error: &SqlError) -> WireError {
         }
         SqlError::Syntax { .. } => WireError::new(SYNTAX_ERROR, error.to_string()),
         SqlError::Parameter(_) => WireError::new(INVALID_PARAMETER, error.to_string()),
+        // PostgreSQL's own code, carried as data from where it was raised.
+        SqlError::Coded { sqlstate, message } => WireError::new(sqlstate, message.clone()),
         SqlError::Engine(message) => {
             if message.contains(NO_COLLECTION_NAMED) {
                 WireError::new(UNDEFINED_TABLE, error.to_string())

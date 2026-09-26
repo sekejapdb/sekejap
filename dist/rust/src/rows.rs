@@ -46,11 +46,20 @@ impl IntoIterator for Rows {
 #[derive(Clone, Debug)]
 pub struct Row {
     pub columns: Arc<Vec<String>>,
+    /// The stored row this answer row came from. A row of a derived
+    /// relation carries [`EntityId::NO_OWNER`]; read [`Row::owner`] rather
+    /// than this field to tell the two apart.
     pub id: EntityId,
     pub values: Vec<SqlValue>,
 }
 
 impl Row {
+    /// The stored row this answer row came from, or `None` for a row of a
+    /// derived relation, which carries [`EntityId::NO_OWNER`].
+    pub fn owner(&self) -> Option<EntityId> {
+        (self.id != EntityId::NO_OWNER).then_some(self.id)
+    }
+
     /// The value under `column`, or `None` if the statement has no such
     /// column. A column that is present but MISSING in this row answers
     /// `Some(&SqlValue::Missing)`: absent from the row is not absent from

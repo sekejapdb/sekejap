@@ -57,7 +57,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sekejap_core::collections::{CollectionId, Database, EntityId, QueryBudget};
+use sekejap_core::collections::{Database, EntityId, QueryBudget};
 use sekejap_lang::{Param, PreparedSql, SqlError, SqlResult, SqlRow, SqlValue};
 
 use crate::service::{ChangeEvent, Receiver, ServiceDatabase, ServiceError, WriterGuard};
@@ -640,14 +640,39 @@ impl<'a> Connection<'a> {
             // (705) because it is a real type whose value maps onto
             // `Param::Text` with nothing inferred.
             let count = count_parameters(&prepared.sql).max(prepared.param_oids.len());
-            let oids: Vec<i32> = (0..count)
+            let mut oids: Vec<i32> = (0..count)
                 .map(|at| match prepared.param_oids.get(at).copied() {
                     Some(0) | None => oid::TEXT,
                     Some(declared) => declared,
                 })
                 .collect();
+            let (fields, typed) = self.describe_columns(&prepared.sql, &oids);
+            // A position the `Parse` left undeclared takes the type the
+            // statement itself gives it (`PreparedSql::param_types`), and
+            // the statement remembers it, so the `Bind` that follows decodes
+            // that position as the type the client was just told.
+            let mut resolved = prepared.param_oids.clone();
+            let mut changed = false;
+            for (at, spelling) in typed.iter().enumerate().take(count) {
+                let undeclared = matches!(prepared.param_oids.get(at), Some(0) | None);
+                if let (true, Some(type_oid)) =
+                    (undeclared, spelling.and_then(types::oid_for_declared))
+                {
+                    oids[at] = type_oid;
+                    if resolved.len() <= at {
+                        resolved.resize(at + 1, 0);
+                    }
+                    resolved[at] = type_oid;
+                    changed = true;
+                }
+            }
+            if changed {
+                if let Some(statement) = self.statements.get_mut(&name) {
+                    statement.param_oids = resolved;
+                }
+            }
             f::parameter_description(out, &oids);
-            match self.describe_columns(&prepared.sql, &oids) {
+            match fields {
                 Some(fields) => f::row_description(out, &fields),
                 None => f::no_data(out),
             }
@@ -931,10 +956,7 @@ impl<'a> Connection<'a> {
                 Ok(SqlResult::Explain(text)) | Ok(SqlResult::Notice(text)) => {
                     let fields = apply_formats(&[text_field("QUERY PLAN")], formats);
                     let row = SqlRow {
-                        id: EntityId {
-                            collection: CollectionId(0),
-                            sequence: 0,
-                        },
+                        id: EntityId::NO_OWNER,
                         values: vec![SqlValue::Text(text)],
                     };
                     body(&row, &fields).map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
@@ -1396,24 +1418,38 @@ impl<'a> Connection<'a> {
     /// the OID the `Parse` declared, because a plan is what names the
     /// collection. A probe that does not compile returns `None`, and the
     /// client is told `NoData` rather than a guess.
-    fn describe_columns(&mut self, sql: &str, oids: &[i32]) -> Option<Vec<FieldDescription>> {
+    /// The columns a statement returns, and the types it gives its own `$n`
+    /// ([`PreparedSql::param_types`]), from one describe-time compile.
+    fn describe_columns(
+        &mut self,
+        sql: &str,
+        oids: &[i32],
+    ) -> (Option<Vec<FieldDescription>>, Vec<Option<&'static str>>) {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         if self.is_session_statement(trimmed) || !is_read(trimmed) {
-            return None;
+            return (None, Vec::new());
         }
         let probe: Vec<Param> = oids.iter().map(|oid| probe_param(*oid)).collect();
         let budget = self.budget();
-        self.refresh_reader().ok()?;
-        let snapshot = self.reader.as_ref()?;
+        if self.refresh_reader().is_err() {
+            return (None, Vec::new());
+        }
+        let Some(snapshot) = self.reader.as_ref() else {
+            return (None, Vec::new());
+        };
         snapshot.with(|db| {
             let db: &Database = db;
-            let prepared =
-                sekejap_lang::prepare_sql_with(db, trimmed, &probe, budget, &mut || false).ok()?;
-            if prepared.is_select() || prepared.is_aggregate() {
-                Some(field_descriptions(db, &prepared))
+            let Ok(prepared) =
+                sekejap_lang::prepare_sql_with(db, trimmed, &probe, budget, &mut || false)
+            else {
+                return (None, Vec::new());
+            };
+            let fields = if prepared.is_select() || prepared.is_aggregate() {
+                field_descriptions(db, &prepared)
             } else {
-                Some(vec![text_field("QUERY PLAN")])
-            }
+                vec![text_field("QUERY PLAN")]
+            };
+            (Some(fields), prepared.param_types())
         })
     }
 
@@ -1737,6 +1773,15 @@ fn probe_param(type_oid: i32) -> Param {
         oid::FLOAT4 | oid::FLOAT8 | oid::NUMERIC => Param::Float(0.0),
         oid::JSON | oid::JSONB => Param::Json(serde_json::Value::Null),
         oid::VECTOR => Param::Vector(Vec::new()),
+        // An array parameter binds as `Param::Json(array)` (`types::decode_param`),
+        // so it is probed as the empty list.
+        oid::BOOL_ARRAY
+        | oid::TEXT_ARRAY
+        | oid::INT8_ARRAY
+        | oid::FLOAT8_ARRAY
+        | oid::DATE_ARRAY
+        | oid::TIMESTAMPTZ_ARRAY
+        | oid::JSONB_ARRAY => Param::Json(serde_json::Value::Array(Vec::new())),
         _ => Param::Text(String::new()),
     }
 }

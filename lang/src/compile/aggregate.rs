@@ -51,15 +51,6 @@ pub(crate) struct AggregatePlan {
     pub(crate) text: String,
 }
 
-/// An aggregate row is not a row of the collection: no entity produced it, so
-/// there is no id to report. `SqlRow` carries one, so a group reports
-/// sequence 0, which `Database::put` never issues (sequences are one-based).
-fn group_identity(collection: CollectionId) -> EntityId {
-    EntityId {
-        collection,
-        sequence: 0,
-    }
-}
 
 fn agg_value(value: &AggValue) -> SqlValue {
     match value {
@@ -107,8 +98,10 @@ impl AggregatePlan {
                     .map_or(SqlValue::Missing, agg_value),
             })
             .collect();
+        // A group is not a row of the collection: no entity produced it, so
+        // it carries the no-owner sentinel and `SqlRow::owner` is `None`.
         SqlRow {
-            id: group_identity(self.collection),
+            id: EntityId::NO_OWNER,
             values,
         }
     }
@@ -138,7 +131,7 @@ impl AggregatePlan {
                 divisor: *divisor,
             },
         });
-        with_borrowed_filters(&self.filters, &[], &[], &mut |filters| {
+        with_borrowed_filters(&self.filters, &mut |filters| {
             let mut prepared = db.prepare_aggregate(AggregateRequest {
                 collection: self.collection,
                 filters,
@@ -174,7 +167,7 @@ impl Compiler<'_> {
         }
         let Source::Table(table) = &statement.source else {
             return Err(SqlError::unsupported(
-                "an aggregate over GRAPH_TABLE: the aggregate atomic folds the candidates of ONE collection's plan; a traversal's COLUMNS are rows, and folding them is the path-accumulator item (QL_CONTRACT §4.3)",
+                "an aggregate over GRAPH_TABLE or FROM ALL: the aggregate atomic folds the candidates of ONE collection's plan; a GQL relation's rows are already RETURNed by its own stage, and folding them again in an outer SELECT is GQL profile M3-D (design §5.5)",
             ));
         };
         let c = collection(self.db, table)?;

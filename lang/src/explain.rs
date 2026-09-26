@@ -6,10 +6,11 @@
 //! asks EXPLAIN to print which predicates are answered index-side and to
 //! label a construct whose definition is a scan; both are below.
 
-use super::compile::{AggregatePlan, Rebind, SelectPlan};
+use super::compile::{AggregatePlan, GqlSqlPlan, Rebind, SelectPlan};
 use super::{RunWork, SqlResult2, PAGE};
+use sekejap_core::collections::gql::{GqlBudget, GqlWork};
 use sekejap_core::collections::{
-    AggregatePlanDescription, Database, FilterAnswer, QueryBudget, QueryPlanDescription,
+    AggregatePlanDescription, Database, FilterAnswer, QueryBudget, QueryPlanDescription, QueryWork,
 };
 
 fn answer_text(answer: &FilterAnswer) -> String {
@@ -58,6 +59,74 @@ pub(super) fn render(
     out.push_str(&rewrites_and_row_functions(select));
     out.push_str(&rebind_line(rebind));
     Ok(out)
+}
+
+/// Run a GQL plan once and render it: the plan as the planner built it
+/// (`GqlPlan::describe`), then the rows, the pages and every counter the
+/// run charged, GQL resources included (design §8).
+pub(super) fn render_gql(
+    db: &Database,
+    gql: &GqlSqlPlan,
+    notices: &[String],
+) -> SqlResult2<String> {
+    let (mut rows, mut pages) = (0u64, 0u64);
+    let mut work = GqlWork::default();
+    gql.plan.for_each_page(
+        db,
+        &gql.params,
+        PAGE,
+        GqlBudget::unlimited(),
+        &mut || false,
+        &mut |page| {
+            rows += page.rows.len() as u64;
+            pages += 1;
+            work.add_page(&page.work);
+            Ok(())
+        },
+    )?;
+    let mut out = gql.plan.describe(db)?;
+    out.push_str(&format!("rows: {rows} in {pages} page(s)\n"));
+    out.push_str(&format!(
+        "{} binding_rows={} path_states={} queue_entries={} predecessor_arcs={} \
+         sort_bytes={} list_bytes={}\n",
+        work_line(&work.base),
+        work.binding_rows,
+        work.path_states,
+        work.queue_entries,
+        work.predecessor_arcs,
+        work.sort_bytes,
+        work.list_bytes,
+    ));
+    for notice in notices {
+        out.push_str(&format!("notice: {notice}\n"));
+    }
+    Ok(out)
+}
+
+/// The `work:` line of every EXPLAIN that runs, without its end: each base
+/// counter the run charged. The GQL EXPLAIN adds its own after it.
+fn work_line(w: &QueryWork) -> String {
+    format!(
+        "work: candidates={} primary_reads={} row_decodes={} scalar_postings={} \
+         spatial_postings={} text_postings={} text_tokens={} graph_edges={} graph_visited={} \
+         vector_locators={} vector_sidecars={} vector_lanes={} key_postings={} groups={} \
+         output_bytes={}",
+        w.candidates,
+        w.primary_reads,
+        w.row_decodes,
+        w.scalar_postings,
+        w.spatial_postings,
+        w.text_postings,
+        w.text_tokens,
+        w.graph_edges,
+        w.graph_visited,
+        w.vector_locators,
+        w.vector_sidecars,
+        w.vector_lanes,
+        w.key_postings,
+        w.groups,
+        w.output_bytes,
+    )
 }
 
 /// Whether this compiled statement can be RE-BOUND with new parameters
@@ -293,29 +362,9 @@ fn format(
             diagnostics.method, diagnostics.ef, diagnostics.examined, diagnostics.reranked
         ));
     }
-    let w = &work.work;
     out.push_str(&format!("rows: {} in {} page(s)\n", work.rows, work.pages));
-    out.push_str(&format!(
-        "work: candidates={} primary_reads={} row_decodes={} scalar_postings={} \
-         spatial_postings={} text_postings={} text_tokens={} graph_edges={} graph_visited={} \
-         vector_locators={} vector_sidecars={} vector_lanes={} key_postings={} groups={} \
-         output_bytes={}\n",
-        w.candidates,
-        w.primary_reads,
-        w.row_decodes,
-        w.scalar_postings,
-        w.spatial_postings,
-        w.text_postings,
-        w.text_tokens,
-        w.graph_edges,
-        w.graph_visited,
-        w.vector_locators,
-        w.vector_sidecars,
-        w.vector_lanes,
-        w.key_postings,
-        w.groups,
-        w.output_bytes,
-    ));
+    out.push_str(&work_line(&work.work));
+    out.push('\n');
     if let Ok(accesses) = db.pool_accesses() {
         out.push_str(&format!("pool accesses (process total): {accesses}\n"));
     }

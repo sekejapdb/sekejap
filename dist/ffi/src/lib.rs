@@ -213,7 +213,9 @@ fn status_of_sql(error: &SqlError) -> SekejapStatus {
         SqlError::Refused { .. } => SekejapStatus::Refused,
         SqlError::Syntax { .. } | SqlError::Parameter(_) => SekejapStatus::Invalid,
         SqlError::Unsupported(_) => SekejapStatus::Unsupported,
-        SqlError::Engine(_) => SekejapStatus::Invalid,
+        // A PostgreSQL SQLSTATE error: a value the statement cannot compute,
+        // or a name or a kind it gets wrong. The code is in the message.
+        SqlError::Engine(_) | SqlError::Coded { .. } => SekejapStatus::Invalid,
     }
 }
 

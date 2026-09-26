@@ -97,6 +97,17 @@ pub(super) struct Parser {
     /// `ST_MakePoint` has SRID 0, which PostGIS refuses against a 4326 column
     /// in a geometry predicate ("mixed SRID geometries").
     last_geo_srid: bool,
+    /// Which refusal table a listed word is looked up in. `Gql` only for
+    /// the length of a GQL body inside `GRAPH_TABLE`, so no word changes
+    /// meaning in plain SQL (`docs/lang/GQL_PROFILE_DESIGN.md` §5.3).
+    pub(crate) dialect: Dialect,
+}
+
+/// The language the cursor is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Dialect {
+    Sql,
+    Gql,
 }
 
 /// The two spatial types a `::` cast can name. Only the unit rule reads it.
@@ -144,6 +155,7 @@ pub(super) fn parse(text: &str) -> SqlResult2<Stmt> {
         depth: 0,
         last_geo_cast: None,
         last_geo_srid: false,
+        dialect: Dialect::Sql,
     };
     let statement = parser.statement()?;
     parser.eat(&Tok::Semicolon);
@@ -159,23 +171,22 @@ pub(super) fn parse(text: &str) -> SqlResult2<Stmt> {
 
 // Names the moved code reaches by `super::` path: they were one level up
 // when this was one file, and are bound here so that they still are.
-use super::{is_key_column, Tier, ID_COLUMN, KEY_COLUMN, MAX_GRAPH_DEPTH};
+use super::{is_key_column, Tier, ID_COLUMN, KEY_COLUMN};
 
 mod catalog;
 mod ddl;
 mod dml;
 mod expr;
-mod graph_table;
 mod select;
 
 impl Parser {
     // ── the token stream ─────────────────────────────────────────────────
 
-    fn peek(&self) -> &Tok {
+    pub(crate) fn peek(&self) -> &Tok {
         &self.tokens[self.at].tok
     }
 
-    fn peek_at(&self, ahead: usize) -> &Tok {
+    pub(crate) fn peek_at(&self, ahead: usize) -> &Tok {
         let index = (self.at + ahead).min(self.tokens.len() - 1);
         &self.tokens[index].tok
     }
@@ -191,11 +202,11 @@ impl Parser {
         self.at = mark;
     }
 
-    fn here(&self) -> usize {
+    pub(crate) fn here(&self) -> usize {
         self.tokens[self.at].at
     }
 
-    fn bump(&mut self) -> Tok {
+    pub(crate) fn bump(&mut self) -> Tok {
         let tok = self.tokens[self.at].tok.clone();
         if self.at + 1 < self.tokens.len() {
             self.at += 1;
@@ -203,7 +214,7 @@ impl Parser {
         tok
     }
 
-    fn eat(&mut self, want: &Tok) -> bool {
+    pub(crate) fn eat(&mut self, want: &Tok) -> bool {
         if self.peek() == want {
             self.bump();
             true
@@ -212,7 +223,7 @@ impl Parser {
         }
     }
 
-    fn expect(&mut self, want: &Tok) -> SqlResult2<()> {
+    pub(crate) fn expect(&mut self, want: &Tok) -> SqlResult2<()> {
         if self.eat(want) {
             return Ok(());
         }
@@ -233,15 +244,15 @@ impl Parser {
     }
 
     /// The upper-cased word at the cursor, if the cursor is on a word.
-    fn word(&self) -> Option<String> {
+    pub(crate) fn word(&self) -> Option<String> {
         self.peek().keyword()
     }
 
-    fn word_at(&self, ahead: usize) -> Option<String> {
+    pub(crate) fn word_at(&self, ahead: usize) -> Option<String> {
         self.peek_at(ahead).keyword()
     }
 
-    fn eat_word(&mut self, want: &str) -> bool {
+    pub(crate) fn eat_word(&mut self, want: &str) -> bool {
         if self.word().as_deref() == Some(want) {
             self.bump();
             true
@@ -250,7 +261,7 @@ impl Parser {
         }
     }
 
-    fn expect_word(&mut self, want: &str) -> SqlResult2<()> {
+    pub(crate) fn expect_word(&mut self, want: &str) -> SqlResult2<()> {
         if self.eat_word(want) {
             return Ok(());
         }
@@ -265,12 +276,14 @@ impl Parser {
     }
 
     /// The refusal a word or operator carries, if the Tier-2/3 table lists
-    /// it. Two-word constructs are tried first so `ANY SHORTEST` is refused
-    /// as itself rather than as a bare `ANY`. `GROUP BY` left this list when
+    /// it. Two-word constructs are tried first so `ALL SHORTEST` is refused
+    /// as itself rather than as a bare `ALL`. `GROUP BY` left this list when
     /// it became Tier 1 (`src/query/aggregate.rs`).
     fn listed(&self, word: &str) -> Option<SqlError> {
+        if self.dialect == Dialect::Gql {
+            return self.gql_listed(word);
+        }
         for (first, second) in [
-            ("ANY", "SHORTEST"),
             ("ALL", "SHORTEST"),
             ("SIMILAR", "TO"),
             ("GROUPING", "SETS"),
@@ -305,6 +318,13 @@ impl Parser {
     /// Refuse the OPERATOR at the cursor if the table lists it. The table is
     /// keyed by the operator's own spelling, so `&&` is refused as `&&`.
     fn guard_operator(&self) -> SqlResult2<()> {
+        // The GQL table lists no operator by its spelling: an operator the
+        // profile does not build is refused where its parse site meets it,
+        // because its meaning depends on where it stands (`*` after an edge
+        // is a quantifier; between two values it is arithmetic).
+        if self.dialect == Dialect::Gql {
+            return Ok(());
+        }
         let spelling = match self.peek() {
             Tok::Overlaps => "&&",
             Tok::ContainsOp => "@>",
@@ -328,12 +348,12 @@ impl Parser {
     /// that would otherwise name a position -- [`Parser::expect`],
     /// [`Parser::expect_word`], a SELECT's tail, the end of a statement --
     /// asks this first.
-    fn guard_here(&self) -> SqlResult2<()> {
+    pub(crate) fn guard_here(&self) -> SqlResult2<()> {
         self.guard_word()?;
         self.guard_operator()
     }
 
-    fn deeper(&mut self) -> SqlResult2<()> {
+    pub(crate) fn deeper(&mut self) -> SqlResult2<()> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             return Err(SqlError::syntax(
@@ -344,14 +364,14 @@ impl Parser {
         Ok(())
     }
 
-    fn shallower(&mut self) {
+    pub(crate) fn shallower(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }
 
     /// A bare or double-quoted name. `tbl.col` keeps the last segment, which
     /// is what a single-table statement means by it; a schema-qualified name
     /// (`schema.tbl.col`) is Tier 2.
-    fn name(&mut self) -> SqlResult2<String> {
+    pub(crate) fn name(&mut self) -> SqlResult2<String> {
         let at = self.here();
         let mut parts = Vec::new();
         loop {

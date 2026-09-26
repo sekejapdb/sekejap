@@ -582,63 +582,6 @@ pub(super) enum SelectItem {
     },
 }
 
-/// One comparison written inside an edge element's inline `WHERE`, over a
-/// property of the edge's own inline bag (`GRAPH_CONTRACT` 4.3).
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct EdgePredicate {
-    pub(super) property: String,
-    pub(super) op: CmpOp,
-    pub(super) value: Literal,
-}
-
-/// One element of a `GRAPH_TABLE` pattern's path.
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct GraphHop {
-    pub(super) edge_type: Option<String>,
-    /// `Outgoing` for `-[..]->`, `Incoming` for `<-[..]-`, `Both` for `-[..]-`.
-    pub(super) direction: GraphDirection,
-    pub(super) min_depth: usize,
-    pub(super) max_depth: usize,
-    /// The edge element's inline `WHERE`, a conjunction over the edge's own
-    /// properties. Applied per hop, not to completed matches.
-    pub(super) predicates: Vec<EdgePredicate>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GraphDirection {
-    Outgoing,
-    Incoming,
-    Both,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct GraphTable {
-    pub(super) context: String,
-    /// The seeding element: its collection and the key equality that names
-    /// one row. Only a key equality seeds in this slice.
-    pub(super) seed_collection: String,
-    pub(super) seed_key: Literal,
-    pub(super) hop: GraphHop,
-    /// The far element's collection, which is the collection the outer
-    /// statement selects from.
-    pub(super) target_collection: String,
-    /// The far element's inline `WHERE`, a conjunction over the NODE's own
-    /// fields. Applied per hop: a node it refuses is neither returned nor
-    /// expanded.
-    pub(super) node_predicates: Vec<Predicate>,
-    /// `COLUMNS (b.<field> AS <alias>)` and `COLUMNS (r.<property> AS
-    /// <alias>)`.
-    pub(super) columns: Vec<(GraphColumn, String)>,
-}
-
-/// One entry of a `COLUMNS (...)` list: a field of the far NODE, or a
-/// property of the EDGE the pattern bound.
-#[derive(Clone, Debug, PartialEq)]
-pub(super) enum GraphColumn {
-    Node(SelectItem),
-    Edge(String),
-}
-
 /// One `SET column = ...` value: a constant, or a row expression over the
 /// same row (QL_CONTRACT §4.1 / §4.2).
 #[derive(Clone, Debug, PartialEq)]
@@ -713,7 +656,11 @@ pub(super) enum Show {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Source {
     Table(String),
-    Graph(Box<GraphTable>),
+    /// `GRAPH_TABLE (<graph> ... RETURN ...)`: the GQL body
+    /// (`docs/lang/GQL_PROFILE_DESIGN.md` §5), the only body `GRAPH_TABLE`
+    /// takes (owner decision 1, M2-E: the SQL/PGQ `COLUMNS (...)` body has
+    /// no compatibility alias).
+    Gql(Box<super::gql::ast::GqlGraphTable>),
     /// `FROM ALL`: every collection of the catalog at once (QL_CONTRACT §2).
     All,
 }

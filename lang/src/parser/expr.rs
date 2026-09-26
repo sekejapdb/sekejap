@@ -1,34 +1,6 @@
 use super::*;
 
 impl Parser {
-    // ── WHERE ────────────────────────────────────────────────────────────
-
-    /// A flat conjunction, which is what a GRAPH_TABLE element's inline
-    /// `WHERE` is: per-hop predicates are answered index-side one node at a
-    /// time (`GRAPH_CONTRACT` 4.3), and a union over the whole collection is
-    /// not a per-hop question. `OR` and `NOT` there are refused, naming that.
-    pub(super) fn conjunction(&mut self) -> SqlResult2<Vec<Predicate>> {
-        let mut out = Vec::new();
-        loop {
-            let mut negated = false;
-            out.push(self.predicate_negatable(&mut negated)?);
-            if negated {
-                return Err(SqlError::unsupported(
-                    "a negated predicate inside a graph pattern element: a per-hop predicate is answered from one node's postings, and a complement is a set over the whole collection (GRAPH_CONTRACT 4.3)",
-                ));
-            }
-            if self.word().as_deref() == Some("OR") {
-                return Err(SqlError::unsupported(
-                    "OR inside a graph pattern element: a per-hop predicate is answered from one node's postings, and a union is a set over the whole collection (GRAPH_CONTRACT 4.3)",
-                ));
-            }
-            if !self.eat_word("AND") {
-                break;
-            }
-        }
-        Ok(out)
-    }
-
     // ── the boolean tree (docs/lang/QL_CONTRACT.md §3) ────────────────────────
     //
     // `AND` is the conjunction a filter list already is, so EVERY `And` in

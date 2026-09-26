@@ -262,31 +262,6 @@ impl<'a> Binder<'a> {
         })
     }
 
-    /// An edge property's value. An edge bag is untyped JSON, so the literal
-    /// decides the type.
-    pub(crate) fn edge_value(&self, literal: &Literal, property: &str) -> SqlResult2<Scalar> {
-        Ok(match self.value_of(literal)? {
-            Value::Bool(value) => Scalar::Bool(value),
-            Value::String(value) => Scalar::Text(value),
-            Value::Number(number) => match number.as_i64() {
-                Some(value) => Scalar::I64(value),
-                None => Scalar::F64(number.as_f64().ok_or_else(|| {
-                    SqlError::Parameter(format!("`{property}`'s value is not a number"))
-                })?),
-            },
-            Value::Null => {
-                return Err(SqlError::unsupported(format!(
-                    "`{property} = NULL` on an edge element: an absent or null property satisfies no comparison, so the predicate would refuse every edge"
-                )))
-            }
-            other => {
-                return Err(SqlError::unsupported(format!(
-                    "an edge property compares against a scalar literal, found {other}"
-                )))
-            }
-        })
-    }
-
     /// The tsquery text, split into E4's `TextMatch`. A tsquery that mixes
     /// `&` and `|` is an AND/OR tree, which is Tier 2.
     pub(crate) fn tsquery(&self, query: &TsQuery) -> SqlResult2<(String, TextMatch)> {
@@ -354,25 +329,6 @@ impl<'a> Binder<'a> {
             TextMatch::All
         };
         Ok((terms.join(" "), matching))
-    }
-
-
-    /// The `GRAPH_TABLE` seed: a key equality, which is one point-get.
-    /// Resolved at BIND, not at prepare, so the same compiled traversal walks
-    /// from a new seed without being compiled again.
-    pub(crate) fn seed_of(&self, fill: &SeedFill) -> SqlResult2<EntityId> {
-        let key = self.text_of(&fill.key)?;
-        Ok(self
-            .db
-            .get(fill.collection, &key)
-            .map_err(SqlError::from)?
-            .ok_or_else(|| {
-                SqlError::engine(format!(
-                    "GRAPH_TABLE seed: `{}` has no row at key `{key}`",
-                    fill.table
-                ))
-            })?
-            .id)
     }
 }
 
@@ -485,15 +441,6 @@ pub(crate) struct GeomFill {
     pub(crate) predicate: SpatialPredicate,
     pub(crate) argument: GeoArg,
     pub(crate) metres: Option<Literal>,
-}
-
-/// A `GRAPH_TABLE` seed: the collection the key is looked up in, and the
-/// literal that spells the key.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SeedFill {
-    pub(crate) collection: CollectionId,
-    pub(crate) table: String,
-    pub(crate) key: Literal,
 }
 
 // ── rebindability ─────────────────────────────────────────────────────────

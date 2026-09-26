@@ -98,7 +98,6 @@ pub(crate) enum OwnedFilter {
         /// and `a | b` are different matches of the same slot.
         fill: Option<TsQuery>,
     },
-    Graph(OwnedGraph),
     Key {
         lower: Bound<String>,
         upper: Bound<String>,
@@ -157,9 +156,6 @@ impl OwnedFilter {
                 query,
                 matching: *matching,
             },
-            // Filled in by `SelectPlan::with_query`, which owns the
-            // borrowed predicate slices for the length of one prepared query.
-            Self::Graph(_) => unreachable!("a graph filter is borrowed through `graph_request`"),
             Self::Key { lower, upper, .. } => QueryFilter::Key {
                 lower: borrow_key_bound(lower),
                 upper: borrow_key_bound(upper),
@@ -197,49 +193,24 @@ struct BuiltAt<'a> {
     previous: Option<&'a BuiltAt<'a>>,
 }
 
-/// Build the whole borrowed filter list -- traversals, boolean trees and
-/// plain leaves alike -- on this call's stack and hand it to `k`.
+/// Build the whole borrowed filter list -- boolean trees and plain leaves
+/// alike -- on this call's stack and hand it to `k`.
 ///
-/// One entry point for both `with_query` and `with_aggregate`, because a
-/// `WHERE` clause is the same clause whichever of the two reads it.
-/// `graph_edges` and `graph_nodes` are the traversal's borrowed predicate
-/// slices, empty when the plan has no traversal.
-/// The borrowed view of a WRITE statement's filters, for the length of one
-/// `Database::write_where` call. The same stack-built view
-/// `SelectPlan::with_query` hands a prepared query: a `QueryFilter::Any`
+/// One entry point for `with_query`, `with_aggregate` and a WRITE
+/// statement's `WHERE`, because a clause is the same clause whichever of the
+/// three reads it. The borrowed view lives for the length of one
+/// `Database::write_where` call or one prepared query: a `QueryFilter::Any`
 /// names a SLICE and a `Not` a reference, so neither can be returned from a
 /// compiled plan that outlives the statement.
 pub(super) fn with_write_filters<T>(
     owned: &[OwnedFilter],
     k: &mut dyn FnMut(&[QueryFilter<'_>]) -> SqlResult2<T>,
 ) -> SqlResult2<T> {
-    let graph_edges: Vec<Vec<EdgePredicate<'_>>> = owned
-        .iter()
-        .map(|filter| match filter {
-            OwnedFilter::Graph(graph) => graph
-                .edge_where
-                .iter()
-                .map(OwnedEdgePredicate::borrowed)
-                .collect(),
-            _ => Vec::new(),
-        })
-        .collect();
-    let graph_nodes: Vec<Vec<QueryFilter<'_>>> = owned
-        .iter()
-        .map(|filter| match filter {
-            OwnedFilter::Graph(graph) => {
-                graph.node_where.iter().map(OwnedFilter::borrowed).collect()
-            }
-            _ => Vec::new(),
-        })
-        .collect();
-    with_borrowed_filters(owned, &graph_edges, &graph_nodes, k)
+    with_borrowed_filters(owned, k)
 }
 
 pub(super) fn with_borrowed_filters<T>(
     owned: &[OwnedFilter],
-    graph_edges: &[Vec<EdgePredicate<'_>>],
-    graph_nodes: &[Vec<QueryFilter<'_>>],
     k: &mut dyn FnMut(&[QueryFilter<'_>]) -> SqlResult2<T>,
 ) -> SqlResult2<T> {
     let boolean: Vec<usize> = owned
@@ -248,15 +219,13 @@ pub(super) fn with_borrowed_filters<T>(
         .filter(|(_, filter)| matches!(filter, OwnedFilter::Any(_) | OwnedFilter::All(_) | OwnedFilter::Not(_)))
         .map(|(at, _)| at)
         .collect();
-    with_boolean_filters(owned, &boolean, None, graph_edges, graph_nodes, k)
+    with_boolean_filters(owned, &boolean, None, k)
 }
 
 fn with_boolean_filters<T>(
     owned: &[OwnedFilter],
     remaining: &[usize],
     built: Option<&BuiltAt<'_>>,
-    graph_edges: &[Vec<EdgePredicate<'_>>],
-    graph_nodes: &[Vec<QueryFilter<'_>>],
     k: &mut dyn FnMut(&[QueryFilter<'_>]) -> SqlResult2<T>,
 ) -> SqlResult2<T> {
     match remaining.split_first() {
@@ -265,9 +234,6 @@ fn with_boolean_filters<T>(
                 .iter()
                 .enumerate()
                 .map(|(at, filter)| match filter {
-                    OwnedFilter::Graph(graph) => {
-                        QueryFilter::Graph(graph.request(&graph_edges[at], &graph_nodes[at]))
-                    }
                     OwnedFilter::Any(_) | OwnedFilter::All(_) | OwnedFilter::Not(_) => {
                         let mut link = built;
                         loop {
@@ -293,7 +259,7 @@ fn with_boolean_filters<T>(
                     node,
                     previous: built,
                 };
-                with_boolean_filters(owned, rest, Some(&link), graph_edges, graph_nodes, k)
+                with_boolean_filters(owned, rest, Some(&link), k)
             })
         }
     }
@@ -447,72 +413,6 @@ fn with_score<R>(node: &OwnedScore, k: &mut dyn FnMut(&ScoreExpr<'_>) -> R) -> R
     }
 }
 
-/// One `GRAPH_TABLE` pattern's traversal, with the per-hop predicates of
-/// `docs/core/GRAPH_CONTRACT.md` §4.3 owned by the plan.
-///
-/// A `BfsRequest` borrows its predicate slices, and a compiled plan outlives
-/// every statement text it was built from, so the plan holds the owned forms
-/// and [`SelectPlan::with_query`] builds the borrowed ones on the stack for
-/// the length of one prepared query -- the same shape the term strings and
-/// query vectors already have.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct OwnedGraph {
-    pub(crate) seed: EntityId,
-    /// The seed as the pattern WROTE it, when its key is a `$n`. The key is
-    /// then resolved at BIND -- one point-get -- rather than at prepare, so
-    /// the same compiled traversal walks from a new seed without a compile.
-    pub(crate) seed_fill: Option<SeedFill>,
-    pub(crate) direction: Direction,
-    pub(crate) context: GraphContextId,
-    pub(crate) edge_type: Option<EdgeTypeId>,
-    pub(crate) min_depth: usize,
-    pub(crate) max_depth: usize,
-    pub(crate) edge_where: Vec<OwnedEdgePredicate>,
-    pub(crate) node_where: Vec<OwnedFilter>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct OwnedEdgePredicate {
-    pub(crate) property: String,
-    pub(crate) op: Cmp,
-    pub(crate) value: Scalar,
-    /// The literal the element WHERE wrote, when it is a `$n`.
-    pub(crate) fill: Option<Literal>,
-}
-
-impl OwnedEdgePredicate {
-    fn borrowed(&self) -> EdgePredicate<'_> {
-        EdgePredicate {
-            property: &self.property,
-            op: self.op,
-            value: self.value.borrowed(),
-        }
-    }
-}
-
-impl OwnedGraph {
-    pub(crate) fn request<'a>(
-        &'a self,
-        edge_where: &'a [EdgePredicate<'a>],
-        node_where: &'a [QueryFilter<'a>],
-    ) -> BfsRequest<'a> {
-        BfsRequest {
-            seed: self.seed,
-            direction: self.direction,
-            context: self.context,
-            edge_type: self.edge_type,
-            min_depth: self.min_depth,
-            max_depth: self.max_depth,
-            include_seed: false,
-            max_visited: GRAPH_VISITED,
-            max_edges: GRAPH_EDGES,
-            result_limit: GRAPH_RESULTS,
-            edge_where,
-            node_where,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum OwnedOrder {
     Driver,
@@ -547,11 +447,6 @@ pub(crate) enum OwnedOrder {
     },
     Score {
         expr: OwnedScore,
-        direction: SortDirection,
-    },
-    /// `ORDER BY <edge alias>` over a property of the edge the pattern bound.
-    Edge {
-        property: String,
         direction: SortDirection,
     },
 }
@@ -653,37 +548,10 @@ impl SelectPlan {
         db: &Database,
         body: &mut dyn FnMut(&mut sekejap_core::collections::PreparedQuery<'_>) -> SqlResult2<T>,
     ) -> SqlResult2<T> {
-        // A traversal's per-hop predicates are BORROWED by its `BfsRequest`,
-        // so the borrowed forms are built here, on this call's stack, and the
-        // request that names them cannot outlive them -- the same reason this
-        // is a callback rather than a returned cursor.
-        let graph_edges: Vec<Vec<EdgePredicate<'_>>> = self
-            .filters
-            .iter()
-            .map(|filter| match filter {
-                OwnedFilter::Graph(graph) => graph
-                    .edge_where
-                    .iter()
-                    .map(OwnedEdgePredicate::borrowed)
-                    .collect(),
-                _ => Vec::new(),
-            })
-            .collect();
-        let graph_nodes: Vec<Vec<QueryFilter<'_>>> = self
-            .filters
-            .iter()
-            .map(|filter| match filter {
-                OwnedFilter::Graph(graph) => {
-                    graph.node_where.iter().map(OwnedFilter::borrowed).collect()
-                }
-                _ => Vec::new(),
-            })
-            .collect();
-        // The boolean trees go on this call's stack for the same reason the
-        // traversal's predicate slices do: a `QueryFilter::Any` names a
-        // slice and a `Not` a reference, and a compiled plan outlives every
-        // statement it was built from.
-        with_borrowed_filters(&self.filters, &graph_edges, &graph_nodes, &mut |filters| {
+        // The boolean trees go on this call's stack: a `QueryFilter::Any`
+        // names a slice and a `Not` a reference, and a compiled plan
+        // outlives every statement it was built from.
+        with_borrowed_filters(&self.filters, &mut |filters| {
                 let fields: Vec<&str> = self.fields.iter().map(String::as_str).collect();
         let projection = if fields.is_empty() {
             Projection::Ids
@@ -750,13 +618,6 @@ impl SelectPlan {
                     expr: compiled,
                     direction: *direction,
                 })
-            }),
-            OwnedOrder::Edge {
-                property,
-                direction,
-            } => run(QueryOrder::Edge {
-                property,
-                direction: *direction,
             }),
         }
         })
@@ -1423,7 +1284,7 @@ fn run_write(
     Ok(progress.rows_written)
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum Plan {
     Select(SelectPlan),
     Explain(SelectPlan),
@@ -1438,6 +1299,77 @@ pub(crate) enum Plan {
     /// An EXPLAIN whose statement is not a query: the text is the plan, and
     /// nothing is run to produce it.
     ExplainText(String),
+    /// `SELECT * FROM GRAPH_TABLE (<graph> ... RETURN ...)`: a GQL stage
+    /// (`docs/lang/GQL_PROFILE_DESIGN.md` §6.1), and its `EXPLAIN`.
+    Gql(GqlSqlPlan),
+    ExplainGql(GqlSqlPlan),
+}
+
+/// A compiled GQL statement and the parameters its next execution reads.
+///
+/// A GQL plan folds no parameter value (design §7): every `$n` is read
+/// when an execution opens, so a bind swaps `params` and compiles nothing.
+#[derive(Clone, Debug)]
+pub(crate) struct GqlSqlPlan {
+    pub(crate) plan: crate::gql::plan::GqlPlan,
+    pub(crate) params: Vec<crate::Param>,
+}
+
+impl GqlSqlPlan {
+    /// One execution, paged: each row handed to `body` as this statement's
+    /// columns, carrying [`EntityId::NO_OWNER`] -- a row of a relation has
+    /// no single stored owner (design Q1). Every page runs under `budget`
+    /// (with the GQL memory caps, which no budget lifts) and `cancelled`.
+    pub(crate) fn for_each_row(
+        &self,
+        db: &Database,
+        page_rows: usize,
+        budget: QueryBudget,
+        cancelled: &mut dyn FnMut() -> bool,
+        body: &mut dyn FnMut(&SqlRow) -> SqlResult2<()>,
+    ) -> SqlResult2<()> {
+        self.rows(db, page_rows, budget, cancelled, &mut |row| body(&row))
+    }
+
+    /// [`Self::for_each_row`], handing each row over rather than lending it.
+    fn rows(
+        &self,
+        db: &Database,
+        page_rows: usize,
+        budget: QueryBudget,
+        cancelled: &mut dyn FnMut() -> bool,
+        body: &mut dyn FnMut(SqlRow) -> SqlResult2<()>,
+    ) -> SqlResult2<()> {
+        self.plan.for_each_page(
+            db,
+            &self.params,
+            page_rows,
+            sekejap_core::collections::gql::GqlBudget::from_query_budget(budget),
+            cancelled,
+            &mut |page| {
+                for row in &page.rows {
+                    body(SqlRow {
+                        id: EntityId::NO_OWNER,
+                        values: self.plan.row(row)?,
+                    })?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// One execution to exhaustion, as a SQL answer.
+    pub(crate) fn answer(&self, db: &Database) -> SqlResult2<SqlResult> {
+        let mut rows = Vec::new();
+        self.rows(db, crate::PAGE, QueryBudget::unlimited(), &mut || false, &mut |row| {
+            rows.push(row);
+            Ok(())
+        })?;
+        Ok(SqlResult::Rows {
+            columns: self.plan.columns().to_vec(),
+            rows,
+        })
+    }
 }
 
 
@@ -1545,7 +1477,6 @@ impl OwnedFilter {
                     };
                 }
             }
-            Self::Graph(graph) => graph.rebind(binder)?,
             Self::Any(children) | Self::All(children) => {
                 for child in children.iter_mut() {
                     child.rebind(binder)?;
@@ -1556,23 +1487,6 @@ impl OwnedFilter {
             // holds one is never rebindable and this arm is never reached
             // with a changed parameter.
             Self::Ids(_) => {}
-        }
-        Ok(())
-    }
-}
-
-impl OwnedGraph {
-    fn rebind(&mut self, binder: &Binder<'_>) -> SqlResult2<()> {
-        if let Some(fill) = &self.seed_fill {
-            self.seed = binder.seed_of(fill)?;
-        }
-        for predicate in self.edge_where.iter_mut() {
-            if let Some(literal) = &predicate.fill {
-                predicate.value = binder.edge_value(literal, &predicate.property)?;
-            }
-        }
-        for filter in self.node_where.iter_mut() {
-            filter.rebind(binder)?;
         }
         Ok(())
     }
@@ -1643,7 +1557,7 @@ impl OwnedOrder {
                 }
             }
             Self::Score { expr, .. } => expr.rebind(binder)?,
-            Self::Driver | Self::EntityId | Self::Scalar { .. } | Self::Edge { .. } => {}
+            Self::Driver | Self::EntityId | Self::Scalar { .. } => {}
         }
         Ok(())
     }

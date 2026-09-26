@@ -34,7 +34,8 @@
 //!            | ('sum'|'min'|'max'|'avg') '(' name ')'
 //! group     := name ['/' n]        -- one key; `/ n` needs an Int index
 //! having    := aggregate cmp value (AND aggregate cmp value)*
-//! source    := name | graph_table | ALL   -- ALL is refused by name (§2)
+//! source    := name | gql_table | ALL
+//!                                        -- ALL is refused by name (§2)
 //! conj      := predicate (AND predicate)*
 //!
 //! predicate := name cmp value
@@ -62,15 +63,27 @@
 //! expression := arithmetic over bm25(), 1 - (name '<=>' value),
 //!               ST_Distance(name, geo), scalar names and numbers
 //!
-//! graph_table := GRAPH_TABLE '(' name MATCH
-//!                  '(' name label WHERE name '.' '_key' '=' value ')'
-//!                  hop
-//!                  '(' name label ')'
-//!                COLUMNS '(' (name '.' name [AS alias]) (',' ...)* ')' ')'
-//! hop       := '-' ['[' [name] label ']'] ('->' | '-') [quantifier]
-//!            | '<-' ['[' [name] label ']'] '-' [quantifier]
-//! quantifier:= '{' n [',' [n]] '}' | '+' | '?'
-//! label     := ':' name | IS name
+//! -- The GQL body (docs/lang/GQL_PROFILE_DESIGN.md §5): the only body
+//! -- `GRAPH_TABLE` takes (owner decision 1: the SQL/PGQ `GRAPH_TABLE (g
+//! -- MATCH ... COLUMNS (...))` body has no compatibility alias, and a
+//! -- `COLUMNS` written where this grammar stands is refused by name, naming
+//! -- `RETURN`). `SELECT * FROM gql_table` prepares and runs as a GQL plan
+//! -- (`Plan::Gql`); an outer select list or clause over it is refused until
+//! -- M3-D. Everything else of the profile is refused by name with its
+//! -- milestone (`gql_refusals()`).
+//! gql_table := GRAPH_TABLE '(' name stage ')' [AS name]
+//! stage     := (MATCH pattern (',' pattern)* [WHERE gexpr])* RETURN
+//!                gexpr [AS name] (',' gexpr [AS name])*
+//! pattern   := node (edge node)*
+//! node      := '(' [var] [glabel] [WHERE gexpr] ')'
+//! edge      := '-[' filler ']->' | '<-[' filler ']-' | '-[' filler ']-'
+//!            | '->' | '<-' | '-'
+//! filler    := [var] [glabel] [WHERE gexpr]
+//! glabel    := (':' | IS) name ('|' name)*
+//! gexpr     := gexpr OR gexpr | gexpr AND gexpr | NOT gexpr
+//!            | operand [cmp operand] | '(' gexpr ')'
+//! operand   := var | var '.' name | number | string | TRUE | FALSE | NULL
+//!            | '$' n
 //!
 //! insert    := INSERT INTO name '(' names ')' VALUES '(' values ')'
 //!                                                  (',' '(' values ')')*
@@ -102,6 +115,7 @@ pub mod catalog;
 mod compile;
 mod explain;
 mod functions;
+mod gql;
 mod lexer;
 mod parser;
 mod refuse;
@@ -122,17 +136,8 @@ pub const ID_COLUMN: &str = "_id";
 /// every layout (`collections::KEY_FIELD`), so projecting it reads the row;
 /// naming it in a WHERE is the key-order driver's own range.
 pub const KEY_COLUMN: &str = "_key";
-/// The deepest a `{n,}` or `+` quantifier walks when the statement writes no
-/// upper bound. The traversal is bounded by contract; this is the bound.
-pub const MAX_GRAPH_DEPTH: usize = 16;
 /// The page a `Database::sql` SELECT assembles its answer from.
 const PAGE: usize = 8192;
-/// Bounds every traversal a `GRAPH_TABLE` compiles to, so a pattern cannot
-/// ask for unbounded work. `GRAPH_CONTRACT` section 4 makes the bound the
-/// caller's; a statement that writes none gets these.
-const GRAPH_VISITED: usize = 1 << 16;
-const GRAPH_EDGES: usize = 1 << 18;
-const GRAPH_RESULTS: usize = 1 << 16;
 
 pub(crate) fn is_key_column(name: &str) -> bool {
     name == KEY_COLUMN
@@ -173,6 +178,51 @@ pub enum SqlError {
     /// The statement is well formed but the database refuses it -- a missing
     /// collection, a missing index, a budget.
     Engine(String),
+    /// An error PostgreSQL raises for the same statement, with PostgreSQL's
+    /// five-character SQLSTATE (`22012`, `42703`, ...): a value an evaluation cannot compute (a
+    /// division by zero, an integer overflow, a text that does not spell
+    /// its type), or a statement that names a variable or a function that
+    /// does not exist or gives a value of the wrong kind. The message does
+    /// not repeat the code; `Display` adds it.
+    Coded {
+        sqlstate: &'static str,
+        message: String,
+    },
+}
+
+/// The SQLSTATEs [`SqlError::Coded`] carries, by PostgreSQL's names
+/// (PostgreSQL's `errcodes.txt`).
+pub(crate) mod sqlstate {
+    /// `22003 numeric_value_out_of_range`.
+    pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
+    /// `22007 invalid_datetime_format`.
+    pub const INVALID_DATETIME_FORMAT: &str = "22007";
+    /// `22008 datetime_field_overflow`.
+    pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
+    /// `22011 substring_error`.
+    pub const SUBSTRING_ERROR: &str = "22011";
+    /// `22012 division_by_zero`.
+    pub const DIVISION_BY_ZERO: &str = "22012";
+    /// `2201E invalid_argument_for_logarithm`.
+    pub const INVALID_ARGUMENT_FOR_LOGARITHM: &str = "2201E";
+    /// `2201F invalid_argument_for_power_function`.
+    pub const INVALID_ARGUMENT_FOR_POWER_FUNCTION: &str = "2201F";
+    /// `22P02 invalid_text_representation`.
+    pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
+    /// `42703 undefined_column`: a variable no statement binds.
+    pub const UNDEFINED_COLUMN: &str = "42703";
+    /// `42712 duplicate_alias`: a variable bound twice in one stage.
+    pub const DUPLICATE_ALIAS: &str = "42712";
+    /// `42803 grouping_error`: a grouped `RETURN` reads what it did not group.
+    pub const GROUPING_ERROR: &str = "42803";
+    /// `42804 datatype_mismatch`: a value of a kind the operation does not
+    /// take.
+    pub const DATATYPE_MISMATCH: &str = "42804";
+    /// `42846 cannot_coerce`: a cast with no rule between the two types.
+    pub const CANNOT_COERCE: &str = "42846";
+    /// `42883 undefined_function`: an unknown function, or a known one
+    /// given the wrong number of arguments.
+    pub const UNDEFINED_FUNCTION: &str = "42883";
 }
 
 impl SqlError {
@@ -189,6 +239,13 @@ impl SqlError {
 
     pub(crate) fn engine(message: impl fmt::Display) -> Self {
         Self::Engine(message.to_string())
+    }
+
+    pub(crate) fn coded(sqlstate: &'static str, message: impl fmt::Display) -> Self {
+        Self::Coded {
+            sqlstate,
+            message: message.to_string(),
+        }
     }
 
     /// The tier of a refusal, for a caller that wants to count them.
@@ -224,6 +281,7 @@ impl fmt::Display for SqlError {
             Self::Unsupported(message) => write!(f, "unsupported: {message}"),
             Self::Parameter(message) => write!(f, "parameter: {message}"),
             Self::Engine(message) => write!(f, "engine: {message}"),
+            Self::Coded { sqlstate, message } => write!(f, "{message} (SQLSTATE {sqlstate})"),
         }
     }
 }
@@ -276,8 +334,19 @@ pub enum SqlValue {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqlRow {
+    /// The stored row this answer row came from. A row of a derived
+    /// relation has no single owner and carries [`EntityId::NO_OWNER`];
+    /// read [`SqlRow::owner`] rather than this field to tell the two apart.
     pub id: EntityId,
     pub values: Vec<SqlValue>,
+}
+
+impl SqlRow {
+    /// The stored row this answer row came from, or `None` for a row of a
+    /// derived relation, which carries [`EntityId::NO_OWNER`].
+    pub fn owner(&self) -> Option<EntityId> {
+        (self.id != EntityId::NO_OWNER).then_some(self.id)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -366,6 +435,12 @@ impl PreparedSql {
                 }
                 compile::Plan::Aggregate(aggregate)
                 | compile::Plan::ExplainAggregate(aggregate) => aggregate.rebind(&binder),
+                // A GQL plan folds no value: the next execution reads the
+                // new parameters when it opens (design §7).
+                compile::Plan::Gql(gql) | compile::Plan::ExplainGql(gql) => {
+                    gql.params = params.to_vec();
+                    Ok(())
+                }
                 // A write folds its document and a notice holds no value, so
                 // neither carries a slot; a rebindable one is one with no
                 // parameter at all. A `Rows` plan is the same case: its
@@ -411,6 +486,7 @@ impl PreparedSql {
                 &aggregate.columns
             }
             compile::Plan::Rows(rows) => &rows.columns,
+            compile::Plan::Gql(gql) | compile::Plan::ExplainGql(gql) => gql.plan.columns(),
             _ => &[],
         }
     }
@@ -419,18 +495,42 @@ impl PreparedSql {
     /// for `ST_AsBinary`, `FLOAT8` for `ST_X` -- and `None` when the column
     /// is a declared field (whose type the catalog holds) or text. A wire
     /// describes a result with this before any row exists.
+    ///
+    /// A GQL relation types EVERY column here, from its binding schema
+    /// (`docs/lang/GQL_PROFILE_DESIGN.md` §6.1): a node property's declared
+    /// type, `TEXT` for a property declared differently or not at all, `T[]`
+    /// for a list.
     pub fn column_type(&self, at: usize) -> Option<&'static str> {
         match &self.plan {
             compile::Plan::Select(select) | compile::Plan::Explain(select) => {
                 select.column_type(at)
             }
+            compile::Plan::Gql(gql) => gql.plan.column_type(at),
             _ => None,
+        }
+    }
+
+    /// The SQL type this statement itself gives each `$n`, in the spellings
+    /// [`PreparedSql::column_type`] uses (`TEXT`, `BIGINT`, `TEXT[]`, ...):
+    /// entry `i` is `$i+1`, and `None` or a position past the end means the
+    /// statement does not decide it. A wire answers `ParameterDescription`
+    /// with this for a position its `Parse` left undeclared.
+    ///
+    /// A collection statement types its `$n` by where each is USED, at
+    /// bind, so this is empty for it. A GQL plan gives a `$n` the declared
+    /// type of the property it is compared with, when every comparison
+    /// agrees (`docs/lang/GQL_PROFILE_DESIGN.md` §7; the full parameter
+    /// table is M3-D).
+    pub fn param_types(&self) -> Vec<Option<&'static str>> {
+        match &self.plan {
+            compile::Plan::Gql(gql) | compile::Plan::ExplainGql(gql) => gql.plan.param_types(),
+            _ => Vec::new(),
         }
     }
 
     pub fn is_select(&self) -> bool {
         match &self.plan {
-            compile::Plan::Select(_) | compile::Plan::Aggregate(_) => true,
+            compile::Plan::Select(_) | compile::Plan::Aggregate(_) | compile::Plan::Gql(_) => true,
             // A catalog view, a `SHOW` and a `SELECT` with no `FROM` all
             // answer with rows; an `EXPLAIN` of one answers with its plan.
             compile::Plan::Rows(rows) => !rows.explain,
@@ -476,6 +576,7 @@ impl PreparedSql {
         db: &Database,
         body: &mut dyn FnMut(&mut PreparedQuery<'_>) -> Result<T>,
     ) -> Result<T> {
+        self.not_gql("prepared query")?;
         let select = self.select_plan().ok_or_else(|| {
             SqlError::unsupported("this statement is not a SELECT and has no prepared query")
         })?;
@@ -491,12 +592,24 @@ impl PreparedSql {
         db: &Database,
         body: &mut dyn FnMut(&mut PreparedAggregate<'_>) -> Result<T>,
     ) -> Result<T> {
+        self.not_gql("prepared aggregate")?;
         let aggregate = self.aggregate_plan().ok_or_else(|| {
             SqlError::unsupported(
                 "this statement does not fold rows and has no prepared aggregate",
             )
         })?;
         aggregate.with_aggregate(db, body)
+    }
+
+    /// A GQL plan is a pipeline of operators, not one engine query: the
+    /// callers that want the engine's own request are refused by name.
+    fn not_gql(&self, what: &str) -> Result<()> {
+        match &self.plan {
+            compile::Plan::Gql(_) | compile::Plan::ExplainGql(_) => Err(SqlError::unsupported(format!(
+                "a GQL plan has no single {what}: it is a pipeline of operators; page its rows with `for_each_row_with`"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// Page a compiled SELECT and hand each ASSEMBLED row to `body`.
@@ -550,6 +663,11 @@ impl PreparedSql {
                 }
             }
             return Ok(());
+        }
+        // A GQL relation: its rows carry no owner (design Q1), and every
+        // page runs under the caller's budget and cancel.
+        if let compile::Plan::Gql(gql) = &self.plan {
+            return gql.for_each_row(db, page_rows, budget, cancelled, body);
         }
         let select = self.select_plan().ok_or_else(|| {
             SqlError::unsupported("this statement is not a row SELECT and pages no rows")
@@ -638,6 +756,12 @@ impl PreparedSql {
                 explain::render_aggregate(db, aggregate, &self.notices, &self.rebind)?,
             )),
             compile::Plan::ExplainText(text) => Ok(SqlResult::Explain(text.clone())),
+            compile::Plan::Gql(gql) => gql.answer(db),
+            compile::Plan::ExplainGql(gql) => Ok(SqlResult::Explain(explain::render_gql(
+                db,
+                gql,
+                &self.notices,
+            )?)),
             compile::Plan::Write(_) => Err(SqlError::unsupported(
                 "a writing statement runs through `SqlDatabase::sql`, which takes the mutable borrow one writer needs",
             )),
@@ -719,6 +843,15 @@ pub fn refusals() -> &'static [(&'static str, Tier, &'static str)] {
     refuse::TABLE
 }
 
+/// The refusal table INSIDE a GQL body (`docs/lang/GQL_PROFILE_DESIGN.md`
+/// §5.4): one row per construct the profile builds later, with the tier and
+/// a reason that names the milestone building it, or says it is not
+/// adopted. [`refusals`] is never consulted inside a GQL body, and this
+/// table never outside one.
+pub fn gql_refusals() -> &'static [(&'static str, Tier, &'static str)] {
+    refuse::GQL_TABLE
+}
+
 /// The reason a §4.2 rewrite whose pre-image is a SET of scalar ranges
 /// carries. Public so a caller -- and `lang/tests/sql_functions.rs` -- can name it
 /// instead of matching on the text.
@@ -772,9 +905,9 @@ pub fn prepare_sql_with(
 /// `EXPLAIN <select>` without the `EXPLAIN` keyword: prepare, run, and print
 /// the plan together with the work the run charged.
 ///
-/// This entry point runs the statement to explain it, so it takes the two
-/// families that can be run for an answer -- a SELECT and an aggregate -- and
-/// nothing else. The EXPLAIN families that must NOT be run to be explained
+/// This entry point runs the statement to explain it, so it takes the
+/// families that can be run for an answer -- a SELECT, an aggregate and a
+/// GQL relation -- and nothing else. The EXPLAIN families that must NOT be run to be explained
 /// (`DROP TABLE` and the predicated `UPDATE`/`DELETE`) go through
 /// `SqlDatabase::sql` with the `EXPLAIN` keyword, which prepares and
 /// describes without executing; the refusal below names that route rather
@@ -782,6 +915,9 @@ pub fn prepare_sql_with(
 /// statement that does have an EXPLAIN.
 pub fn explain_sql(db: &Database, text: &str, params: &[Param]) -> Result<String> {
     let prepared = prepare_sql(db, text, params)?;
+    if let compile::Plan::Gql(gql) = &prepared.plan {
+        return explain::render_gql(db, gql, prepared.notices());
+    }
     if let Some(aggregate) = prepared.aggregate_plan() {
         return explain::render_aggregate(db, aggregate, prepared.notices(), &prepared.rebind);
     }
@@ -882,6 +1018,10 @@ impl SqlDatabase for Database {
                 let text = explain::render_aggregate(self, &aggregate, &notices, &rebind)?;
                 Ok(SqlResult::Explain(text))
             }
+            compile::Plan::Gql(gql) => gql.answer(self),
+            compile::Plan::ExplainGql(gql) => {
+                Ok(SqlResult::Explain(explain::render_gql(self, &gql, &notices)?))
+            }
             compile::Plan::Write(write) => write.run(self, notices, budget),
         }
     }
@@ -940,49 +1080,18 @@ pub(crate) struct RunWork {
 }
 
 impl RunWork {
-    /// One aggregate page's work. `groups` is a HIGH-WATER mark of live
-    /// accumulator sets, not a running total, so it is maxed rather than
-    /// summed -- the same reason the budget is a memory bound.
+    /// One aggregate page's work, added as `QueryWork::add_page` adds it:
+    /// `groups` is a HIGH-WATER mark of live accumulator sets, not a running
+    /// total, so it is maxed rather than summed.
     pub(crate) fn add_groups(&mut self, page: &sekejap_core::collections::GroupPage) {
-        let w = &page.work;
-        let total = &mut self.work;
-        total.candidates += w.candidates;
-        total.primary_reads += w.primary_reads;
-        total.row_decodes += w.row_decodes;
-        total.scalar_postings += w.scalar_postings;
-        total.graph_edges += w.graph_edges;
-        total.graph_visited += w.graph_visited;
-        total.spatial_postings += w.spatial_postings;
-        total.text_postings += w.text_postings;
-        total.text_tokens += w.text_tokens;
-        total.vector_locators += w.vector_locators;
-        total.vector_sidecars += w.vector_sidecars;
-        total.vector_lanes += w.vector_lanes;
-        total.key_postings += w.key_postings;
-        total.groups = total.groups.max(w.groups);
-        total.output_bytes += w.output_bytes;
+        self.work.add_page(&page.work);
         self.rows += page.groups.len() as u64;
         self.pages += 1;
     }
 
+    /// One row page's work.
     pub(crate) fn add(&mut self, page: &QueryPage) {
-        let w = &page.work;
-        let total = &mut self.work;
-        total.candidates += w.candidates;
-        total.primary_reads += w.primary_reads;
-        total.row_decodes += w.row_decodes;
-        total.scalar_postings += w.scalar_postings;
-        total.graph_edges += w.graph_edges;
-        total.graph_visited += w.graph_visited;
-        total.spatial_postings += w.spatial_postings;
-        total.text_postings += w.text_postings;
-        total.text_tokens += w.text_tokens;
-        total.vector_locators += w.vector_locators;
-        total.vector_sidecars += w.vector_sidecars;
-        total.vector_lanes += w.vector_lanes;
-        total.key_postings += w.key_postings;
-        total.groups = total.groups.max(w.groups);
-        total.output_bytes += w.output_bytes;
+        self.work.add_page(&page.work);
         self.rows += page.rows.len() as u64;
         self.pages += 1;
     }

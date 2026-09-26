@@ -15,20 +15,18 @@ use super::ast::*;
 use super::functions::{self, TimeUnit};
 use super::{
     collection, is_key_column, order_value, projected, refuse, SqlError, SqlResult, SqlResult2,
-    SqlRow, SqlValue, Tier, GRAPH_EDGES, GRAPH_RESULTS, GRAPH_VISITED, ID_COLUMN, KEY_COLUMN,
-    MAX_GRAPH_DEPTH,
+    SqlRow, SqlValue, Tier, ID_COLUMN, KEY_COLUMN,
 };
 use sekejap_core::collections::{
-    Accumulator, AggValue, AggregateFn, AggregateInput, AggregateRequest, BfsRequest,
-    CandidateDriver, Cmp, CollectionId, CollectionOptions, Database, Direction, DropMode,
-    DropPhase, EdgePredicate, EdgeTypeId, EntityId, Geom, GeometryFilter, GraphContextId,
+    Accumulator, AggValue, AggregateFn, AggregateInput, AggregateRequest,
+    CandidateDriver, CollectionId, CollectionOptions, Database, Direction, DropMode,
+    DropPhase, EntityId, Geom, GeometryFilter, GraphContextId,
     ColumnRule, DefaultValue, GroupCmp, GroupKey, GroupOrder, GroupPredicate, GroupRow, IndexExpr,
     IndexFamily, IndexId,
     IndexInfo, IndexState, OwnedScalarValue, PointFilter, ProjectedValue, Projection, QueryBudget,
     QueryFilter, QueryOrder, QueryRequest, QueryRow, ScalarFilter, ScalarValue, ScoreExpr,
     SortDirection, TextMatch, UpdatePatch, VectorMetric, WriteAction, WriteCursor, WriteRequest,
 };
-use sekejap_core::internal::EDGE_FIELD_PREFIX;
 use sekejap_core::spatial_io;
 use sekejap_core::spatial_math::{Bounds, Point};
 use sekejap_core::Kind;
@@ -60,7 +58,6 @@ mod bind;
 mod boolean;
 mod ddl;
 mod dml;
-mod graph_table;
 mod plan;
 mod predicates;
 mod row;
@@ -78,7 +75,8 @@ use row::*;
 
 pub(crate) use aggregate::AggregatePlan;
 pub(crate) use bind::{Binder, Rebind};
-pub(crate) use plan::{Plan, SelectPlan};
+pub(crate) use plan::{GqlSqlPlan, Plan, SelectPlan};
+pub(crate) use row::bytea_text;
 pub(crate) use rows::RowsPlan;
 
 // ── the compiler ──────────────────────────────────────────────────────────
@@ -161,23 +159,69 @@ pub(crate) fn compile(
 }
 
 impl Compiler<'_> {
+    /// The GQL body of `SELECT * FROM GRAPH_TABLE (<graph> ... RETURN ...)`
+    /// with no outer clause: the one shape of a GQL relation compiled until
+    /// M3-D compiles the outer SELECT as one more stage (design §5.5).
+    fn bare_gql(select: &SelectStmt) -> Option<&crate::gql::ast::GqlGraphTable> {
+        let SelectStmt {
+            items,
+            source,
+            predicates,
+            distinct,
+            group,
+            having,
+            order,
+            limit,
+        } = select;
+        let Source::Gql(graph) = source else {
+            return None;
+        };
+        let bare = matches!(items.as_slice(), [(SelectItem::Star, None)])
+            && predicates.is_empty()
+            && !distinct
+            && group.is_none()
+            && having.is_empty()
+            && order.is_none()
+            && limit.is_none();
+        bare.then_some(&**graph)
+    }
+
+    /// Bind and plan a GQL body. The statement's parameters are kept, not
+    /// folded: an execution reads them when it opens.
+    fn gql(&mut self, graph: &crate::gql::ast::GqlGraphTable) -> SqlResult2<GqlSqlPlan> {
+        let plan = crate::gql::plan::GqlPlan::compile(self.db, graph, self.notices)?;
+        Ok(GqlSqlPlan {
+            plan,
+            params: self.params.to_vec(),
+        })
+    }
+
     fn statement(&mut self, statement: Stmt) -> SqlResult2<Plan> {
         Ok(match statement {
-            // A `FROM` that names a CATALOG relation takes the `Rows`
-            // driver: the statement is an ordinary SELECT whose candidates
-            // are a bounded list the compiler builds here (`rows.rs`).
-            Stmt::Select(select) => match Self::catalog_source(&select) {
-                Some(relation) => Plan::Rows(self.catalog_select(relation, *select, false)?),
-                None => match self.aggregate(&select)? {
-                    Some(plan) => Plan::Aggregate(plan),
-                    None => Plan::Select(self.select(*select)?),
+            // `SELECT * FROM GRAPH_TABLE (<graph> ... RETURN ...)` is a GQL
+            // plan. An outer select list or clause over the relation takes
+            // the collection path, which refuses it by name (M3-D). A `FROM`
+            // that names a CATALOG relation takes the `Rows` driver: the
+            // statement is an ordinary SELECT whose candidates are a bounded
+            // list the compiler builds here (`rows.rs`).
+            Stmt::Select(select) => match Self::bare_gql(&select) {
+                Some(graph) => Plan::Gql(self.gql(graph)?),
+                None => match Self::catalog_source(&select) {
+                    Some(relation) => Plan::Rows(self.catalog_select(relation, *select, false)?),
+                    None => match self.aggregate(&select)? {
+                        Some(plan) => Plan::Aggregate(plan),
+                        None => Plan::Select(self.select(*select)?),
+                    },
                 },
             },
-            Stmt::Explain(select) => match Self::catalog_source(&select) {
-                Some(relation) => Plan::Rows(self.catalog_select(relation, *select, true)?),
-                None => match self.aggregate(&select)? {
-                    Some(plan) => Plan::ExplainAggregate(plan),
-                    None => Plan::Explain(self.select(*select)?),
+            Stmt::Explain(select) => match Self::bare_gql(&select) {
+                Some(graph) => Plan::ExplainGql(self.gql(graph)?),
+                None => match Self::catalog_source(&select) {
+                    Some(relation) => Plan::Rows(self.catalog_select(relation, *select, true)?),
+                    None => match self.aggregate(&select)? {
+                        Some(plan) => Plan::ExplainAggregate(plan),
+                        None => Plan::Explain(self.select(*select)?),
+                    },
                 },
             },
             Stmt::SessionRows(items) => Plan::Rows(self.session_rows(&items)?),

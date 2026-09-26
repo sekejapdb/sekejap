@@ -70,7 +70,7 @@ fn want_geom(value: &SqlValue, func: GeoFunc) -> SqlResult2<Geom> {
 /// A `bytea` value as PostgreSQL prints it in hex output: `\x` and the
 /// digits. The wire sends the raw bytes instead when a binary result is
 /// asked for (`dist/src/pg/types.rs`).
-fn bytea_text(bytes: &[u8]) -> String {
+pub(crate) fn bytea_text(bytes: &[u8]) -> String {
     format!("\\x{}", spatial_io::to_hex(bytes))
 }
 
@@ -282,11 +282,11 @@ fn string_function(func: StrFunc, args: &[SqlValue]) -> SqlResult2<SqlValue> {
     Ok(match func {
         StrFunc::Lower => {
             arity(1..=1)?;
-            SqlValue::Text(text(0)?.to_lowercase())
+            SqlValue::Text(functions::lower(&text(0)?))
         }
         StrFunc::Upper => {
             arity(1..=1)?;
-            SqlValue::Text(text(0)?.to_uppercase())
+            SqlValue::Text(functions::upper(&text(0)?))
         }
         StrFunc::Length => {
             arity(1..=1)?;
@@ -294,19 +294,22 @@ fn string_function(func: StrFunc, args: &[SqlValue]) -> SqlResult2<SqlValue> {
         }
         StrFunc::Trim => {
             arity(1..=1)?;
-            SqlValue::Text(text(0)?.trim().to_owned())
+            SqlValue::Text(functions::trim(&text(0)?))
         }
         StrFunc::Concat => {
-            let mut out = String::new();
-            for (at, value) in args.iter().enumerate() {
-                if nullish(value) {
-                    continue;
-                }
-                out.push_str(&want_text(value, func.written()).map_err(|_| {
-                    SqlError::Parameter(format!("concat() argument {} is not text", at + 1))
-                })?);
-            }
-            SqlValue::Text(out)
+            let parts = args
+                .iter()
+                .enumerate()
+                .map(|(at, value)| {
+                    if nullish(value) {
+                        return Ok(None);
+                    }
+                    want_text(value, func.written()).map(Some).map_err(|_| {
+                        SqlError::Parameter(format!("concat() argument {} is not text", at + 1))
+                    })
+                })
+                .collect::<SqlResult2<Vec<_>>>()?;
+            SqlValue::Text(functions::concat(parts))
         }
         StrFunc::Substring => {
             arity(2..=3)?;

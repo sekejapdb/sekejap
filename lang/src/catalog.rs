@@ -138,6 +138,44 @@ pub const PG_TYPES: &[(i32, &str, &str, i32, i64)] = &[
     (OID_VECTOR, "vector", "U", -1, NS_PUBLIC),
 ];
 
+/// The one-dimensional array types a list column or a list parameter uses
+/// (`docs/lang/GQL_PROFILE_DESIGN.md` §6.3), as `(oid, typname, typelem)`.
+/// PostgreSQL's fixed OIDs. A driver looks an array OID up here, reading
+/// `typelem`, before it decodes a value of that type.
+const PG_ARRAY_TYPES: &[(i32, &str, i32)] = &[
+    (1000, "_bool", OID_BOOL),
+    (1009, "_text", OID_TEXT),
+    (1016, "_int8", OID_INT8),
+    (1022, "_float8", OID_FLOAT8),
+    (1182, "_date", OID_DATE),
+    (1185, "_timestamptz", OID_TIMESTAMPTZ),
+    (3807, "_jsonb", OID_JSONB),
+];
+
+/// Every `pg_type` row in OID order: `(oid, typname, typcategory, typlen,
+/// namespace oid, typelem, typarray)`. A scalar with an array type names it
+/// in `typarray`; an array names its element in `typelem`, with category
+/// `A`, as PostgreSQL does.
+fn pg_type_rows() -> Vec<(i32, &'static str, &'static str, i32, i64, i32, i32)> {
+    let mut out: Vec<_> = PG_TYPES
+        .iter()
+        .map(|(oid, name, category, len, namespace)| {
+            let array = PG_ARRAY_TYPES
+                .iter()
+                .find(|(_, _, element)| element == oid)
+                .map_or(0, |(array, _, _)| *array);
+            (*oid, *name, *category, *len, *namespace, 0, array)
+        })
+        .chain(
+            PG_ARRAY_TYPES
+                .iter()
+                .map(|(oid, name, element)| (*oid, *name, "A", -1, NS_PG_CATALOG, *element, 0)),
+        )
+        .collect();
+    out.sort_by_key(|row| row.0);
+    out
+}
+
 /// The PostgreSQL type a declared e4 column is reported as: `(oid, typname)`.
 ///
 /// `TIMESTAMPTZ` and `DATE` are both `Kind::Int` (`docs/lang/QL_CONTRACT.md`
@@ -1110,24 +1148,24 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
                 })
             })
             .collect(),
-        ("pg_catalog", "pg_type") => PG_TYPES
-            .iter()
-            .map(|(oid, name, category, len, namespace)| {
+        ("pg_catalog", "pg_type") => pg_type_rows()
+            .into_iter()
+            .map(|(oid, name, category, len, namespace, element, array)| {
                 vec![
-                    int(i64::from(*oid)),
-                    text(*name),
-                    int(*namespace),
+                    int(i64::from(oid)),
+                    text(name),
+                    int(namespace),
                     int(OWNER),
-                    int(i64::from(*len)),
-                    SqlValue::Bool(*len > 0),
+                    int(i64::from(len)),
+                    SqlValue::Bool(len > 0),
                     text("b"),
-                    text(*category),
+                    text(category),
                     SqlValue::Bool(false),
                     SqlValue::Bool(true),
                     text(","),
                     int(0),
-                    int(0),
-                    int(0),
+                    int(i64::from(element)),
+                    int(i64::from(array)),
                     SqlValue::Bool(false),
                     int(0),
                     int(-1),
