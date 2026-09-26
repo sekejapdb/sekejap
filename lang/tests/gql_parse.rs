@@ -189,6 +189,13 @@ fn every_later_construct_is_refused_by_name_with_its_milestone() {
     }
 }
 
+/// The rows a statement reaches only when it is BOUND (they need the
+/// pattern's shape, not its words), with the test that reaches each.
+const BOUND: &[(&str, &str)] = &[(
+    "ANY CHEAPEST over several edge steps",
+    "gql_automaton.rs::refusals_cost_belongs_to_any_cheapest",
+)];
+
 #[test]
 fn the_gql_table_is_well_formed_and_every_row_is_reached() {
     let mut seen: Vec<&str> = Vec::new();
@@ -204,7 +211,7 @@ fn the_gql_table_is_well_formed_and_every_row_is_reached() {
             Tier::Three => assert!(reason.contains("not adopted"), "`{keyword}`: {reason}"),
         }
         assert!(
-            REFUSED.iter().any(|(_, name, _)| name == keyword),
+            REFUSED.iter().any(|(_, name, _)| name == keyword) || BOUND.iter().any(|(name, _)| name == keyword),
             "no statement above reaches the GQL row `{keyword}`"
         );
     }

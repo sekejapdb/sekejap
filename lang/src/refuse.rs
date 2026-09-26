@@ -163,6 +163,7 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
 /// does not adopt because another spelling already says it.
 pub(crate) const GQL_TABLE: &[(&str, Tier, &str)] = &[
     // ── P1: after the P0 release ─────────────────────────────────────────
+    ("ANY CHEAPEST over several edge steps", Tier::Two, "GQL profile P1: the cheapest search takes ONE COST, so an ANY CHEAPEST pattern crosses exactly one edge step -- one edge, quantified or not -- which carries it (design Q36). A COST per step over several edge steps is a P1 construct."),
     ("search()", Tier::Two, "GQL profile P1: the typo-tolerant `search()` and `search_score()` inside a GQL body are P1 constructs (design Q30). A GQL body matches text through the index as SQL spells it, `to_tsvector('simple', n.field) @@ to_tsquery('simple', q)`, and ranks with `bm25(n.field, q)`."),
     ("ALL SHORTEST", Tier::Two, "GQL profile P1: ALL SHORTEST is a P1 construct, after the P0 release."),
     ("SIMPLE", Tier::Two, "GQL profile P1: the SIMPLE path mode is a P1 construct, after the P0 release."),

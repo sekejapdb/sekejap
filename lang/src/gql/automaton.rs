@@ -244,9 +244,7 @@ pub(crate) fn layout<'a>(
     let cost = match selector {
         Some(Selector::Cheapest) => {
             if edges != 1 {
-                return Err(SqlError::unsupported(format!(
-                    "ANY CHEAPEST here crosses {edges} edge steps: the profile's cheapest search takes ONE COST, so its pattern crosses exactly one edge step -- one edge, quantified or not -- which carries it (a COST per step is not built, GQL profile M4-C)"
-                )));
+                return Err(crate::refuse::gql_refuse("ANY CHEAPEST over several edge steps"));
             }
             match costs.as_slice() {
                 [cost] => Some(*cost),

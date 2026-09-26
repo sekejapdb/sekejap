@@ -48,6 +48,7 @@ mod horizontal;
 mod host;
 mod lineage;
 mod parse;
+mod registry;
 pub(crate) mod plan;
 mod scalar;
 pub(crate) mod schema;

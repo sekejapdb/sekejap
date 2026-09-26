@@ -191,12 +191,19 @@ impl HostEx {
     pub(crate) fn show(&self, show: &dyn Fn(&Ex) -> String) -> String {
         match self {
             Self::Text {
+                node,
                 field,
                 query,
                 score: false,
                 ..
-            } => format!("to_tsvector('simple', <node>.{field}) @@ to_tsquery('simple', {})", lit(&query.source)),
-            Self::Text { field, query, .. } => format!("bm25(<node>.{field}, {})", lit(&query.source)),
+            } => format!(
+                "to_tsvector('simple', {}.{field}) @@ to_tsquery('simple', {})",
+                show(&Ex::Slot(*node)),
+                lit(&query.source)
+            ),
+            Self::Text { node, field, query, .. } => {
+                format!("bm25({}.{field}, {})", show(&Ex::Slot(*node)), lit(&query.source))
+            }
             Self::Spatial {
                 predicate,
                 left,

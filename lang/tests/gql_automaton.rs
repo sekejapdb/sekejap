@@ -297,10 +297,11 @@ fn refusals_cost_belongs_to_any_cheapest() {
             "MATCH ANY CHEAPEST (a WHERE a._key = 'n0')-[e]->{1,2}(b) RETURN b._key AS k",
             "COST",
         ),
-        // More than one edge step (M4-C: one COST).
+        // More than one edge step (M4-C: one COST): the P1 row of
+        // `refuse::GQL_TABLE` (design Q36), refused by name.
         (
             "MATCH ANY CHEAPEST (a WHERE a._key = 'n0')-[e COST e.w]->{1,2}(b)-[f COST f.w]->(c) RETURN c._key AS k",
-            "one edge step",
+            "ANY CHEAPEST over several edge steps",
         ),
         // A COST that reads another element.
         (
