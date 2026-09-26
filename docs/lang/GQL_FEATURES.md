@@ -92,7 +92,7 @@ identifier would read as a claim.
 | `ANY CHEAPEST` crosses one edge step, which carries the one `COST` | the cheapest search takes one cost (P1 for several) |
 | `CALL` names its imports: `CALL (a, b) { ... }` or `CALL () { ... }` | a body sees only what it imports; there is no implicit import |
 | `UNION` branches match their columns by name and position | the result has one column list |
-| a vector order inside a body is exact unless `SET LOCAL ef_search` is set | owner decision; the SQL surface's default over an approximate-only column is approximate |
+| a vector order inside a body is exact unless `SET LOCAL ef_search` is set, whatever vector indexes the column has | owner decision, the opt-in Oracle (`FETCH APPROX`) and Spanner (`APPROX_` functions) also take; the SQL surface keeps pgvector's default, approximate over an approximate-only column |
 | a text form needs a READY text index on the field | there is no text analyzer outside an index; the row is never re-tokenized |
 | inside a body, an absent property and a stored null are both `NULL`; `IS MISSING` is SQL-only, and `PROPERTY_NAMES` tells whether a property is present | brief rule 8: a missing property evaluates to null in GQL; the SQL surface's missing contract is unchanged |
 

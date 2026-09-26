@@ -186,8 +186,11 @@ number and before `NULL`.
 **Exact unless asked.** Inside a body, a vector order is exact. With
 `SET LOCAL ef_search = n` in the same transaction, and an approximate
 (vamana or quantized) index on the column, it becomes approximate with that
-shortlist, and `EXPLAIN` says so. The setting is read when a statement runs,
-so one prepared statement follows the transaction it runs in.
+shortlist, and `EXPLAIN` says so -- also when that is the column's only
+vector index, which without the setting is read unordered and sorted whole.
+This is the opt-in Oracle writes as `FETCH APPROX` and Spanner as its
+`APPROX_` distance functions. The setting is read when a statement runs, so
+one prepared statement follows the transaction it runs in.
 
 ## Parameters
 
