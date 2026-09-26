@@ -670,7 +670,7 @@ fn a_leaf_with_no_set_is_refused_at_prepare() {
             "phrase",
             QueryFilter::Text {
                 index: f.index.text,
-                query: "kebun sekolah",
+                query: "garden harbour",
                 matching: TextMatch::Phrase,
             },
             "phrase cannot be a boolean leaf",

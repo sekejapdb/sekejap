@@ -39,7 +39,7 @@ use tempfile::TempDir;
 const RADIUS_METRES: f64 = 18_000.0;
 const BORN_LOWER: i64 = 19_520_101;
 const BORN_UPPER: i64 = 19_800_101;
-const TERM: &str = "kopi";
+const TERM: &str = "coffee";
 
 fn open() -> (TempDir, fixture::Fixture) {
     let dir = TempDir::new().unwrap();

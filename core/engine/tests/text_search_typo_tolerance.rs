@@ -239,9 +239,9 @@ impl Fixture {
 /// bounded walk has something to accept and something to refuse.
 fn corpus() -> Vec<String> {
     let words = [
-        "kebun", "kebon", "kebunan", "kabun", "sekolah", "sekola", "sekolahan", "jembatan",
-        "jambatan", "warung", "waring", "gudang", "pasar", "pasir", "kopi", "kopo", "sawah",
-        "sawa", "danau", "danu", "hutan", "hutang", "kantor", "kantir", "desa", "desi", "mesa",
+        "garden", "garsen", "gardenan", "girden", "harbour", "harbou", "harbouran", "mountain",
+        "mauntain", "resort", "resolt", "temple", "market", "marcet", "coffee", "coffey", "field",
+        "fiel", "ocean", "ocan", "woods", "woodsy", "office", "offise", "lake", "laki", "make",
     ];
     let mut texts = Vec::new();
     let mut state = 0x243F_6A88_85A3_08D3u64;
@@ -342,28 +342,28 @@ fn the_last_token_completes_as_a_prefix_and_the_earlier_tokens_do_not() {
     let f = build(
         temp.path(),
         &[
-            "kebun sekolah".to_owned(),
-            "sekolah kebun".to_owned(),
-            "kebun warung".to_owned(),
+            "beach harbour".to_owned(),
+            "harbour beach".to_owned(),
+            "beach resort".to_owned(),
         ],
     );
-    // `sekol` is four characters short of `sekolah`; with no edit budget at
-    // five characters it can only be reached by completing a prefix.
-    assert_eq!(f.rows("sekol").len(), 2, "the only token is the last one");
-    // The same token written FIRST does not complete: `sekol` is not a term,
-    // and one edit does not reach `sekolah` from it either.
+    // `harbo` is two characters short of `harbour`; it is not itself a term,
+    // so it can only be reached by completing a prefix.
+    assert_eq!(f.rows("harbo").len(), 2, "the only token is the last one");
+    // The same token written FIRST does not complete: `harbo` is not a term,
+    // and no edit budget reaches `harbour` from it either.
     assert!(
-        f.rows("sekol kebun").is_empty(),
+        f.rows("harbo beach").is_empty(),
         "an earlier token must not complete as a prefix"
     );
     // Written last, it completes, and the earlier token still has to match a
     // whole term.
-    assert_eq!(f.rows("kebun sekol").len(), 2);
+    assert_eq!(f.rows("beach harbo").len(), 2);
     assert!(
-        f.rows("kebu sekolah").is_empty(),
-        "`kebu` is four characters, which the edit rule gives no edits, and it is not the last token"
+        f.rows("beac harbour").is_empty(),
+        "`beac` is four characters, which the edit rule gives no edits, and it is not the last token"
     );
-    assert_eq!(f.rows("sekolah kebu").len(), 2, "`kebu` completes `kebun`");
+    assert_eq!(f.rows("harbour beac").len(), 2, "`beac` completes `beach`");
 }
 
 #[test]
@@ -372,25 +372,25 @@ fn the_edit_bound_is_none_up_to_four_characters_one_up_to_eight_and_two_beyond()
     let f = build(
         temp.path(),
         &[
-            "kopi".to_owned(),
-            "jembatan".to_owned(),
-            "pembangunan".to_owned(),
+            "reef".to_owned(),
+            "mountain".to_owned(),
+            "destination".to_owned(),
         ],
     );
     // Four characters, no edits: one substitution is not reachable. Written
     // last it would COMPLETE, so the query pins the token with a word that
     // cannot help it.
-    assert!(f.rows("kzpi jembatan").is_empty(), "four characters spend no edit");
+    assert!(f.rows("rzef mountain").is_empty(), "four characters spend no edit");
     // Eight characters, one edit.
-    assert_eq!(f.rows("jembztan").len(), 1);
+    assert_eq!(f.rows("mounzain").len(), 1);
     assert!(
-        f.rows("jzmbztan kopi").is_empty(),
+        f.rows("mzunzain reef").is_empty(),
         "eight characters spend one edit, not two"
     );
     // Eleven characters, two edits.
-    assert_eq!(f.rows("pzmbzngunan").len(), 1);
+    assert_eq!(f.rows("dzstinztion").len(), 1);
     assert!(
-        f.rows("pzmbzngunzn kopi").is_empty(),
+        f.rows("dzstinztizn reef").is_empty(),
         "eleven characters spend two edits, not three"
     );
 }
@@ -398,24 +398,24 @@ fn the_edit_bound_is_none_up_to_four_characters_one_up_to_eight_and_two_beyond()
 #[test]
 fn an_exact_term_scores_one_an_edit_scores_less_and_a_longer_prefix_scores_more() {
     let temp = tempfile::tempdir().unwrap();
-    let f = build(temp.path(), &["kebun".to_owned()]);
+    let f = build(temp.path(), &["garden".to_owned()]);
     let one = |query: &str| -> f64 {
         let scored = f.scored(query);
         assert_eq!(scored.len(), 1, "query {query:?} named {scored:?}");
         scored[0].1
     };
-    let exact = one("kebun");
+    let exact = one("garden");
     assert!(
         (exact - 1.0).abs() < 1e-12,
         "an exact term match is 1.0, found {exact}"
     );
-    let edited = one("kebin");
+    let edited = one("gardem");
     assert!(
         edited < exact,
         "a one-edit match ({edited}) must score strictly less than an exact one ({exact})"
     );
-    let long = one("kebu");
-    let short = one("keb");
+    let long = one("garde");
+    let short = one("gard");
     assert!(
         long > short,
         "completing one character ({long}) must score strictly more than completing two ({short})"
@@ -436,7 +436,7 @@ fn a_walk_that_would_pass_its_bound_is_truncated_and_says_so() {
         texts.push(format!("aaaaaaaaa{n:05}"));
     }
     let f = build(temp.path(), &texts);
-    let plain = f.db.search_expansion(f.index, "kopi").unwrap();
+    let plain = f.db.search_expansion(f.index, "coffee").unwrap();
     assert!(
         !plain.truncated,
         "a token no dictionary entry can reach must prune instead of truncating: {plain:?}"
@@ -461,11 +461,11 @@ fn a_walk_that_would_pass_its_bound_is_truncated_and_says_so() {
 fn a_search_answers_under_a_query_budget_and_a_refusal_names_its_resource() {
     let temp = tempfile::tempdir().unwrap();
     let f = build(temp.path(), &corpus());
-    let generous = f.run("kebun sekol", QueryOrder::Driver, QueryBudget::unlimited());
+    let generous = f.run("garden harbo", QueryOrder::Driver, QueryBudget::unlimited());
     assert!(!generous.unwrap().is_empty());
     let mut budget = QueryBudget::unlimited();
     budget.text_postings = 3;
-    let refused = f.run("kebun sekol", QueryOrder::Driver, budget);
+    let refused = f.run("garden harbo", QueryOrder::Driver, budget);
     match refused {
         Err(QueryError::BudgetExceeded { resource, .. }) => {
             assert_eq!(resource, WorkResource::TextPostings);
