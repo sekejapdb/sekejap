@@ -15,8 +15,8 @@
 //! collection, or `NULL` -- is an empty stream, never an error.
 
 use super::super::super::{
-    corrupt_query, invalid_query, CandidateDriver, PreparedQuery, Projection, QueryError,
-    QueryOrder, QueryPage, QueryRequest, QueryResult, QueryRow, WorkResource,
+    corrupt_query, invalid_query, CandidateDriver, PreparedQuery, Projection, QueryOrder,
+    QueryRequest, QueryResult, QueryRow, WorkResource,
 };
 use super::super::host::ExecMeter;
 use super::super::plan::SeedSource;
@@ -223,54 +223,9 @@ impl<'q> Paged<'q> {
             if self.done {
                 return Ok(None);
             }
-            let page = engine_page(&mut self.query, meter)?;
+            let page = meter.engine_page(&mut self.query, SEED_PAGE_ROWS)?;
             self.done = page.done;
             self.rows = page.rows.into_iter();
         }
-    }
-}
-
-/// One engine page of `query`, run under what is LEFT of the GQL page's
-/// budget, with the GQL page's cancellation, and charged to its meter.
-///
-/// A refusal inside the engine page names the resource against the budget
-/// it was handed -- the remainder. It is restated against the whole GQL
-/// page: the limit that page was given, and the total the charge would have
-/// reached. Which resources [`QueryBudget::left_after`] subtracts is read
-/// off the refusal itself, so no list of them is kept here to drift from
-/// it: a resource it subtracted was handed exactly the page's limit less
-/// what the page had spent; one it passes through was handed the whole
-/// limit and is restated as it is.
-///
-/// [`QueryBudget::left_after`]: super::super::super::QueryBudget
-fn engine_page(query: &mut PreparedQuery<'_>, meter: &mut ExecMeter<'_>) -> QueryResult<QueryPage> {
-    let base = meter.base();
-    let budget = base.limit.left_after(&base.used);
-    match query.next_page(SEED_PAGE_ROWS, budget, &mut *base.cancelled) {
-        Ok(page) => {
-            base.used.add_page(&page.work);
-            Ok(page)
-        }
-        Err(QueryError::BudgetExceeded {
-            resource,
-            limit,
-            attempted,
-        }) => {
-            let (used, total) = base.slot(resource);
-            let spent = *used;
-            if spent > 0 && total.checked_sub(spent) == Some(limit) {
-                return Err(QueryError::BudgetExceeded {
-                    resource,
-                    limit: total,
-                    attempted: attempted.saturating_add(spent),
-                });
-            }
-            Err(QueryError::BudgetExceeded {
-                resource,
-                limit,
-                attempted,
-            })
-        }
-        Err(error) => Err(error),
     }
 }

@@ -28,7 +28,8 @@ pub use cursor::{GqlCursor, GqlPage};
 pub use host::{EvalCx, ExecMeter, ExprId, GqlHost, SeedId, Truth};
 pub use paths::{EdgeStep, NodeTest, PathAutomaton, PathLink, PathMode, Repeat};
 pub use plan::{
-    AggSpec, CountExpr, OpSpec, PathSearch, ReachSpec, SeedSource, SortKey, StepSpec, Target,
+    AggSpec, CountExpr, ExistsMode, OpSpec, PathSearch, ReachSpec, SeedSource, SortKey, StepSpec,
+    Target,
 };
 pub use reader::ElementReader;
 pub use value::{BindingRow, BindingValue, EdgeRef, ListRef, NodeRef, PathRef, SlotId, ValueType};

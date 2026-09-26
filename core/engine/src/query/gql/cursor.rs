@@ -118,6 +118,7 @@ impl<'q> GqlCursor<'q> {
             meter: &mut meter,
             page: self.pages,
             argument: None,
+            replay: None,
         };
         let mut rows = Vec::new();
         let pulled = loop {

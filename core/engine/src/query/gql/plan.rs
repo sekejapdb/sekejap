@@ -28,6 +28,18 @@
 //! [`OpSpec::OptionalApply`] and its [`OpSpec::Argument`] leaf are M3-F's:
 //! `OPTIONAL MATCH`. [`OpSpec::Reach`] is M4-F's: the existing node BFS,
 //! where the planner has proved it answers a path pattern (§4.6).
+//! [`OpSpec::ExistsApply`], [`OpSpec::CallApply`], [`OpSpec::Union`],
+//! [`OpSpec::Buffered`] and [`OpSpec::Replay`] are M5-B's: `EXISTS`, `CALL`
+//! and `UNION` (`docs/lang/GQL_PROFILE_DESIGN_M5_M7.md` §2.3-§2.5).
+//!
+//! WHERE an operator may stand is part of the vocabulary. A plan's leaves
+//! are [`OpSpec::Unit`] at the top, [`OpSpec::Argument`] inside an apply's
+//! inner side, and [`OpSpec::Replay`] inside a branch of a buffered union.
+//! The inner side of an `OptionalApply` or an `ExistsApply` holds only
+//! streaming operators; a `CallApply`'s may also hold `Project`,
+//! `Aggregate`, `Distinct`, `Sort`, `Page` and `CallApply`. `Union` and
+//! `Buffered` stand only at the top, outside every inner side and branch
+//! after `NEXT`.
 
 use super::host::{ExprId, SeedId};
 use super::paths::PathAutomaton;
@@ -161,16 +173,80 @@ pub enum OpSpec {
     /// `inner`, so it decides whether a match exists and never drops an
     /// input row. `inner` keeps the input's width and holds only streaming
     /// operators: `Seed`, `Expand`, `Filter`, `Let`, `Unnest`, `PathSearch`,
-    /// `Reach` and `OptionalApply`.
+    /// `Reach`, `OptionalApply` and `ExistsApply`.
     OptionalApply {
         input: Box<OpSpec>,
         inner: Box<OpSpec>,
         introduced: Box<[SlotId]>,
     },
-    /// The leaf of an [`OpSpec::OptionalApply`]'s `inner` side: the input
-    /// row being joined, once. `width` is that row's; anywhere else the
-    /// plan is refused.
+    /// The leaf of an apply's `inner` side ([`OpSpec::OptionalApply`],
+    /// [`OpSpec::ExistsApply`], [`OpSpec::CallApply`]): the input row being
+    /// joined, once. `width` is that row's; anywhere else the plan is
+    /// refused.
     Argument { width: u16 },
+    /// `EXISTS { ... }` and `NOT EXISTS { ... }`: per input row, `inner` runs
+    /// from that row -- its leaf an [`OpSpec::Argument`] of the input's
+    /// width -- until its FIRST row, and is then dropped; `mode` says what
+    /// the answer does to the row. At most one row out per row in: an inner
+    /// side with many matches never multiplies the row. The inner tree is
+    /// built afresh for each input row, because one stopped at its first row
+    /// may still hold a refill or a search frontier (a named cost: one small
+    /// allocation per input row, no store read). `inner` holds the streaming
+    /// operators an `OptionalApply`'s does, and `ExistsApply`.
+    ExistsApply {
+        input: Box<OpSpec>,
+        inner: Box<OpSpec>,
+        mode: ExistsMode,
+    },
+    /// `CALL (imports) { ... }`: a LATERAL INNER join, per input row. A fresh
+    /// instance of `inner` runs from each input row (its leaf an
+    /// [`OpSpec::Argument`] of the input's width); each row it returns,
+    /// `outputs.len()` slots wide, is written into the `outputs` slots of a
+    /// copy of the input row, which is one output row. An input row whose
+    /// `inner` returns nothing is dropped. `inner` may hold blocking
+    /// operators -- per-input grouping and top-k are the point of `CALL` --
+    /// and what they hold is given back when each input row's tree is
+    /// dropped. Charges `binding_rows` 1 per row out.
+    CallApply {
+        input: Box<OpSpec>,
+        inner: Box<OpSpec>,
+        outputs: Box<[SlotId]>,
+    },
+    /// `UNION ALL`: the rows of each branch in turn, branch order then row
+    /// order; every branch's rows are `width` slots wide. Each branch is a
+    /// plan of its own whose leaf is a [`OpSpec::Unit`] (a first part) or,
+    /// under an [`OpSpec::Buffered`], a [`OpSpec::Replay`]. `UNION` (and
+    /// `UNION DISTINCT`) is the existing [`OpSpec::Distinct`] over this
+    /// operator, not a second implementation. Charges nothing itself.
+    Union { branches: Box<[OpSpec]>, width: u16 },
+    /// A union after `NEXT`: `input`, the incoming table, is read ONCE and
+    /// held, then handed to each [`OpSpec::Replay`] leaf of `union` -- which
+    /// must be an [`OpSpec::Union`] -- from its start, so every branch sees
+    /// the whole table. The table is charged as `sort_bytes`, held until the
+    /// last branch has replayed it and refused past the cap like any
+    /// blocking operator (Q25). `UNION` is an [`OpSpec::Distinct`] over this
+    /// operator.
+    Buffered {
+        input: Box<OpSpec>,
+        union: Box<OpSpec>,
+    },
+    /// The leaf of a branch of a [`OpSpec::Buffered`] union: every row of
+    /// the incoming table, in order. `width` is that table's; anywhere else
+    /// the plan is refused.
+    Replay { width: u16 },
+}
+
+/// What an [`OpSpec::ExistsApply`]'s answer does to its input row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExistsMode {
+    /// A top-level conjunct of a filter: keep the input row when the inner
+    /// side gives a row (`negated` false) or gives none (`negated` true),
+    /// and drop it otherwise.
+    Filter { negated: bool },
+    /// Anywhere else (inside `OR`, `CASE`, `LET`, `RETURN`): keep every
+    /// input row, with whether the inner side gave a row written into
+    /// `slot` as a `Bool`. The expression reads that slot.
+    Mark { slot: SlotId },
 }
 
 /// One [`OpSpec::Reach`]: the edges the BFS crosses, its depth bounds, and

@@ -13,18 +13,23 @@
 //! | an edge's bag when it does not (an incoming hop) | one point read of the primary posting (`graph_edges`, as a traversal charges it) |
 //! | a label | nothing charged: the collection and the edge type ride in the identity, and the name is catalog metadata |
 //! | `ELEMENT_ID` | nothing: a function of the identity |
+//! | does a node's text match a query; its BM25 score | what a one-id engine query over the text index charges: one candidate, the row's norm and one point read per query term (`text_postings`), and for a phrase the row's tokens (`text_tokens`) -- never a term's whole posting list |
 //!
 //! Inside the profile a property absent from its row and a stored null are
 //! one `Null` (§2.5). The difference survives only in the property NAMES: a
 //! stored null is a present property, an absent one is not there.
 
 use super::super::rows::{decode_row, project_value_or_sidecar, RowData};
-use super::super::{corrupt_query, QueryResult, WorkResource};
+use super::super::{
+    corrupt_query, invalid_query, CandidateDriver, OrderValue, Projection, QueryFilter, QueryOrder,
+    QueryRequest, QueryResult, QueryRow, WorkResource,
+};
 use super::budget::GqlMeter;
 use super::value::{BindingValue, EdgeRef, NodeRef};
-use crate::collections::{row_key, Database, Error, ProjectedValue, KEY_FIELD};
+use crate::collections::{row_key, Database, Error, IndexId, ProjectedValue, KEY_FIELD};
 use crate::index::graph::adjacency::primary_posting;
 use crate::index::graph::{decode_properties, read_name};
+use crate::index::text::TextMatch;
 use crate::{dense_v3, Kind};
 use serde_json::Value;
 use std::sync::Arc;
@@ -163,6 +168,97 @@ impl<'db> ElementReader<'db> {
         Ok(name.name)
     }
 
+    /// Does `node`'s text, as text index `index` holds it, match `query`
+    /// under `matching` -- the answer the collection-level text query gives
+    /// for that one row? A node of another collection than the index's, an
+    /// index that is not a READY text index, or a budget refusal is an
+    /// error, never `false`.
+    pub fn text_matches<C: FnMut() -> bool>(
+        &self,
+        node: NodeRef,
+        index: IndexId,
+        query: &str,
+        matching: TextMatch,
+        meter: &mut GqlMeter<'_, C>,
+    ) -> QueryResult<bool> {
+        per_node(matching)?;
+        let text = QueryFilter::Text {
+            index,
+            query,
+            matching,
+        };
+        Ok(self
+            .one_id(node, Some(text), QueryOrder::EntityId, meter)?
+            .is_some())
+    }
+
+    /// `node`'s BM25 score for `query` under `matching` over text index
+    /// `index`: the score the collection-level BM25 order gives that row,
+    /// and `0.0` when the row does not match -- where the SQL `bm25()` leaf
+    /// puts a non-matching row (`ScoreExpr::Bm25`). Errors as
+    /// [`ElementReader::text_matches`].
+    pub fn text_score<C: FnMut() -> bool>(
+        &self,
+        node: NodeRef,
+        index: IndexId,
+        query: &str,
+        matching: TextMatch,
+        meter: &mut GqlMeter<'_, C>,
+    ) -> QueryResult<f64> {
+        per_node(matching)?;
+        // No text filter: the order admits only the rows that match.
+        let order = QueryOrder::Bm25 {
+            index,
+            query,
+            matching,
+        };
+        match self.one_id(node, None, order, meter)? {
+            None => Ok(0.0),
+            Some(QueryRow {
+                order: OrderValue::Bm25(score),
+                ..
+            }) => Ok(score),
+            Some(row) => Err(corrupt_query(format!(
+                "a BM25 order reported {:?}",
+                row.order
+            ))),
+        }
+    }
+
+    /// The row of `node` a one-id engine query answers -- `node`'s id as
+    /// the candidate driver, `filter` if any, and `order` -- or `None` when
+    /// the query drops it. The query is paged under what is left of
+    /// `meter`'s budget and charged to it.
+    fn one_id<C: FnMut() -> bool>(
+        &self,
+        node: NodeRef,
+        filter: Option<QueryFilter<'_>>,
+        order: QueryOrder<'_>,
+        meter: &mut GqlMeter<'_, C>,
+    ) -> QueryResult<Option<QueryRow>> {
+        let ids = [node.0];
+        let filters: Vec<QueryFilter<'_>> = std::iter::once(QueryFilter::Ids(&ids))
+            .chain(filter)
+            .collect();
+        let mut query = self.db.prepare_query(QueryRequest {
+            collection: node.0.collection,
+            filters: &filters,
+            order,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Filter(0),
+        })?;
+        loop {
+            let page = meter.engine_page(&mut query, 1)?;
+            if let Some(row) = page.rows.into_iter().next() {
+                return Ok(Some(row));
+            }
+            if page.done {
+                return Ok(None);
+            }
+        }
+    }
+
     /// `node`'s row, one charged primary read. A node reference is made
     /// only from this snapshot, so a missing row is corruption.
     fn row<C: FnMut() -> bool>(
@@ -179,6 +275,18 @@ impl<'db> ElementReader<'db> {
         meter.base().note_row_decode();
         decode_row(self.db, bytes)
     }
+}
+
+/// Refuse the typo-tolerant [`TextMatch::Search`] per node (design Q30):
+/// its dictionary walk may stop at a bound and say so in a notice
+/// (`QL_CONTRACT` §4.6), and a per-node answer has nowhere to carry it.
+fn per_node(matching: TextMatch) -> QueryResult<()> {
+    if matching == TextMatch::Search {
+        return Err(invalid_query(
+            "the typo-tolerant search() is not read per node: its dictionary walk can stop at a bound with a notice a per-node answer cannot carry",
+        ));
+    }
+    Ok(())
 }
 
 /// `ELEMENT_ID` (design Q16): an opaque text, unique among the elements of

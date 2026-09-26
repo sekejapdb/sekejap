@@ -20,12 +20,17 @@
 //! | `page.rs` | `Page` |
 //! | `unnest.rs` | `Unnest` |
 //! | `optional.rs` | `OptionalApply`, and its `Argument` leaf |
+//! | `exists.rs` | `ExistsApply` (filter and mark forms) |
+//! | `call.rs` | `CallApply` |
+//! | `union.rs` | `Union`, `Buffered` and its `Replay` leaf |
 //! | `reach.rs` | `Reach`: the existing node BFS, where the planner proved it |
 //! | `../paths/enumerate.rs` | `PathSearch::Enumerate` |
 //! | `../paths/bfs.rs`, `../paths/dijkstra.rs` | `PathSearch::Any`, `Shortest`, `Cheapest` |
 
 mod aggregate;
+mod call;
 mod distinct;
+mod exists;
 mod expand;
 mod filter;
 mod optional;
@@ -34,14 +39,16 @@ mod project;
 mod reach;
 mod seed;
 mod sort;
+mod union;
 mod unnest;
 
-pub(super) use expand::{ranges, refill, Range};
+pub(super) use expand::{ranges, refill, Range, REFILL_POSTINGS};
 
 use super::super::{invalid_query, PreparedQuery, QueryResult, WorkResource};
 use super::host::{EvalCx, ExecMeter, ExprId, GqlHost, SeedId, Truth};
 use super::paths::{Enumerate, Select};
-use super::plan::{CountExpr, OpSpec, PathSearch, SeedSource, Target};
+use super::budget::MEMORY;
+use super::plan::{CountExpr, ExistsMode, OpSpec, PathSearch, SeedSource, Target};
 use super::reader::ElementReader;
 use super::value::{BindingRow, BindingValue, SlotId};
 use crate::collections::{Database, EntityId};
@@ -67,9 +74,12 @@ pub(super) struct ExecCx<'q, 'x, 'm> {
     /// The cursor's page count, from 1: a [`Held`] that sees a new number
     /// charges what it holds to this page's meter, which started empty.
     pub(super) page: u64,
-    /// The input row an `OptionalApply` hands its inner side, until the
-    /// inner side's `Argument` leaf takes it (`optional.rs`).
+    /// The input row an apply hands its inner side, until the inner side's
+    /// `Argument` leaf takes it (`optional.rs`).
     pub(super) argument: Option<BindingRow>,
+    /// The incoming table a `Buffered` lends its union while it pulls it,
+    /// which the branches' `Replay` leaves read (`union.rs`).
+    pub(super) replay: Option<Vec<BindingRow>>,
 }
 
 /// The memory a blocking operator -- or a path search's stack, frontier
@@ -203,44 +213,67 @@ impl<'q, 'm> ExecCx<'q, '_, 'm> {
 /// `params` are the execution's: an `OFFSET` / `LIMIT` parameter is read,
 /// and range-checked, here.
 pub(super) fn build<'q>(spec: &'q OpSpec, params: &[BindingValue]) -> QueryResult<(Op<'q>, u16)> {
-    build_in(spec, params, None)
+    build_in(spec, params, Scope::Top)
 }
 
-/// [`build`], inside the inner side of an `OptionalApply` whose input rows
-/// are `argument` slots wide, or outside any (`None`). An inner side runs
-/// again from each input row, so it holds only streaming operators, and its
-/// leaf is the `Argument` that hands it that row.
-fn build_in<'q>(
+/// The kind of apply whose inner side is being built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InnerKind {
+    Optional,
+    Exists,
+    Call,
+}
+
+/// Where an operator is being built, which decides the leaf it may stand on
+/// and the operators it may use.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Scope {
+    /// Outside every inner side and buffered branch: the leaf is `Unit`.
+    Top,
+    /// The inner side of an apply of this kind, whose input rows are this
+    /// wide: the leaf is `Argument`. An inner side runs again from each
+    /// input row. An `OptionalApply`'s or `ExistsApply`'s holds only
+    /// streaming operators; a `CallApply`'s may also hold blocking ones,
+    /// because its tree is built afresh per input row.
+    Inner(InnerKind, u16),
+    /// A branch of a buffered union, whose incoming table is this wide: the
+    /// leaf is `Replay`.
+    Replayed(u16),
+}
+
+/// [`build`], in `scope`.
+pub(super) fn build_in<'q>(
     spec: &'q OpSpec,
     params: &[BindingValue],
-    argument: Option<u16>,
+    scope: Scope,
 ) -> QueryResult<(Op<'q>, u16)> {
-    if argument.is_some() {
-        if let OpSpec::Unit { .. }
-        | OpSpec::Project { .. }
-        | OpSpec::Aggregate { .. }
-        | OpSpec::Distinct { .. }
-        | OpSpec::Sort { .. }
-        | OpSpec::Page { .. } = spec
-        {
-            return Err(invalid_query(
-                "the inner side of an OptionalApply holds only Argument, Seed, Expand, Filter, Let, Unnest, PathSearch, Reach and OptionalApply",
-            ));
-        }
-    }
-    let build = |spec: &'q OpSpec, params: &[BindingValue]| build_in(spec, params, argument);
+    refuse_in(spec, scope)?;
+    let build = |spec: &'q OpSpec, params: &[BindingValue]| build_in(spec, params, scope);
     Ok(match spec {
         OpSpec::Unit { width } => (Box::new(project::Unit::new(*width)), *width),
-        OpSpec::Argument { width } => match argument {
-            Some(input) if input == *width => (Box::new(optional::Argument), *width),
-            Some(input) => {
+        OpSpec::Argument { width } => match scope {
+            Scope::Inner(_, input) if input == *width => (Box::new(optional::Argument), *width),
+            Scope::Inner(_, input) => {
                 return Err(invalid_query(format!(
-                    "an Argument of {width} slots under an OptionalApply whose input rows have {input}"
+                    "an Argument of {width} slots under an apply whose input rows have {input}"
                 )))
             }
-            None => {
+            _ => {
                 return Err(invalid_query(
-                    "an Argument stands only at the leaf of an OptionalApply's inner side",
+                    "an Argument stands only at the leaf of an apply's inner side",
+                ))
+            }
+        },
+        OpSpec::Replay { width } => match scope {
+            Scope::Replayed(table) if table == *width => (Box::new(union::Replay::new()), *width),
+            Scope::Replayed(table) => {
+                return Err(invalid_query(format!(
+                    "a Replay of {width} slots over an incoming table of {table}"
+                )))
+            }
+            _ => {
+                return Err(invalid_query(
+                    "a Replay stands only at the leaf of a branch under a Buffered",
                 ))
             }
         },
@@ -253,10 +286,59 @@ fn build_in<'q>(
             for slot in introduced.iter() {
                 inside(width, *slot)?;
             }
-            let (inner, _) = build_in(inner, params, Some(width))?;
+            let (inner, _) = build_in(inner, params, Scope::Inner(InnerKind::Optional, width))?;
             (
                 Box::new(optional::OptionalApply::new(input, inner, introduced)),
                 width,
+            )
+        }
+        OpSpec::ExistsApply { input, inner, mode } => {
+            let (input, width) = build(input, params)?;
+            if let ExistsMode::Mark { slot } = mode {
+                inside(width, *slot)?;
+            }
+            let (inner, _) = Fresh::build(inner, params, InnerKind::Exists, width)?;
+            (
+                Box::new(exists::ExistsApply::new(input, inner, *mode)),
+                width,
+            )
+        }
+        OpSpec::CallApply {
+            input,
+            inner,
+            outputs,
+        } => {
+            let (input, width) = build(input, params)?;
+            for slot in outputs.iter() {
+                inside(width, *slot)?;
+            }
+            let mut sorted = outputs.to_vec();
+            sorted.sort_unstable();
+            if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(invalid_query("a CallApply names an output slot twice"));
+            }
+            let (inner, returned) = Fresh::build(inner, params, InnerKind::Call, width)?;
+            if usize::from(returned) != outputs.len() {
+                return Err(invalid_query(format!(
+                    "a CallApply writes {} output slots from rows of {returned}",
+                    outputs.len()
+                )));
+            }
+            (Box::new(call::CallApply::new(input, inner, outputs)), width)
+        }
+        OpSpec::Union { branches, width } => {
+            let branches = branches_of(branches, *width, params, scope)?;
+            (Box::new(union::Union::new(branches)), *width)
+        }
+        OpSpec::Buffered { input, union } => {
+            let (input, table) = build(input, params)?;
+            let OpSpec::Union { branches, width } = &**union else {
+                return Err(invalid_query("a Buffered stands over a Union"));
+            };
+            let branches = branches_of(branches, *width, params, Scope::Replayed(table))?;
+            (
+                Box::new(union::Buffered::new(input, union::Union::new(branches))),
+                *width,
             )
         }
         OpSpec::Seed { input, out, source } => {
@@ -290,8 +372,21 @@ fn build_in<'q>(
             if let Some(types) = &step.types {
                 distinct(types)?;
             }
+            // An existence test stops at its first row: its hops start
+            // with a one-posting refill (`expand.rs`).
+            let first_refill = match scope {
+                Scope::Inner(InnerKind::Exists, _) => 1,
+                _ => REFILL_POSTINGS,
+            };
             (
-                Box::new(expand::Expand::new(input, *from, *edge, *to, step)),
+                Box::new(expand::Expand::new(
+                    input,
+                    *from,
+                    *edge,
+                    *to,
+                    step,
+                    first_refill,
+                )),
                 width,
             )
         }
@@ -417,6 +512,160 @@ fn build_in<'q>(
             (op, width)
         }
     })
+}
+
+/// Refuse `spec` where `scope` does not admit it (the placement rules of
+/// [`OpSpec`]'s module documentation).
+fn refuse_in(spec: &OpSpec, scope: Scope) -> QueryResult<()> {
+    let refused = match (scope, spec) {
+        (_, OpSpec::Union { .. } | OpSpec::Buffered { .. }) => match scope {
+            Scope::Top => None,
+            Scope::Inner(..) => Some("an apply's inner side holds no Union and no Buffered"),
+            Scope::Replayed(_) => Some("a branch after NEXT holds no Union and no Buffered"),
+        },
+        (Scope::Inner(InnerKind::Optional | InnerKind::Exists, _), spec) => match spec {
+            OpSpec::Unit { .. }
+            | OpSpec::Project { .. }
+            | OpSpec::Aggregate { .. }
+            | OpSpec::Distinct { .. }
+            | OpSpec::Sort { .. }
+            | OpSpec::Page { .. }
+            | OpSpec::CallApply { .. }
+            | OpSpec::Replay { .. } => Some(
+                "the inner side of an OptionalApply or an ExistsApply holds only Argument, Seed, Expand, Filter, Let, Unnest, PathSearch, Reach, OptionalApply and ExistsApply",
+            ),
+            _ => None,
+        },
+        (Scope::Inner(InnerKind::Call, _) | Scope::Replayed(_), OpSpec::Unit { .. }) => {
+            Some("a Unit stands only at the leaf of a plan's first part")
+        }
+        _ => None,
+    };
+    match refused {
+        Some(message) => Err(invalid_query(message)),
+        None => Ok(()),
+    }
+}
+
+/// The operators of a union's `branches`, built in `scope`, each giving rows
+/// of `width` slots.
+fn branches_of<'q>(
+    branches: &'q [OpSpec],
+    width: u16,
+    params: &[BindingValue],
+    scope: Scope,
+) -> QueryResult<Vec<Op<'q>>> {
+    branches
+        .iter()
+        .map(|branch| {
+            let (op, returned) = build_in(branch, params, scope)?;
+            if returned != width {
+                return Err(invalid_query(format!(
+                    "a union branch gives rows of {returned} slots, not {width}"
+                )));
+            }
+            Ok(op)
+        })
+        .collect()
+}
+
+/// An apply's inner side that is built AFRESH for each input row
+/// (`ExistsApply`, `CallApply`): one stopped early, or holding a blocking
+/// operator's state, cannot restart in place.
+///
+/// A dropped tree cannot give back what its operators held, since they
+/// release through the meter only as they run. So `Fresh` watches the
+/// meter's held memory across each pull of the tree -- only the tree runs
+/// then -- and when it drops the tree it gives back what the tree still
+/// held in this page. (A `groups` charge is the base meter's and stays
+/// counted for the page, as for every operator.)
+pub(super) struct Fresh<'q> {
+    spec: &'q OpSpec,
+    kind: InnerKind,
+    width: u16,
+    /// The tree for the current input row. The one built when the cursor
+    /// opened -- which checked the plan -- serves the first row; `None`
+    /// once a row's tree is dropped.
+    tree: Option<Op<'q>>,
+    /// What the running tree holds in the meter, per memory resource, and
+    /// the page that meter belongs to.
+    held: [u64; MEMORY.len()],
+    page: u64,
+}
+
+impl<'q> Fresh<'q> {
+    /// The inner side `spec` of an apply of `kind` over rows `width` wide,
+    /// checked, and the width of the rows it gives.
+    fn build(
+        spec: &'q OpSpec,
+        params: &[BindingValue],
+        kind: InnerKind,
+        width: u16,
+    ) -> QueryResult<(Self, u16)> {
+        let (tree, returned) = build_in(spec, params, Scope::Inner(kind, width))?;
+        Ok((
+            Self {
+                spec,
+                kind,
+                width,
+                tree: Some(tree),
+                held: [0; MEMORY.len()],
+                page: 0,
+            },
+            returned,
+        ))
+    }
+
+    /// Start the inner side from input row `row`: a fresh tree, whose
+    /// `Argument` leaf takes the row.
+    pub(super) fn start(
+        &mut self,
+        cx: &mut ExecCx<'q, '_, '_>,
+        row: &BindingRow,
+    ) -> QueryResult<()> {
+        if self.tree.is_none() {
+            let scope = Scope::Inner(self.kind, self.width);
+            self.tree = Some(build_in(self.spec, cx.params, scope)?.0);
+        }
+        self.held = [0; MEMORY.len()];
+        self.page = cx.page;
+        cx.argument = Some(row.clone());
+        Ok(())
+    }
+
+    /// The running tree's next row, keeping count of what it holds.
+    pub(super) fn next(&mut self, cx: &mut ExecCx<'q, '_, '_>) -> QueryResult<Option<BindingRow>> {
+        let Some(tree) = &mut self.tree else {
+            return Ok(None);
+        };
+        if self.page != cx.page {
+            // A new page's meter holds nothing yet; the tree charges what it
+            // holds again as it runs.
+            self.page = cx.page;
+            self.held = [0; MEMORY.len()];
+        }
+        let before = cx.meter.held();
+        let row = tree.next(cx)?;
+        let after = cx.meter.held();
+        for ((held, before), after) in self.held.iter_mut().zip(before).zip(after) {
+            *held = (*held + after).saturating_sub(before);
+        }
+        Ok(row)
+    }
+
+    /// Drop the running tree, giving back what it still held.
+    pub(super) fn stop(&mut self, cx: &mut ExecCx<'q, '_, '_>) {
+        self.tree = None;
+        cx.argument = None;
+        if self.page == cx.page {
+            for (resource, held) in MEMORY.into_iter().zip(self.held) {
+                if held > 0 {
+                    cx.meter.release(resource, held);
+                }
+            }
+        }
+        self.held = [0; MEMORY.len()];
+    }
 }
 
 /// An `OFFSET` / `LIMIT` count: an integer in `0..=i64::MAX` (design Q13).

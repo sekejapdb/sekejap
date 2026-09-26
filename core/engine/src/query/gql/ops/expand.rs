@@ -25,6 +25,13 @@
 //! cursor (`PausedAdjacency`, which keeps only the last key), and only then
 //! are its edges tested and handed out.
 //!
+//! Inside the inner side of an `ExistsApply`, which stops at its first row,
+//! a hop's first refill per input row walks ONE posting, and each refill
+//! after it twice as many as the one before, up to 256: an existence test
+//! over a node with many edges reads one posting past the seek. The cost of
+//! that choice, named: a hop that must walk far pauses and resumes its
+//! cursor up to eight times more per input row than a full refill would.
+//!
 //! Charges: `graph_edges` 1 per turn of the walk, the turn that finds the
 //! range's end included (the schedule the existing traversal charges on);
 //! `queue_entries` HELD, 1 per edge of the refill not yet handed out --
@@ -44,7 +51,7 @@ use std::sync::Arc;
 
 /// Postings one refill walks before it pauses: the bound on what a walk
 /// holds between two pulls (§3.2).
-const REFILL_POSTINGS: usize = 256;
+pub(in super::super) const REFILL_POSTINGS: usize = 256;
 
 /// One adjacency range: a direction and an edge type (`None`: every type).
 pub(in super::super) type Range = (Direction, Option<EdgeTypeId>);
@@ -67,7 +74,8 @@ pub(in super::super) fn ranges(direction: Direction, types: Option<&[EdgeTypeId]
         .collect()
 }
 
-/// Walk up to [`REFILL_POSTINGS`] postings of `range` from `near`, resumed
+/// Walk up to `postings` (at most [`REFILL_POSTINGS`]) postings of `range`
+/// from `near`, resumed
 /// from `paused` (or from the range's start), charging `graph_edges` 1 per
 /// turn, and hand each admitted edge and its far node to `push`, which
 /// charges and buffers it. Then set the walk down: the paused walk, or
@@ -86,6 +94,7 @@ pub(in super::super) fn refill<'q, 'x, 'm>(
     (direction, edge_type): Range,
     bag: bool,
     paused: Option<PausedAdjacency>,
+    postings: usize,
     admit: impl Fn(EntityId) -> bool,
     mut push: impl FnMut(&mut ExecCx<'q, 'x, 'm>, EdgeRef, EntityId) -> QueryResult<()>,
 ) -> QueryResult<Option<PausedAdjacency>> {
@@ -113,7 +122,7 @@ pub(in super::super) fn refill<'q, 'x, 'm>(
             };
             push(cx, edge, adjacent.far)?;
         }
-        if walked == REFILL_POSTINGS {
+        if walked == postings {
             return Ok(Some(cursor.pause()?));
         }
     }
@@ -133,6 +142,9 @@ pub(super) struct Expand<'q> {
     refill: VecDeque<(EdgeRef, EntityId)>,
     /// The refill buffer, held across pages.
     held: Held,
+    /// Postings the first refill of each input row's walk takes: 1 inside
+    /// an existence test, [`REFILL_POSTINGS`] elsewhere.
+    first_refill: usize,
 }
 
 /// The hop from one input row.
@@ -149,6 +161,8 @@ struct Walk {
     range: usize,
     /// Where the range's walk was set down; `None` before it starts.
     paused: Option<PausedAdjacency>,
+    /// Postings the next refill takes.
+    postings: usize,
 }
 
 impl<'q> Expand<'q> {
@@ -158,6 +172,7 @@ impl<'q> Expand<'q> {
         edge: Option<SlotId>,
         to: Target,
         step: &'q StepSpec,
+        first_refill: usize,
     ) -> Self {
         Self {
             input,
@@ -169,6 +184,7 @@ impl<'q> Expand<'q> {
             current: None,
             refill: VecDeque::new(),
             held: Held::default(),
+            first_refill,
         }
     }
 
@@ -192,6 +208,7 @@ impl<'q> Expand<'q> {
             into,
             range: 0,
             paused: None,
+            postings: self.first_refill,
         }))
     }
 
@@ -212,6 +229,7 @@ impl<'q> Expand<'q> {
             self.ranges[walk.range],
             self.edge.is_some(),
             walk.paused.take(),
+            walk.postings,
             |far| {
                 step.far_labels
                     .as_deref()
@@ -228,6 +246,7 @@ impl<'q> Expand<'q> {
             walk.range += 1;
         }
         walk.paused = paused;
+        walk.postings = (walk.postings * 2).min(REFILL_POSTINGS);
         Ok(())
     }
 }

@@ -23,7 +23,10 @@
 //!   already follow.
 
 use super::super::rows::RUN_BYTES;
-use super::super::{QueryBudget, QueryError, QueryResult, QueryWork, WorkMeter, WorkResource};
+use super::super::{
+    PreparedQuery, QueryBudget, QueryError, QueryPage, QueryResult, QueryWork, WorkMeter,
+    WorkResource,
+};
 use super::value::{EdgeRef, NodeRef, PathRef};
 use std::mem::size_of;
 
@@ -43,6 +46,15 @@ const QUEUE_ENTRIES_CAP: u64 = (RUN_BYTES / QUEUE_ENTRY_BYTES) as u64;
 /// edge crossed and the orientation it was crossed in.
 const PREDECESSOR_ARC_BYTES: usize = size_of::<(usize, EdgeRef, bool)>();
 const PREDECESSOR_ARCS_CAP: u64 = (RUN_BYTES / PREDECESSOR_ARC_BYTES) as u64;
+
+/// The memory resources this meter holds, in the order
+/// [`GqlMeter::held`] reports them.
+pub(super) const MEMORY: [WorkResource; 4] = [
+    WorkResource::QueueEntries,
+    WorkResource::PredecessorArcs,
+    WorkResource::SortBytes,
+    WorkResource::ListBytes,
+];
 
 /// Per-execution ceilings of a GQL answer: every existing resource and the
 /// deadline in `base`, plus the six resources a pattern match and a path
@@ -217,10 +229,71 @@ impl<'a, C: FnMut() -> bool> GqlMeter<'a, C> {
         }
     }
 
+    /// The memory held now, per resource of [`MEMORY`]: an apply that
+    /// drops its inner tree gives back what the tree held by the difference
+    /// across its pulls (`ops::Fresh`).
+    pub(super) fn held(&self) -> [u64; MEMORY.len()] {
+        [
+            self.held_queue_entries,
+            self.held_predecessor_arcs,
+            self.held_sort_bytes,
+            self.held_list_bytes,
+        ]
+    }
+
     /// The wrapped meter, for the engine's own readers that take one (a
     /// row projection charges its vector sidecars through it).
     pub(super) fn base(&mut self) -> &mut WorkMeter<'a, C> {
         &mut self.base
+    }
+
+    /// One page of at most `rows` rows of an engine `query` the execution
+    /// opened -- an index or scan seed, a per-node text read -- run under
+    /// what is LEFT of this meter's budget, with its cancellation, and
+    /// charged to it.
+    ///
+    /// A refusal inside the engine page names the resource against the
+    /// budget it was handed -- the remainder. It is restated against the
+    /// whole GQL page: the limit that page was given, and the total the
+    /// charge would have reached. Which resources [`QueryBudget::left_after`]
+    /// subtracts is read off the refusal itself, so no list of them is kept
+    /// here to drift from it: a resource it subtracted was handed exactly the
+    /// page's limit less what the page had spent; one it passes through was
+    /// handed the whole limit and is restated as it is.
+    pub(super) fn engine_page(
+        &mut self,
+        query: &mut PreparedQuery<'_>,
+        rows: usize,
+    ) -> QueryResult<QueryPage> {
+        let base = &mut self.base;
+        let budget = base.limit.left_after(&base.used);
+        match query.next_page(rows, budget, &mut *base.cancelled) {
+            Ok(page) => {
+                base.used.add_page(&page.work);
+                Ok(page)
+            }
+            Err(QueryError::BudgetExceeded {
+                resource,
+                limit,
+                attempted,
+            }) => {
+                let (used, total) = base.slot(resource);
+                let spent = *used;
+                if spent > 0 && total.checked_sub(spent) == Some(limit) {
+                    return Err(QueryError::BudgetExceeded {
+                        resource,
+                        limit: total,
+                        attempted: attempted.saturating_add(spent),
+                    });
+                }
+                Err(QueryError::BudgetExceeded {
+                    resource,
+                    limit,
+                    attempted,
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// What this execution has spent so far.

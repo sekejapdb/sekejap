@@ -86,7 +86,7 @@
 
 use super::super::super::{invalid_query, QueryResult, WorkResource};
 use super::super::host::ExprId;
-use super::super::ops::{node_in, refill, ExecCx, Held, Op, Operator, Range};
+use super::super::ops::{node_in, refill, ExecCx, Held, Op, Operator, Range, REFILL_POSTINGS};
 use super::super::value::{BindingRow, BindingValue, EdgeRef, NodeRef, PathRef, SlotId};
 use super::arrive::{
     admit, complete_row, edge_step, labels_admit, link_ranges, moves, restore, Move, Undo,
@@ -458,6 +458,7 @@ impl<'q> Select<'q> {
                     range,
                     step.bind.is_some(),
                     paused,
+                    REFILL_POSTINGS,
                     |far| labels_admit(a, far_state, far),
                     |cx, edge, far| {
                         cx.meter.charge(WorkResource::QueueEntries, 1)?;
