@@ -20,11 +20,19 @@ SEED = 20260919
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "core" / "engine" / "tests" / "fixtures" / "postgis_conformance.json"
 
-# The PostGIS server is reached with `docker exec <container> psql`; override
-# the container, role and database with PGCONTAINER, PGUSER and PGDATABASE.
-PGCONTAINER = os.environ.get("PGCONTAINER", "postgis")
-PGUSER = os.environ.get("PGUSER", "postgres")
-PGDATABASE = os.environ.get("PGDATABASE", "e4_bench")
+# The PostGIS server is reached with `docker exec <container> psql`. No
+# container, role or database is built in: set SEKEJAP_POSTGIS_CONTAINER,
+# PGUSER and PGDATABASE before running.
+_REQUIRED = ("SEKEJAP_POSTGIS_CONTAINER", "PGUSER", "PGDATABASE")
+_missing = [name for name in _REQUIRED if not os.environ.get(name)]
+if _missing:
+    sys.exit(
+        f"postgis_conformance_fixture.py: set {', '.join(_missing)} to reach "
+        "the PostGIS container -- no default is built in"
+    )
+PGCONTAINER = os.environ["SEKEJAP_POSTGIS_CONTAINER"]
+PGUSER = os.environ["PGUSER"]
+PGDATABASE = os.environ["PGDATABASE"]
 
 M_PER_DEG_LAT = 110540.0  # metres per degree of latitude (WGS84-ish mid)
 

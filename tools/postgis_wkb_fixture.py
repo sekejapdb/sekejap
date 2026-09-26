@@ -10,8 +10,9 @@ PostGIS answers `&&` on float4 boxes rounded outward and a double-precision
 test would disagree with it at the edges.
 
 Deterministic (seed 20260925). The PostGIS server is reached with
-`docker exec <container> psql`; set PGCONTAINER, PGUSER and PGDATABASE.
-The test that reads the fixture is offline and never talks to Postgres.
+`docker exec <container> psql`; set SEKEJAP_POSTGIS_CONTAINER, PGUSER and
+PGDATABASE -- none is defaulted. The test that reads the fixture is offline
+and never talks to Postgres.
 """
 from __future__ import annotations
 
@@ -26,9 +27,16 @@ SEED = 20260925
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "core" / "engine" / "tests" / "fixtures" / "postgis_wkb.json"
 
-PGCONTAINER = os.environ.get("PGCONTAINER", "postgis")
-PGUSER = os.environ.get("PGUSER", "postgres")
-PGDATABASE = os.environ.get("PGDATABASE", "postgres")
+_REQUIRED = ("SEKEJAP_POSTGIS_CONTAINER", "PGUSER", "PGDATABASE")
+_missing = [name for name in _REQUIRED if not os.environ.get(name)]
+if _missing:
+    sys.exit(
+        f"postgis_wkb_fixture.py: set {', '.join(_missing)} to reach the "
+        "PostGIS container -- no default is built in"
+    )
+PGCONTAINER = os.environ["SEKEJAP_POSTGIS_CONTAINER"]
+PGUSER = os.environ["PGUSER"]
+PGDATABASE = os.environ["PGDATABASE"]
 
 
 def psql(sql: str) -> str:

@@ -327,11 +327,10 @@ fn default_out_dir() -> PathBuf {
 fn default_work_dir() -> PathBuf {
     default_out_dir().join("vector10k-work")
 }
-/// `--dsn` when the flag is absent: `SEKEJAP_BENCH_PG_DSN`, else a local
-/// default server.
-fn default_dsn() -> String {
-    std::env::var("SEKEJAP_BENCH_PG_DSN")
-        .unwrap_or_else(|_| "host=127.0.0.1 port=5432 user=postgres dbname=postgres".into())
+/// `--dsn` when the flag is absent: `SEKEJAP_BENCH_PG_DSN`. No default
+/// connection is built in.
+fn default_dsn() -> Option<String> {
+    std::env::var("SEKEJAP_BENCH_PG_DSN").ok()
 }
 
 const ARMS: [&str; 7] = [
@@ -2570,7 +2569,7 @@ struct Options {
     rewrite_report: Option<PathBuf>,
     out_dir: PathBuf,
     work_dir: PathBuf,
-    dsn: String,
+    dsn: Option<String>,
     ef: usize,
     only: Option<Vec<String>>,
     keep: bool,
@@ -2605,7 +2604,7 @@ fn parse(args: &[String]) -> R<Options> {
             "--rewrite-report" => options.rewrite_report = Some(PathBuf::from(value(&mut at)?)),
             "--out-dir" => options.out_dir = PathBuf::from(value(&mut at)?),
             "--work" => options.work_dir = PathBuf::from(value(&mut at)?),
-            "--dsn" => options.dsn = value(&mut at)?,
+            "--dsn" => options.dsn = Some(value(&mut at)?),
             "--ef" => options.ef = value(&mut at)?.parse()?,
             "--only" => {
                 options.only =
@@ -2764,8 +2763,14 @@ fn run() -> R<()> {
     let mut pg_vector_version = Value::Null;
     let specs = pg_specs();
     let any_pg = specs.iter().any(|spec| wanted(&options, spec.arm));
-    if any_pg {
-        match Client::connect(&options.dsn, NoTls) {
+    if any_pg && options.dsn.is_none() {
+        eprintln!(
+            "vector10k: arms 6 and 7 need a connection: pass --dsn or set SEKEJAP_BENCH_PG_DSN \
+             (no default is built in); they are reported as unreachable."
+        );
+    }
+    if let (true, Some(dsn)) = (any_pg, options.dsn.as_deref()) {
+        match Client::connect(dsn, NoTls) {
             Ok(mut client) => {
                 pg_version = client
                     .query_one("SELECT version()", &[])
@@ -2814,9 +2819,8 @@ fn run() -> R<()> {
             }
             Err(error) => {
                 eprintln!(
-                    "vector10k: POSTGRES COULD NOT BE REACHED at {}: {error}\n\
-                     arms 6 and 7 are reported as unreachable; the other five are real.",
-                    options.dsn
+                    "vector10k: POSTGRES COULD NOT BE REACHED at the address named by --dsn/SEKEJAP_BENCH_PG_DSN: {error}\n\
+                     arms 6 and 7 are reported as unreachable; the other five are real."
                 );
                 for spec in &specs {
                     if !wanted(&options, spec.arm) {
@@ -2825,11 +2829,11 @@ fn run() -> R<()> {
                     let mut row = ArmRow::new(spec.arm);
                     row.supplementary = spec.supplementary;
                     row.pool_note = "n/a".to_owned();
-                    row.refusal = Some(format!("postgres unreachable at {}: {error}", options.dsn));
+                    row.refusal = Some(format!("postgres unreachable: {error}"));
                     row.did = format!(
-                        "NOT RUN. The server at `{}` could not be reached: {error}. No number in \
-                         this row; nothing was estimated or carried over from another run.",
-                        options.dsn
+                        "NOT RUN. The server named by --dsn/SEKEJAP_BENCH_PG_DSN could not be \
+                         reached: {error}. No number in this row; nothing was estimated or \
+                         carried over from another run."
                     );
                     rows.push(row);
                 }
@@ -2890,7 +2894,9 @@ fn run() -> R<()> {
         "pg_version": pg_version,
         "pg_shared_buffers": pg_shared_buffers,
         "pgvector_version": pg_vector_version,
-        "dsn": options.dsn,
+        // The resolved connection string is never written to a report --
+        // it can carry a password. Only whether one was configured is.
+        "dsn_configured": options.dsn.is_some(),
         "work_dir": options.work_dir.display().to_string(),
     });
     let deviations = deviations();

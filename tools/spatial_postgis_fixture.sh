@@ -5,12 +5,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-: "${PGHOST:=127.0.0.1}"
-: "${PGPORT:=55432}"
-: "${PGUSER:=postgres}"
-: "${PGPASSWORD:=e4}"
-: "${PGDATABASE:=postgres}"
-export PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE
+# No built-in host, port, user, database or password: this script reaches a
+# live PostGIS server only through the standard libpq environment (PGHOST,
+# PGPORT, PGUSER, PGDATABASE, and PGPASSWORD or ~/.pgpass).
+missing=()
+for var in PGHOST PGPORT PGUSER PGDATABASE; do
+  if [ -z "${!var:-}" ]; then
+    missing+=("$var")
+  fi
+done
+if [ "${#missing[@]}" -gt 0 ]; then
+  echo "spatial_postgis_fixture.sh: set ${missing[*]} (and PGPASSWORD or ~/.pgpass) to reach the PostGIS server -- no default is built in" >&2
+  exit 1
+fi
 
 OUT=core/engine/tests/fixtures/spatial_postgis.json
 mkdir -p "$(dirname "$OUT")"

@@ -150,15 +150,16 @@ fn both_arms_answer_the_same_questions() {
 fn a_reuse_pass_answers_exactly_what_the_build_pass_answered() {
     let root = std::env::temp_dir().join(format!("popsim-reuse-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
-    let dsn = std::env::var("POPSIM_PG_DSN")
-        .unwrap_or_else(|_| "host=127.0.0.1 port=55432 user=postgres dbname=postgres".to_string());
-    let pg_reachable = postgres::Client::connect(&dsn, postgres::NoTls).is_ok();
+    let dsn = std::env::var("SEKEJAP_PG_DSN").ok();
+    let pg_reachable = dsn
+        .as_deref()
+        .is_some_and(|dsn| postgres::Client::connect(dsn, postgres::NoTls).is_ok());
     let pass = |which, reuse| {
         let mut options = Options::new(which, ROWS, &root);
         options.reps = 2;
         options.case_budget = Duration::from_secs(30);
         options.reuse = reuse;
-        options.dsn = Some(dsn.clone());
+        options.dsn = dsn.clone();
         run_arm(&options).expect("arm runs")
     };
     let answers = |report: &serde_json::Value| {
@@ -174,8 +175,10 @@ fn a_reuse_pass_answers_exactly_what_the_build_pass_answered() {
     let mut arms = vec![Arm::E4, Arm::Sqlite];
     if pg_reachable {
         arms.push(Arm::Postgres);
+    } else if dsn.is_none() {
+        eprintln!("SKIP the postgres reuse pass: SEKEJAP_PG_DSN is not set");
     } else {
-        eprintln!("SKIP the postgres reuse pass: no server reachable at {dsn}");
+        eprintln!("SKIP the postgres reuse pass: no server reachable at the address named by SEKEJAP_PG_DSN");
     }
     for which in arms {
         let built = pass(which, false);
@@ -201,14 +204,19 @@ fn a_reuse_pass_answers_exactly_what_the_build_pass_answered() {
 /// suite executes. The test SKIPS (prints a note, returns `Ok`) rather than
 /// failing when nothing answers on the DSN, so `cargo test` stays green on a
 /// machine with no Postgres and still exercises the third arm wherever one is
-/// reachable (`POPSIM_PG_DSN` overrides the default local dev DSN).
+/// reachable. `SEKEJAP_PG_DSN` names the server; there is no built-in default.
 #[test]
 fn postgres_arm_answers_the_same_questions_as_e4() -> Result<(), Box<dyn std::error::Error>> {
-    let dsn = std::env::var("POPSIM_PG_DSN")
-        .unwrap_or_else(|_| "host=127.0.0.1 port=55432 user=postgres dbname=postgres".to_string());
+    let dsn = match std::env::var("SEKEJAP_PG_DSN") {
+        Ok(dsn) => dsn,
+        Err(_) => {
+            eprintln!("SKIP postgres_arm_answers_the_same_questions_as_e4: SEKEJAP_PG_DSN is not set");
+            return Ok(());
+        }
+    };
     if postgres::Client::connect(&dsn, postgres::NoTls).is_err() {
         eprintln!(
-            "SKIP postgres_arm_answers_the_same_questions_as_e4: no server reachable at {dsn}"
+            "SKIP postgres_arm_answers_the_same_questions_as_e4: no server reachable at the address named by SEKEJAP_PG_DSN"
         );
         return Ok(());
     }
