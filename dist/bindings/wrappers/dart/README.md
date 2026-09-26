@@ -68,7 +68,7 @@ native library at build time.
 import 'package:sekejap/sekejap.dart';
 
 void main() {
-  final db = Db.open('/tmp/warung');
+  final db = Db.open('/tmp/demo');
 
   db.createCollection('dish', const [
     FieldSpec('name', FieldKind.text),
@@ -79,10 +79,10 @@ void main() {
   db.execute('CREATE INDEX dish_price ON dish USING btree(price)');
 
   db.put('dish', 'd1',
-      {'_key': 'd1', 'name': 'Nasi Goreng', 'price': 45000});
+      {'_key': 'd1', 'name': 'Fried Rice', 'price': 45000});
   db.putMany('dish', {
-    'd2': {'name': 'Gado Gado', 'price': 38000},
-    'd3': {'name': 'Sate Ayam', 'price': 52000},
+    'd2': {'name': 'Garden Salad', 'price': 38000},
+    'd3': {'name': 'Grilled Skewers', 'price': 52000},
   });
 
   print(db.get('dish', 'd1'));                // {_key: d1, name: …, price: …}
@@ -124,8 +124,8 @@ document at compile. The call says so rather than pretending otherwise.
 ### Graph
 
 ```dart
-db.link('place', 'warung', 'serves', 'dish', 'd1', properties: {'since': 1998});
-final served = db.neighbours('place', 'warung', edgeType: 'serves');
+db.link('place', 'stall', 'serves', 'dish', 'd1', properties: {'since': 1998});
+final served = db.neighbours('place', 'stall', edgeType: 'serves');
 final back = db.neighbours('dish', 'd1',
     edgeType: 'serves', direction: SekejapDirection.incoming);
 ```
@@ -139,7 +139,7 @@ of 256 edges; a walk deeper than one hop is SQL's `GRAPH_TABLE`.
 ```dart
 final tx = db.transaction();
 try {
-  tx.put('dish', 'd4', {'name': 'Soto Ayam', 'price': 41000});
+  tx.put('dish', 'd4', {'name': 'Chicken Soup', 'price': 41000});
   tx.execute(r'DELETE FROM dish WHERE _key = $1', ['d3']);
   tx.commit();
 } catch (_) {
@@ -180,9 +180,9 @@ of them, and an emulation would be a fake.
 ### Service mode
 
 ```dart
-final service = Db.openService('/tmp/warung');
+final service = Db.openService('/tmp/demo');
 final subscription = service.subscribe();
-service.put('dish', 'd9', {'name': 'Rendang', 'price': 65000});
+service.put('dish', 'd9', {'name': 'Beef Stew', 'price': 65000});
 final event = service.nextChange(subscription, timeoutMs: 2000);
 service.statementTimeoutMs(5000);
 service.unsubscribe(subscription);

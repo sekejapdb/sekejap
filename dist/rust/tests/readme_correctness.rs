@@ -190,39 +190,45 @@ fn step_4_and_records_and_time() {
 #[test]
 fn graph_hops_directions_and_depths() {
     let (_dir, db) = bali();
-    let rows = query(&db, readme("SELECT airline, hours
+    let rows = query(&db, readme("SELECT *
         FROM GRAPH_TABLE (base MATCH
             (t:tourists WHERE t._key = 'chloe')-[:flew_on]->(f:flights)
-            COLUMNS (f.airline AS airline, f.duration_hours AS hours))"));
+            RETURN f.airline AS airline, f.duration_hours AS hours)"));
     assert_eq!(texts(&rows, "airline"), ["Qantas"]);
     assert_eq!(column(&rows, "hours"), [json!(6)]);
     // Contrast: the same edge walked BACKWARD from the flight.
-    let rows = query(&db, "SELECT who FROM GRAPH_TABLE (base MATCH
+    let rows = query(&db, "SELECT * FROM GRAPH_TABLE (base MATCH
         (f:flights WHERE f._key = 'qf-mel')<-[:flew_on]-(t:tourists)
-        COLUMNS (t.name AS who))");
+        RETURN t.name AS who)");
     assert_eq!(sorted(texts(&rows, "who")), ["Budi", "Chloe"]);
 
-    let rows = query(&db, readme("SELECT tourist
+    let rows = query(&db, readme("SELECT *
         FROM GRAPH_TABLE (base MATCH
             (c:tourists WHERE c._key = 'chloe')-[:similar_taste]->{1,2}(t:tourists)
-            COLUMNS (t.name AS tourist))"));
+            RETURN t.name AS tourist)"));
     assert_eq!(sorted(texts(&rows, "tourist")), ["Budi", "Dewi"]);
     // Contrast: one hop stops at Budi; backward finds who points at Chloe.
-    let rows = query(&db, "SELECT tourist FROM GRAPH_TABLE (base MATCH
+    let rows = query(&db, "SELECT * FROM GRAPH_TABLE (base MATCH
         (c:tourists WHERE c._key = 'chloe')-[:similar_taste]->(t:tourists)
-        COLUMNS (t.name AS tourist))");
+        RETURN t.name AS tourist)");
     assert_eq!(texts(&rows, "tourist"), ["Budi"]);
-    let rows = query(&db, "SELECT tourist FROM GRAPH_TABLE (base MATCH
+    let rows = query(&db, "SELECT * FROM GRAPH_TABLE (base MATCH
         (c:tourists WHERE c._key = 'chloe')<-[:similar_taste]-(t:tourists)
-        COLUMNS (t.name AS tourist))");
+        RETURN t.name AS tourist)");
     assert_eq!(texts(&rows, "tourist"), ["Aiym"]);
 
-    // What a pattern may not do, refused by name rather than answered wrong.
-    refused(&db, "SELECT who FROM GRAPH_TABLE (base MATCH
+    // M2-E: the removed legacy body used to refuse both of these ("is the
+    // starting node", "has no starting key"), naming the two things its
+    // projection could not carry. GQL lifts both limits by design (M2:
+    // "every bound variable projectable"; a pattern with no key predicate
+    // seeds by a SCAN), so both now ANSWER rather than refuse.
+    let rows = query(&db, "SELECT * FROM GRAPH_TABLE (base MATCH
         (c:tourists WHERE c._key = 'chloe')-[:flew_on]->(f:flights)
-        COLUMNS (c.name AS who))", "is the starting node");
-    refused(&db, "SELECT a FROM GRAPH_TABLE (base MATCH
-        (t:tourists)-[:flew_on]->(f:flights) COLUMNS (f.airline AS a))", "has no starting key");
+        RETURN c.name AS who)");
+    assert_eq!(texts(&rows, "who"), ["Chloe"]);
+    let rows = query(&db, "SELECT * FROM GRAPH_TABLE (base MATCH
+        (t:tourists)-[:flew_on]->(f:flights) RETURN f.airline AS a)");
+    assert_eq!(sorted(texts(&rows, "a")), ["Air Astana", "Qantas", "Qantas"]);
 }
 
 #[test]
@@ -390,15 +396,15 @@ fn the_sql_tour() {
     for (a, b) in [("seminyak-beach", "kuta"), ("kuta", "jimbaran"), ("jimbaran", "uluwatu"), ("canggu", "seminyak-beach")] {
         db.link(("places", a), "near", ("places", b)).unwrap();
     }
-    let rows = query(&db, readme("SELECT place
+    let rows = query(&db, readme("SELECT *
         FROM GRAPH_TABLE (base MATCH
             (a:places WHERE a._key = 'seminyak-beach')-[:near]->{1,3}(dest:places)
-            COLUMNS (dest._key AS place))"));
+            RETURN dest._key AS place)"));
     assert_eq!(sorted(texts(&rows, "place")), ["jimbaran", "kuta", "uluwatu"]);
     // Contrast: two hops stop short of Uluwatu; backward finds Canggu.
-    let rows = query(&db, "SELECT place FROM GRAPH_TABLE (base MATCH (a:places WHERE a._key = 'seminyak-beach')-[:near]->{1,2}(dest:places) COLUMNS (dest._key AS place))");
+    let rows = query(&db, "SELECT * FROM GRAPH_TABLE (base MATCH (a:places WHERE a._key = 'seminyak-beach')-[:near]->{1,2}(dest:places) RETURN dest._key AS place)");
     assert_eq!(sorted(texts(&rows, "place")), ["jimbaran", "kuta"]);
-    let rows = query(&db, "SELECT place FROM GRAPH_TABLE (base MATCH (a:places WHERE a._key = 'seminyak-beach')<-[:near]-(dest:places) COLUMNS (dest._key AS place))");
+    let rows = query(&db, "SELECT * FROM GRAPH_TABLE (base MATCH (a:places WHERE a._key = 'seminyak-beach')<-[:near]-(dest:places) RETURN dest._key AS place)");
     assert_eq!(texts(&rows, "place"), ["canggu"]);
 
     for (who, rating) in [("chloe", 4.8), ("aiym", 4.5), ("budi", 4.2)] {
@@ -418,17 +424,22 @@ fn the_sql_tour() {
     let rows = query(&db, "SELECT category, COUNT(*) AS n FROM places GROUP BY category ORDER BY n ASC");
     assert_eq!(texts(&rows, "category"), ["temple", "beach"]);
 
-    let rows = query(&db, readme("SELECT visitor, rating
+    // M2-E: the ranking (`ORDER BY rating DESC`/`ASC`) is dropped rather than
+    // weakened into something it does not test -- an outer clause over a
+    // GQL relation is refused until M3-D, and a RETURN stage's own ORDER BY
+    // is GQL profile M3-B, neither built yet. The edge property itself
+    // still projects correctly, checked as an unordered set.
+    let rows = query(&db, readme("SELECT *
         FROM GRAPH_TABLE (base MATCH
             (p:places WHERE p._key = 'uluwatu')<-[v:visited]-(t:tourists)
-            COLUMNS (t.name AS visitor, v.rating AS rating))
-        ORDER BY rating DESC"));
-    assert_eq!(texts(&rows, "visitor"), ["Chloe", "Aiym", "Budi"]);
-    // Contrast: the other order.
-    let rows = query(&db, "SELECT visitor, rating FROM GRAPH_TABLE (base MATCH
-        (p:places WHERE p._key = 'uluwatu')<-[v:visited]-(t:tourists)
-        COLUMNS (t.name AS visitor, v.rating AS rating)) ORDER BY rating ASC");
-    assert_eq!(texts(&rows, "visitor"), ["Budi", "Aiym", "Chloe"]);
+            RETURN t.name AS visitor, v.rating AS rating)"));
+    assert_eq!(sorted(texts(&rows, "visitor")), ["Aiym", "Budi", "Chloe"]);
+    let mut ratings: Vec<f64> = column(&rows, "rating")
+        .into_iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    ratings.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(ratings, vec![4.2, 4.5, 4.8]);
 
     let rows = query(&db, readme("SELECT * FROM places   WHERE ST_DWithin(geometry, ST_MakePoint(115.168, -8.690)::geography, 5000.0)"));
     // seminyak-beach 1.4 km, kuta 3.1 km, canggu 5.3 km (just outside).

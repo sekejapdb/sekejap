@@ -98,8 +98,8 @@ The blocks below assume one collection, one edge type and one graph context:
 | edge type `near`, property `weight` `REAL` | `place` → `place`, a chain `p000 -> p001 -> …` | the graph keyspace |
 | graph context | `base`, the context every edge above is written in | |
 
-`body` holds words from a small vocabulary that includes `kebun` and
-`sawah`, so a `tsquery` over it matches rows. `kind` takes the values
+`body` holds words from a small vocabulary that includes `garden` and
+`field`, so a `tsquery` over it matches rows. `kind` takes the values
 `depot`, `farm`, `home`, `mill`, `park`, `port`, `school`, `shop`.
 
 `place` is created with `WITH (index: none)` and every index above is then
@@ -133,17 +133,63 @@ block creates is prefixed `ex_` so the fixture's own names are never touched.
 | layer | specification | dialect reference |
 |---|---|---|
 | container | ISO/IEC 9075:2023 SQL | PostgreSQL 19 documentation; where ISO and Postgres differ, Postgres wins |
-| graph | ISO/IEC 9075-16:2023 SQL/PGQ, `GRAPH_TABLE ... COLUMNS` | PostgreSQL 19 ch. 5.15; Oracle 23ai GRAPH_TABLE; patterns per GPML (Deutsch et al., SIGMOD 2022, arXiv 2112.06217), shared with ISO/IEC 39075:2024 GQL |
+| graph | ISO/IEC 39075:2024 GQL, `GRAPH_TABLE ... RETURN` (Google's `GRAPH_TABLE` embedding of it) | PostgreSQL 19 ch. 5.15 and Oracle 23ai use the same `GRAPH_TABLE (...)` embedding for ISO/IEC 9075-16:2023 SQL/PGQ instead, whose `COLUMNS` projection is NOT adopted (owner decision, M2-E); patterns per GPML (Deutsch et al., SIGMOD 2022, arXiv 2112.06217), shared between the two standards |
 | spatial | PostGIS 3.6 function names and unit semantics | `docs/core/SPATIAL_FUNCTIONS.md`, `core/engine/tests/spatial_postgis_conformance.rs` |
 | vector | pgvector 0.8 type and operators; pgvectorscale knobs where they map | `tools/battle50k_pg_cases.sql` |
 | text | PostgreSQL tsvector/tsquery for boolean matching; BM25 ranking; search functions in the family the prior engine shipped (typo, prefix) | `core/engine/src/index/text/mod.rs` |
 | catalog | `db_*` core rows; `pg_catalog` and `information_schema` as views | **T1** (`lang/src/catalog.rs`, `lang/src/compile/rows.rs`): the rows are VIRTUAL -- computed at prepare from `list_collections` / `collection_info` / `list_indexes` / `row_count` / `graph_names` / `edge_shape` into a typed value list, with the `Rows` driver of `lang/src/compile/rows.rs` over it. Nothing is stored and no format bit was spent. The relation list, the columns and the type OIDs are `docs/dist/PG_SURFACE.md`; the bound is the catalog's size, except `db_edges`, whose graph-shape probe is capped at 65,536 descents and says so when it stops |
 
 Not adopted: standalone GQL statements, Cypher, AQL, SurrealQL, the `FROM
-MATCH` of the prior engine, Google's `RETURN` inside GRAPH_TABLE (accepted as
-an alias for `COLUMNS` only if measured demand appears). "The prior engine"
+MATCH` of the prior engine. "The prior engine"
 throughout this contract is the release sekejap replaces -- its own SQL
 surface, still in production, its sources kept on branch `e1`.
+
+**The GQL profile (under construction, M1-M4).** A GQL body inside
+`GRAPH_TABLE` -- `GRAPH_TABLE (g MATCH ... RETURN ...)`, Google's documented
+embedding, with selected ISO/IEC 39075 GQL constructs -- is the ONLY body
+`GRAPH_TABLE` takes; its design is `docs/lang/GQL_PROFILE_DESIGN.md`. M2-E
+(owner decision 1) removed the SQL/PGQ `COLUMNS` body of the graph row
+above, with no compatibility alias, once GQL's own tests pinned every
+property the removed body's tests pinned (§4.3 says which, row by row). No
+GQL construct beyond §4.3's T1 rows is Tier 1 until a named test proves it
+and a row of this contract says so. A `RETURN` body is PARSED -- patterns
+with labels (`:` or `IS`, alternation `A|B`), the
+three directions, inline and pattern `WHERE`, comma-separated patterns,
+repeated variables, and comparisons with `AND`/`OR`/`NOT` over properties,
+literals and `$n` (`lang/src/gql/parse/tests.rs`, `lang/tests/gql_parse.rs`).
+`SELECT * FROM GRAPH_TABLE (<graph> ... RETURN ...)` prepares and runs
+through every SQL entry point (`prepare_sql`, `Database::sql`, the
+published crate, the C ABI, the PostgreSQL wire) as a GQL plan: typed
+columns, owner-less rows, always rebindable, and an `EXPLAIN` that prints
+the plan's operators, seeds and predicate placement
+(`lang/tests/gql_patterns.rs`, `lang/tests/gql_explain.rs`,
+`dist/tests/pg_wire_gql.rs`). A body is a pipeline of stages joined by
+`NEXT`: each stage's statements -- `MATCH`, `LET`, `FILTER`, `FOR x IN
+<list or $n>` -- bind in order, each seeing only what the ones before it
+bound, and its `RETURN [DISTINCT]` projects the next stage's whole working
+table, grouping by `GROUP BY` or by its non-aggregated items around
+`COUNT(*)`/`COUNT([DISTINCT] x)`/`SUM`/`AVG`/`MIN`/`MAX`/`ARRAY_AGG`, then
+`ORDER BY` several keys, `OFFSET` and `LIMIT` (literals or `$n`). A node
+crosses `NEXT` as a node; a variable the `RETURN` dropped is out of scope,
+named with the stage that dropped it (`lang/tests/gql_pipeline.rs`).
+`OPTIONAL MATCH <one pattern> [WHERE ...]` is a left outer join per input
+row: every match, or the row once with the pattern's new variables `NULL`;
+its `WHERE` decides whether a match exists and never drops the row, unlike a
+later `FILTER`, and `COUNT` over the `NULL` side is 0
+(`lang/tests/gql_optional.rs`). The
+path and element functions (`PATH_LENGTH`, `PATH_FIRST`, `PATH_LAST`,
+`NODES`, `EDGES`, `IS_ACYCLIC`, `IS_TRAIL`, `ELEMENT_ID`,
+`SOURCE_NODE_ID`, `DESTINATION_NODE_ID`, `LABELS`, `PROPERTY_NAMES`,
+`ARRAY_LENGTH`) and list literals `[a, b]` are typed when the statement is
+compiled, a list of mixed kinds refused. An aggregate in a `LET`, a
+`FILTER` or a `MATCH`'s `WHERE` is horizontal: it folds, per row, the list
+one list variable holds (`SUM(e.cost)` over one path's edges); in a
+`RETURN` it stays vertical, over rows (`lang/tests/gql_functions.rs`). An
+outer select list or clause over the relation is refused until M3-D.
+Every later construct is refused by name with the milestone that builds it
+(`sekejap_lang::gql_refusals()`), and inside a body only that table is
+consulted: a word the SQL table refuses is an ordinary name there. Its
+values differ from the SQL surface's in the ways §5 deviation 19 states.
 
 ## 2. Statements
 
@@ -153,7 +199,7 @@ Test files are `lang/tests/*.rs` unless another crate is written out.
 | statement | tier | test | atomic / note |
 |---|---|---|---|
 | `SELECT ... FROM <collection> [WHERE] [ORDER BY one expr] [LIMIT]` | T1 | `sql_tier1.rs::select_star_names_every_declared_column`, `::an_indexed_scalar_order_matches_the_direct_request`, `::limit_is_a_total_limit_on_the_prepared_query` | prepare_query: filters AND, one order, pages |
-| `SELECT ... FROM GRAPH_TABLE (...)` | T1 (patterns per §4.3) | `sql_tier1.rs::graph_table_compiles_to_one_bounded_traversal` | traversal driver/filter |
+| `SELECT * FROM GRAPH_TABLE (<graph> MATCH ... RETURN ...)`, the GQL body (patterns per §4.3) | T1 | `sql_tier1.rs::graph_table_compiles_to_one_bounded_traversal`, `lang/tests/gql_patterns.rs` | GQL plan (`Plan::Gql`); an outer select list or clause over the relation is refused until M3-D |
 | `INSERT INTO t (...) VALUES (...)`, `$n` params | T1 | `sql_tier1.rs::insert_update_delete_walk_the_key`, `::a_parameter_takes_its_type_from_its_position` | put by key |
 | `UPDATE t SET ... WHERE _key = $1` | T1 | `sql_dml.rs::the_key_forms_of_update_and_delete_stay_the_single_key_atomics` | put replaces the row; partial update = read-modify-put |
 | `DELETE FROM t WHERE _key = $1` | T1 | `sql_dml.rs::the_key_forms_of_update_and_delete_stay_the_single_key_atomics` | delete by key; RESTRICT/CASCADE per graph contract 6.1 |
@@ -284,28 +330,29 @@ already built and already charged.
 | `to_char(t, fmt)`, `to_timestamp`, `to_date` | T1 for the named templates | `sql_functions.rs::projected_date_functions_equal_rusts_own_computation`, `::an_unnamed_to_char_template_is_refused_at_prepare` | `to_char` carries `YYYY-MM-DD`, `YYYY-MM`, `YYYY`, `HH24:MI`, `HH24:MI:SS` and `YYYY-MM-DD HH24:MI:SS`, checked at PREPARE so an unnamed template is a refusal rather than an error on the first row. A general Postgres template is a formatting language of its own and is T3 |
 | time zones other than UTC storage (`AT TIME ZONE`) | T3 (refused by name) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | declared TIMESTAMPTZ is stored UTC; display conversion only |
 
-### 4.3 Graph (SQL/PGQ names)
+### 4.3 Graph (GQL names; `GRAPH_TABLE` takes a GQL body only -- §1, §5 deviation 19, `docs/lang/GQL_PROFILE_DESIGN.md`)
+
+M2-E (owner decision 1) removed the SQL/PGQ `GRAPH_TABLE (g MATCH ... COLUMNS (...))` body -- its parser (`lang/src/parser/graph_table.rs`), its compiler (`lang/src/compile/graph_table.rs`) and its AST -- with no compatibility alias. A `GRAPH_TABLE (...)` body is parsed as GQL only; a body that writes `COLUMNS` is refused by name, naming `RETURN` as the replacement (`lang/src/refuse.rs::GQL_TABLE`'s `COLUMNS` row; `lang/tests/gql_parse.rs::a_columns_body_is_refused_by_name_naming_return`). Every row below is the GQL construct that carries the property the removed body's tests pinned; where GQL is MORE permissive than the removed body was -- every bound variable projectable, a predicate evaluated over the row rather than answered index-only, a pattern seeded by a SCAN -- the row says so, because that is a real behaviour change, not a renaming.
 
 | function / construct | tier | test | atomic |
 |---|---|---|---|
-| element pattern `(v IS label)` / `(v:label)`, edge `-[e IS type]->`, `<-`, `-` | T1 | `sql_tier1.rs::graph_table_compiles_to_one_bounded_traversal`, `aggregate_graph_adversarial.rs::n_sql_graph_table_forms` | direction + type on BFS |
-| inline `WHERE` in element, edge (`-[r:t WHERE r.p > v]->`) | T1 | `sql_tier1.rs::graph_table_inline_edge_where_compiles_to_a_per_hop_prune`, `sql_explain.rs::explain_prints_the_edge_predicates_and_the_node_membership_sets` | per-hop edge predicates over the inline bag (graph contract 4.3) |
-| inline `WHERE` in element, far node, membership-able (`=`, range, `BETWEEN`, `ST_DWithin`, `ST_Within` on a point) | T1 | `sql_tier1.rs::graph_table_inline_node_where_compiles_to_a_membership_prune`, `aggregate_graph_adversarial.rs::o_node_predicate_membership_overflow_needs_67_million_sequences` | per-hop node predicates over index postings (graph contract 4.3) |
-| inline `WHERE` in element, far node, row-bound (`IS NULL`, `IS MISSING`, text, geometry, JSON) | T2/T3 | `sql_tier1.rs::a_row_bound_inline_node_predicate_is_refused_with_its_tier` | a per-hop predicate is answered index-side; these need the row, which graph contract 4.3 forbids per hop |
-| `COLUMNS (r.<prop> AS name)` on the edge element | T1 | `sql_tier1.rs::graph_table_columns_project_the_reaching_edge_and_order_by_it`, `::an_edge_alias_in_columns_is_matched_without_case`, `aggregate_graph_adversarial.rs::k_reaching_edge_equals_bag_first_admitted_across_types` | the reaching edge, bound by the traversal (graph contract 4.2) |
-| `ORDER BY <edge column alias>` | T1 | `sql_tier1.rs::graph_table_columns_project_the_reaching_edge_and_order_by_it`, `aggregate_graph_adversarial.rs::l_edge_order_missing_text_last_paged_refuses_entities_keys` | rank by the reaching edge's property |
-| `{n,m}`, `{n,}`, `+`, `?` quantifiers | T1 | `sql_tier1.rs::graph_table_compiles_to_one_bounded_traversal`, `aggregate_graph_adversarial.rs::j_five_hundred_sampled_traversals_equal_brute_force` | min/max depth |
-| label alternation `type1\|type2` | T2 | `sql_refusals.rs::graph_constructs_beyond_the_slice_name_their_tier` | multi-type hop (two ranges per hop) |
-| post-pattern `WHERE` | T1 | `sql_tier1.rs::a_key_post_filter_beside_a_graph_table_keeps_the_traversal_driving` | post-filter on rows |
-| `COLUMNS (expr AS name)` | T1 | `sql_tier1.rs::graph_table_columns_project_the_reaching_edge_and_order_by_it` | projection |
-| `path_length()` | T2 (refused by name) | `sql_refusals.rs::graph_constructs_beyond_the_slice_name_their_tier` | frontier depth accumulator |
-| `path_sum/product/min/max/avg/first/last(e.prop)` | T2 (refused by name) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | accumulators (graph contract 5.1) |
-| `p = ...`, `nodes(p)`, `edges(p)` | T2 (refused by name) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | path rebuild for returned rows |
-| `ANY SHORTEST`, `ALL SHORTEST` | T2 (refused by name) | `sql_refusals.rs::graph_constructs_beyond_the_slice_name_their_tier` | shortest-path atomic, unweighted |
-| `VERTEX_ID(v)`, `EDGE_ID(e)` | T2 (refused by name) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | entity id; edge id (after element identity) |
-| `IS ACYCLIC` (default), `TRAIL`, `WALK`, `SIMPLE` | T1 default only; others T3 (refused by name) | `sql_refusals.rs::graph_constructs_beyond_the_slice_name_their_tier` | contract 4.1. The three words are refused by name where SQL/PGQ puts them: the pattern parser asks the table before it demands the `(` (`lang/src/parser/graph_table.rs::graph_table`), so `MATCH TRAIL (...)` inside `GRAPH_TABLE` is the Tier-3 refusal and not `42601`. The same sweep fixed `ALL SHORTEST`, which one hand-written `if` had been refusing under the name `ANY SHORTEST`. |
-| negative patterns, `NOT EXISTS { pattern }` | T3 | — | no atomic |
-| a three-part name inside `GRAPH_TABLE`, or an element name that belongs to another element | syntax error naming the place | `sql_tier1.rs::a_graph_table_refuses_a_name_that_belongs_to_another_element` | |
+| element pattern `(v IS label)` / `(v:label)`, edge `-[e IS type]->`, `<-`, `-` | T1 | `sql_tier1.rs::graph_table_compiles_to_one_bounded_traversal`, `aggregate_graph_adversarial.rs::n_sql_graph_table_forms`, `lang/tests/gql_patterns.rs` | GQL's own `Expand`/`ExpandInto` (`core/engine/src/query/gql/`), not the SQL/PGQ `BfsRequest` driver |
+| inline `WHERE` in element, edge (`-[r:t WHERE r.p > v]->`) | T1 | `sql_tier1.rs::graph_table_inline_edge_where_compiles_to_a_per_hop_prune`, `sql_explain.rs::explain_prints_the_edge_predicates_and_the_node_membership_sets` (`#[ignore]`, needs M3-B for its ranking half), `lang/tests/gql_explain.rs` (`edge filter, per edge: (...)`) | per-hop edge predicate, evaluated over the edge's own bag |
+| inline `WHERE` in element, far node -- ANY pure expression, including `IS NULL`, a text search or a spatial predicate the row must be read for | T1 for the M2/M3-C expression pack; T2 (M6, `host function`) for `ST_*`/`to_tsvector`/`to_tsquery`/`bm25` | `sql_tier1.rs::graph_table_inline_node_where_compiles_to_a_membership_prune`, `::a_text_search_inline_node_predicate_is_refused_naming_its_milestone`, `aggregate_graph_adversarial.rs::n_sql_graph_table_forms`, `lang/tests/gql_explain.rs` (`far filter, per far node: (...)`) | a per-hop predicate is an ordinary pure expression over the bound row (`docs/LAYERS.md`: "lang may evaluate pure expressions over values core has already handed it"), never restricted to what an index posting answers without a row read -- the removed body's stricter rule (graph contract 4.3, "never reads a row for a predicate on a covered field") does not carry over |
+| `RETURN r.<prop> AS name` (the reaching edge's own property) | T1 | `lang/tests/gql_patterns.rs`, `sql_tier1.rs::an_edge_variable_is_matched_without_case`, `aggregate_graph_adversarial.rs::k_reaching_edge_equals_bag_first_admitted_across_types` | the reaching edge, bound by the traversal (graph contract 4.2); a variable is matched WITHOUT case, as every unquoted name in this dialect is (`lang/src/gql/schema.rs`) |
+| `RETURN <expr> AS name` over ANY bound pattern variable, including the pattern's SEED | T1 | `lang/tests/gql_patterns.rs`, `dist/rust/tests/readme_correctness.rs::graph_hops_directions_and_depths` | every bound variable projects (design M2), unlike the removed body, whose match row carried only the far node and the edge and refused a `COLUMNS` entry over the starting node by name |
+| `ORDER BY <edge property>`, over a RETURNed edge column | T2 (GQL profile M3-B: a `RETURN` stage's own `ORDER BY`/`LIMIT`, not built) | `sql_tier1.rs::graph_table_return_projects_the_reaching_edge_and_order_by_it` (`#[ignore = "needs M3-B"]`) | the engine atomic (`QueryOrder::Edge`) is T1 and reachable directly (`aggregate_graph_adversarial.rs::l_edge_order_missing_text_last_paged_refuses_entities_keys`); the GQL surface for it waits on the stage grammar |
+| `{n,m}`, `{n,}`, `+`, `?` quantifiers, on an edge or on a parenthesised subpath | T1 | `sql_tier1.rs::graph_table_compiles_to_one_bounded_traversal`, `aggregate_graph_adversarial.rs::j_five_hundred_sampled_traversals_equal_brute_force`, `lang/tests/gql_paths.rs`, `lang/tests/gql_automaton.rs` | min/max depth (a chain), or the `PathAutomaton` M4-A compiles a subpath repeat to |
+| label alternation `type1\|type2`, on a node or an edge | T1 | `lang/tests/gql_patterns.rs` (`label_alternation_*`) | a multi-type hop, unlike the removed body, which refused it by name as not built |
+| pattern (post-pattern) `WHERE` | T1 | `sql_tier1.rs::a_key_post_filter_beside_a_graph_table_keeps_the_traversal_driving`, `lang/tests/gql_patterns.rs` (`inline_and_pattern_where_*`) | post-filter on completed matches |
+| `WALK`, `TRAIL`, `ACYCLIC` (default) | T1 | `lang/tests/gql_paths.rs`, `lang/tests/gql_automaton.rs` | path mode, M4-A. `SIMPLE` is a P1 construct (`refuse::GQL_TABLE`), not this slice's |
+| `ANY`, `ANY SHORTEST`, `ANY CHEAPEST ... COST` | T1 | `lang/tests/gql_paths.rs` | `PathSearch::{Any,Shortest,Cheapest}`, M4-A/M4-C. `ALL SHORTEST` is a P1 construct |
+| a named path `p = ...` | T1 to BIND; `RETURN p` itself is refused ("a path") pending the path functions | `lang/tests/gql_paths.rs` (named path), `lang/tests/gql_parse.rs` (`NODES`, `EDGES`, `PATH_LENGTH`, `PATH_FIRST`, `PATH_LAST`, `ELEMENT_ID` rows) | M4-D builds `nodes(p)`, `edges(p)` and the path/element functions |
+| `path_sum/product/min/max/avg(e.prop)` | not adopted | `lang/tests/gql_parse.rs` | a path accumulator is a horizontal aggregate (`SUM`/... over the path's group variable), M4-D, not a function of its own |
+| `VERTEX_ID(v)`, `EDGE_ID(e)` | not adopted | `lang/tests/gql_parse.rs` | an element's id is `ELEMENT_ID(x)`, M4-D |
+| negative patterns, `EXISTS { pattern }` | T2 (GQL profile M5) | `lang/tests/gql_parse.rs` | brief §11 step 5 |
+| `COLUMNS (...)`, the removed SQL/PGQ projection | T3, not adopted | `lang/tests/gql_parse.rs::a_columns_body_is_refused_by_name_naming_return` | `GRAPH_TABLE` projects with `RETURN`; there is no compatibility alias |
+| a three-part name (`x.y.z`) inside a GQL body | syntax error naming the construct | `lang/tests/gql_parse.rs::a_property_reference_is_one_variable_and_one_property` | a property reference is one variable and one property; the removed body's separate "element name that belongs to another element" refusal does not carry over -- GQL's binder places an inline predicate wherever its variables are bound, so a forward reference across a pattern is accepted rather than refused (M4-A design: "the FIRST line position where everything it names is bound") |
 
 ### 4.4 Spatial (PostGIS names)
 
@@ -385,8 +432,8 @@ already built and already charged.
 
 1. The graph is native: `CREATE PROPERTY GRAPH` is optional and uses `EDGE TYPES`, not `EDGE TABLES`; no `SOURCE KEY ... REFERENCES` because endpoints are known from written edges.
 2. Inline element `WHERE` prunes per hop by contract; the post-pattern `WHERE` filters completed matches. Both are standard syntax; the guarantee is ours. A node predicate an index cannot answer without the row (`IS NULL`, `IS MISSING`, a text search, a geometry predicate, a JSON equality) is REFUSED inline rather than demoted to a post-filter: a post-filter keeps a node in the frontier that graph contract 4.3 says must never be expanded, so it answers a different question at two hops.
-3. `ORDER BY` takes one key; an expression is one key (the Score atomic). Two keys are a refusal (`sql_refusals.rs::two_order_by_keys_are_deviation_three`).
-4. `OFFSET` is a keyset continuation, never a skip count; the word itself is refused as Tier 2 (`sql_refusals.rs::offset_is_deviation_four`).
+3. In a SELECT over a collection, `ORDER BY` takes one key; an expression is one key (the Score atomic). Two keys are a refusal (`sql_refusals.rs::two_order_by_keys_are_deviation_three`).
+4. In a SELECT over a collection, `OFFSET` is a keyset continuation, never a skip count; the word itself is refused as Tier 2 (`sql_refusals.rs::offset_is_deviation_four`).
 5. BM25 stands behind `ts_rank_cd`; the number differs from Postgres and the docs say so.
 6. `USING vamana` and `USING diskann` name the VAMANA GRAPH family, which is
    this engine's own (`core/engine/src/index/vector/graph.rs`), not pgvectorscale's
@@ -412,15 +459,19 @@ already built and already charged.
    `0.0`, which is where a `Bm25` leaf puts a non-matching candidate too.
 8. Declared TIMESTAMPTZ is stored as UTC microseconds in an Int; no time-zone storage.
 9. `<>` on an edge property is accepted, and so is `<>` on an indexed scalar column. The two get there by different roads, and the difference is worth stating: an edge predicate reads the property out of the posting the hop is standing on, so the complement costs exactly what the predicate costs and no set is involved; a scalar `<>` is the COMPLEMENT of an equality over the membership algebra (`sql_refusals.rs::an_inequality_is_the_complement_of_an_equality`), which is a set, bounded by `WorkResource::MembershipBytes`.
-10. The reaching edge is projected under a reserved `@edge.` prefix (`@edge.weight`), which no unquoted SQL identifier can spell, so it never collides with a declared field. A `COLUMNS (r.weight AS w)` entry compiles to it, and `ORDER BY w` resolves against the pattern's edge aliases before it looks for a column of the far node. An edge column entry and an `ORDER BY` over one are matched to the pattern's edge variable WITHOUT case, as every other name in this dialect is.
+10. (M2-E) The removed SQL/PGQ body projected the reaching edge under a reserved `@edge.` prefix (`@edge.weight`), a spelling the outer SQL SELECT list needed because the edge was not an ordinary bound variable there. GQL has no such prefix: every pattern variable, including the edge one, is bound in the same schema, so `RETURN r.weight AS w` reads it through the same expression evaluator every other property read goes through (`lang/src/gql/eval.rs`). A variable is matched WITHOUT case, as every unquoted name in this dialect is (`lang/src/gql/schema.rs`).
 11. A nullish group key (NULL or missing) sorts FIRST under `GROUP BY`, the scalar keyspace's own order; Postgres sorts NULL last and `NULLS FIRST|LAST` is refused. `HAVING` over an all-null accumulator drops the group (SQL three-valued logic); a `HAVING` over `min`/`max` of a non-numeric column is refused at prepare.
 12. `DROP TABLE` is RESTRICT by default, and what restricts it is GRAPH EDGES, not foreign keys: Postgres refuses on a dependent constraint, this refuses while any edge in any context references a row of the table and names those contexts (graph contract 6.1). `CASCADE` removes those edges and nothing else -- it never reaches a second table's rows. A table with no edges on it drops under the default.
 13. `DROP TABLE` is bounded and resumable, so it is not one transaction: the DROPPING mark is committed first and each bounded step after it is committed as it goes. An interrupted `DROP TABLE` leaves a collection that answers nothing and resumes from its committed cursor; it never leaves a half-emptied readable table. `ROLLBACK` does not undo a drop that has begun.
-14. A statement that reads the reaching edge runs on the traversal that bound it, because no other candidate stream carries the edge (graph contract 4.2); any other driver is refused when the query is prepared, with the driver named. So a post-pattern `_key` predicate beside such a statement keeps the traversal driving and is answered from the external key the row carries, at one primary read per candidate, instead of taking the driver for the mapping walk. A `_key` predicate with no such pattern still drives the mapping walk, which is the cheaper plan and remains the default.
-15. The prior engine's `FROM MATCH (a)-[r]->(b)` is not adopted (§1) and never will be. The capability is not lost and is not Tier 3: it is T1 under the standard spelling, `FROM GRAPH_TABLE (g MATCH (a)-[r]->(b) COLUMNS (...))`. Migration is mechanical -- wrap the pattern in `GRAPH_TABLE (...)`, name the graph, and move the SELECT list into `COLUMNS`. `MATCH SHORTEST` is `ANY SHORTEST` (§4.3), and a multi-FROM `..., collection AS alias` is a `CROSS JOIN LATERAL` (§4.8). This is a refusal with a named reason: the atomic exists, the spelling does not.
+14. (M2-E) The removed SQL/PGQ body's outer SQL SELECT could read the reaching edge, so an ordinary `_key` post-filter beside such a statement had to keep the TRAVERSAL driving rather than take the mapping-walk driver its own predicate would otherwise choose (graph contract 4.2: no other candidate stream carries the edge). GQL has no outer SELECT over the relation to make that choice for (an outer clause is refused until M3-D, §4.3): a `_key` predicate inside a GQL pattern's own `WHERE` is one more `Filter` operator of the GQL plan, not a driver choice at the `SelectPlan` level. An ordinary (non-`GRAPH_TABLE`) statement's `_key` predicate still drives the mapping walk, which is the cheaper plan and remains the default.
+15. The prior engine's `FROM MATCH (a)-[r]->(b)` is not adopted (§1) and never will be. The capability is not lost and is not Tier 3: it is T1 under the standard spelling, `FROM GRAPH_TABLE (g MATCH (a)-[r]->(b) RETURN ...)`. Migration is mechanical -- wrap the pattern in `GRAPH_TABLE (...)`, name the graph, write `SELECT *` as the outer list, and move the SELECT list into `RETURN`. `MATCH SHORTEST` is `ANY SHORTEST` (§4.3), and a multi-FROM `..., collection AS alias` is a `CROSS JOIN LATERAL` (§4.8). This is a refusal with a named reason: the atomic exists, the spelling does not.
 16. `NOT NULL` is enforced here. The prior engine parses it and does not check it, so a corpus it accepted can be refused by sekejap on the row that was always in violation. The check is a descriptor flag tested when the row is assembled; the error names the column.
 17. `FROM ALL` is unordered by contract: it would concatenate the collections in catalog id order and page within each. It is not a UNION (which stays T3), it does not deduplicate, and a ranked `ORDER BY` over it is refused for the reason in its §2 row. It is not built, and is refused by name today.
 18. `RETURNING` is refused by name in `UPDATE` and `DELETE`, and so is a `SET _key = ...` that would patch the external key of a row a driver is standing on (`sql_dml.rs::a_predicated_write_refuses_returning_and_a_patched_key_by_name`).
+19. Deviations 3 and 4 are rules of a SELECT over a collection, where one key and a keyset continuation are what the drivers serve. They do not bind the GQL profile (§1), whose working-table `ORDER BY` takes several keys and whose `OFFSET` skips rows of one live execution (`docs/lang/GQL_PROFILE_DESIGN.md` §3; `lang/tests/gql_pipeline.rs`). The profile's VALUES differ from the SQL surface's in three ways, each fixed at the one place a value crosses between them (`lang/src/gql/convert.rs`). They are pinned at the conversion by unit tests:
+    - **One null inside the profile.** A property absent from its row and a property stored as NULL both read as NULL inside a GQL body, so `IS NULL` is true for both, and an answer that returns such a property returns NULL, never MISSING. `IS MISSING` stays a SQL predicate. Outside `GRAPH_TABLE`, MISSING and NULL remain distinct exactly as §3 and §8.2 state. Pinned at the conversion by `lang/src/gql/convert.rs::tests::a_missing_property_is_null_in_gql_and_stays_missing_in_sql`.
+    - **A list is a JSON array.** A list-valued output column reaches a caller as JSON holding an array, element NULLs as JSON null (`::a_list_converts_to_a_json_array`); a list holding a float that JSON cannot carry (NaN, infinity) is refused, naming the column, rather than written as null.
+    - **Nodes, edges and paths never leave the profile.** They are values inside it and have no SQL representation; an output column holding one is refused, naming the column and what to return instead, such as `person._key` (`::nodes_edges_and_paths_are_not_sql_values_and_the_error_names_the_variable`).
 
 ## 6. Execution guarantees the contract makes
 
@@ -499,8 +550,8 @@ SELECT _key, name, born FROM place WHERE kind = 'shop' ORDER BY born DESC LIMIT 
 ```
 
 ```sql
--- SELECT ... FROM GRAPH_TABLE (...)
-SELECT k FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{1,3}(b:place) COLUMNS (b._key AS k))
+-- SELECT * FROM GRAPH_TABLE (<graph> MATCH ... RETURN ...), the GQL body
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{1,3}(b:place) RETURN b._key AS k)
 ```
 
 ```sql
@@ -538,7 +589,7 @@ CREATE TABLE ex_town (name TEXT PRIMARY KEY, label TEXT, founded INT, rating DOU
 -- the same table WITHOUT the override: every eligible column is indexed with
 -- the collection, and the predicate answers with no CREATE INDEX anywhere
 CREATE TABLE ex_auto (name TEXT, founded INT, active BOOLEAN, day DATE, loc GEOMETRY(Point,4326), props JSONB, emb VECTOR(4));
-INSERT INTO ex_auto (_key, name, founded, active, day) VALUES ('a1', 'kebun', 1901, true, '1901-06-15');
+INSERT INTO ex_auto (_key, name, founded, active, day) VALUES ('a1', 'garden', 1901, true, '1901-06-15');
 SELECT _key FROM ex_auto WHERE founded BETWEEN 1900 AND 1910;
 SELECT _key FROM ex_auto ORDER BY name ASC LIMIT 1
 ```
@@ -1164,61 +1215,76 @@ SELECT count(*) AS n FROM posts WHERE meta->>'author' = 'nobody';
 SELECT _key FROM posts WHERE meta -> 'author' = 'bob'
 ```
 
-### 8.4 Graph (§4.3)
+### 8.4 Graph (§4.3, the GQL body)
 
 ```sql
 -- element pattern, edge type and direction
-SELECT k FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->(b:place) COLUMNS (b._key AS k))
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->(b:place) RETURN b._key AS k)
 ```
 
 ```sql
 -- {n,m} quantifiers are min/max depth
-SELECT k FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{1,4}(b:place) COLUMNS (b._key AS k))
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{1,4}(b:place) RETURN b._key AS k)
 ```
 
 ```sql
 -- inline WHERE on the EDGE prunes per hop, over the posting's own property
-SELECT k FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[r:near WHERE r.weight > 0.2]->{1,4}(b:place) COLUMNS (b._key AS k))
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[r:near WHERE r.weight > 0.2]->{1,4}(b:place) RETURN b._key AS k)
 ```
 
 ```sql
 -- inline WHERE on the far NODE, membership-able, prunes over index postings
-SELECT k FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{1,4}(b:place WHERE b.kind = 'port') COLUMNS (b._key AS k))
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{1,4}(b:place WHERE b.kind = 'port') RETURN b._key AS k)
 ```
 
 ```sql
--- COLUMNS over the reaching edge, and ORDER BY that edge column
-SELECT k, w FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[r:near]->{1,6}(b:place) COLUMNS (b._key AS k, r.weight AS w)) ORDER BY w DESC LIMIT 3
+-- inline WHERE on the far NODE, row-bound: GQL evaluates ANY pure expression
+-- over the bound row, unlike the removed SQL/PGQ body, which refused this
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{1,4}(b:place WHERE b.tag IS NULL) RETURN b._key AS k)
 ```
 
 ```sql
--- a post-pattern WHERE filters completed matches and keeps the traversal driving
-SELECT k, w FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[r:near]->{1,6}(b:place) COLUMNS (b._key AS k, r.weight AS w)) WHERE _key <= 'p004' ORDER BY w DESC
+-- RETURN over the reaching edge, matched WITHOUT case. The hop count is
+-- split into an unnamed {0,5} repeat plus one more named hop: r, quantified
+-- directly, would be a group variable (M4-A design) and RETURN r.weight on
+-- it would be refused, naming M4-D; splitting off the last hop keeps r a
+-- singleton, the reaching edge, while the walk is still 1 to 6 hops deep.
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{0,5}(x:place)-[r:near]->(b:place) RETURN b._key AS k, R.weight AS w)
+```
+
+```sql
+-- a pattern WHERE filters completed matches, applied after the pattern
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{0,5}(x:place)-[r:near]->(b:place) WHERE b._key <= 'p004' RETURN b._key AS k, r.weight AS w)
+```
+
+```sql
+-- label alternation is a multi-type hop, built (M4-A), not refused
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near|far]->(b:place) RETURN b._key AS k)
+```
+
+```sql
+-- ANY SHORTEST is a selector, built (M4-A): the fewest hops out of p000
+SELECT * FROM GRAPH_TABLE (base MATCH ANY SHORTEST (a:place WHERE a._key = 'p000')-[:near]->{1,199}(b:place WHERE b._key = 'p005') RETURN b._key AS k)
 ```
 
 ```sql refused
--- refused 0A000: a row-bound inline node predicate
-SELECT k FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{1,4}(b:place WHERE b.tag IS NULL) COLUMNS (b._key AS k))
+-- refused 0A000: the removed SQL/PGQ COLUMNS body
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->(b:place) COLUMNS (b._key AS k))
 ```
 
 ```sql refused
--- refused 0A000: label alternation is a multi-type hop
-SELECT k FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near|far]->(b:place) COLUMNS (b._key AS k))
+-- refused 0A000: SIMPLE is a P1 construct; WALK, TRAIL and ACYCLIC are this slice's
+SELECT * FROM GRAPH_TABLE (base MATCH SIMPLE (a:place WHERE a._key = 'p000')-[:near]->{1,4}(b:place) RETURN b._key AS k)
+```
+
+```sql
+-- PATH_LENGTH counts a path's edges
+SELECT * FROM GRAPH_TABLE (base MATCH p = ANY SHORTEST (a:place WHERE a._key = 'p000')-[:near]->{1,4}(b:place) RETURN b._key AS k, PATH_LENGTH(p) AS d)
 ```
 
 ```sql refused
--- refused 0A000: ANY SHORTEST
-SELECT k FROM GRAPH_TABLE (base MATCH ANY SHORTEST (a:place WHERE a._key = 'p000')-[:near]->+(b:place) COLUMNS (b._key AS k))
-```
-
-```sql refused
--- refused 0A000: PATH_LENGTH
-SELECT d FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->+(b:place) COLUMNS (path_length() AS d))
-```
-
-```sql refused
--- refused 0A000: TRAIL (IS ACYCLIC is the default and the only mode; the pattern head asks the table before it demands the `(`)
-SELECT k FROM GRAPH_TABLE (base MATCH TRAIL (a:place WHERE a._key = 'p000')-[:near]->+(b:place) COLUMNS (b._key AS k))
+-- refused 0A000: to_tsvector/to_tsquery are GQL profile M6 host functions
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->(b:place WHERE to_tsvector('simple', b.body) @@ to_tsquery('simple', 'garden')) RETURN b._key AS k)
 ```
 
 ### 8.5 Spatial (§4.4)
@@ -1319,47 +1385,47 @@ SELECT vector_dims(emb) AS d FROM place LIMIT 1
 
 ```sql
 -- a one-term tsquery is Any of one term
-SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'kebun')
+SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'garden')
 ```
 
 ```sql
 -- & is All
-SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'kebun & sawah')
+SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'garden & field')
 ```
 
 ```sql
 -- | is Any
-SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'kebun | sawah')
+SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'garden | field')
 ```
 
 ```sql
 -- a quoted term list is a Phrase
-SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', '"kebun sawah"')
+SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', '"garden field"')
 ```
 
 ```sql
 -- NOT over a text leaf is the complement of the index's own document universe
-SELECT _key FROM place WHERE NOT (to_tsvector('simple', body) @@ to_tsquery('simple', 'kebun'))
+SELECT _key FROM place WHERE NOT (to_tsvector('simple', body) @@ to_tsquery('simple', 'garden'))
 ```
 
 ```sql
 -- ORDER BY ts_rank_cd is the Bm25 order, and the value projects under an alias
-SELECT _key, ts_rank_cd(to_tsvector('simple', body), to_tsquery('simple', 'kebun')) AS score FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'kebun') ORDER BY ts_rank_cd(to_tsvector('simple', body), to_tsquery('simple', 'kebun')) DESC LIMIT 5
+SELECT _key, ts_rank_cd(to_tsvector('simple', body), to_tsquery('simple', 'garden')) AS score FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'garden') ORDER BY ts_rank_cd(to_tsvector('simple', body), to_tsquery('simple', 'garden')) DESC LIMIT 5
 ```
 
 ```sql
 -- bm25(col, 'query') is the same Score leaf under its own name
-SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'kebun') ORDER BY bm25(body, 'kebun') DESC LIMIT 5
+SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'garden') ORDER BY bm25(body, 'garden') DESC LIMIT 5
 ```
 
 ```sql
 -- an arithmetic ORDER BY is ONE key: a blend over Score leaves
-SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'kebun') ORDER BY 0.5 * bm25(body, 'kebun') + 0.5 * (1 - (emb <=> '[1,0,0,0]'::vector)) DESC LIMIT 5
+SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'garden') ORDER BY 0.5 * bm25(body, 'garden') + 0.5 * (1 - (emb <=> '[1,0,0,0]'::vector)) DESC LIMIT 5
 ```
 
 ```sql refused
 -- refused 0A000: a tsquery that mixes & with | is a boolean tree of text leaves
-SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'kebun & (sawah | pasar)')
+SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'garden & (field | market)')
 ```
 
 ```sql refused
@@ -1369,32 +1435,32 @@ SELECT _key FROM place WHERE to_tsvector('english', body) @@ to_tsquery('english
 
 ```sql
 -- search(col, 'query') is typo-tolerant: this is an exact term
-SELECT _key FROM place WHERE search(body, 'kebun')
+SELECT _key FROM place WHERE search(body, 'garden')
 ```
 
 ```sql
--- one edit is spent on a five-character token, so a typo still finds it
-SELECT _key FROM place WHERE search(body, 'kebum')
+-- one edit is spent on a six-character token, so a typo still finds it
+SELECT _key FROM place WHERE search(body, 'gardem')
 ```
 
 ```sql
 -- the LAST token completes as a prefix (search-as-you-type)
-SELECT _key FROM place WHERE search(body, 'keb')
+SELECT _key FROM place WHERE search(body, 'gar')
 ```
 
 ```sql
 -- an earlier token does NOT complete: it matches a whole term, typos aside
-SELECT _key FROM place WHERE search(body, 'kebun saw')
+SELECT _key FROM place WHERE search(body, 'garden fie')
 ```
 
 ```sql
 -- search_score() is the predicate's own Score leaf, in [0,1], and projects under an alias
-SELECT _key, search_score() AS score FROM place WHERE search(body, 'keb') ORDER BY search_score() DESC LIMIT 5
+SELECT _key, search_score() AS score FROM place WHERE search(body, 'gar') ORDER BY search_score() DESC LIMIT 5
 ```
 
 ```sql
 -- a blended order: one key over a bounded text score and a vector similarity
-SELECT _key FROM place WHERE search(body, 'kebun') ORDER BY 0.6 * search_score() + 0.4 * (1 - (emb <=> '[1,0,0,0]'::vector)) DESC LIMIT 5
+SELECT _key FROM place WHERE search(body, 'garden') ORDER BY 0.6 * search_score() + 0.4 * (1 - (emb <=> '[1,0,0,0]'::vector)) DESC LIMIT 5
 ```
 
 ```sql refused
@@ -1404,12 +1470,12 @@ SELECT _key FROM place WHERE kind = 'cafe' ORDER BY search_score() DESC
 
 ```sql refused
 -- refused 0A000: WEBSEARCH_TO_TSQUERY
-SELECT _key FROM place WHERE to_tsvector('simple', body) @@ websearch_to_tsquery('simple', 'kebun sawah')
+SELECT _key FROM place WHERE to_tsvector('simple', body) @@ websearch_to_tsquery('simple', 'garden field')
 ```
 
 ```sql refused
 -- refused 0A000: TS_HEADLINE
-SELECT ts_headline(body, 'kebun') AS snippet FROM place LIMIT 1
+SELECT ts_headline(body, 'garden') AS snippet FROM place LIMIT 1
 ```
 
 ### 8.8 Aggregates (§4.7)

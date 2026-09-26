@@ -105,7 +105,10 @@ rows are STREAMED page by page and nothing is held.
   source collection's declared types (§3.1); the statement is compiled with
   one PROBE parameter per `$n`, built from the declared OID, because a plan
   is what names the collection. A probe that does not compile answers
-  `NoData` rather than a guess.
+  `NoData` rather than a guess. A position the `Parse` left undeclared is
+  answered with the type the statement itself gives it
+  (`PreparedSql::param_types`, §3.3) when it gives one, and `text`
+  otherwise.
 * **`Describe('P')`** runs the portal and holds its answer, which is what
   lets its columns be described; the `Execute` that follows does not repeat
   the run.
@@ -180,6 +183,29 @@ per install rather than reserving one, and a client recognises them by NAME
 through the catalog, so any stable number above the system range serves.
 18000 is the prior engine's and is kept.
 
+**Lists are one-dimensional PostgreSQL arrays.** A list column is declared by
+`PreparedSql::column_type` with a `T[]` spelling (`docs/lang/GQL_PROFILE_DESIGN.md`
+§6.1, §6.3) and typed by the array OID of `T`:
+
+| spelling | OID | `typname` |
+|---|---|---|
+| `TEXT[]` | 1009 | `_text` |
+| `BIGINT[]` (any integer spelling) | 1016 | `_int8` |
+| `DOUBLE PRECISION[]`, `REAL[]` | 1022 | `_float8` |
+| `BOOLEAN[]` | 1000 | `_bool` |
+| `JSONB[]` | 3807 | `_jsonb` |
+| `DATE[]` | 1182 | `_date` |
+| `TIMESTAMPTZ[]` | 1185 | `_timestamptz` |
+
+These are the element types a list holds (`docs/lang/GQL_PROFILE_DESIGN.md`
+§6.3), the two declared times among them: a list of `DATE` or `TIMESTAMPTZ`
+values prints each item as the scalar column prints it (ISO-8601 text), and
+is written as `date` / `timestamptz` elements in text and binary. Any other
+`T[]` spelling (`BYTEA[]`, `GEOMETRY[]`, `VECTOR[]`) names no wire type. The
+seven are also rows of the `pg_type` catalog view (`typcategory` `A`, `typelem` the element OID), where a
+driver looks an array OID up before it decodes one. Nothing produces a list
+column yet; the GQL profile's list expressions (M3) are the first that will.
+
 **A column's OID is data-independent, and that is deliberate.** It is read
 from the collection's DECLARED spelling first — `TIMESTAMPTZ` and `DATE` are
 both `Kind::Int` (`QL_CONTRACT` §5 deviation 8), so only the catalog says
@@ -189,6 +215,19 @@ client decodes every later row with what it read there; an OID inferred from
 values would type the same statement differently at `Describe` and at
 `Execute`. So a computed column — an aggregate, a row function, a literal,
 `_id` — is `text`, carrying the text `sekejap_lang` prints.
+
+**A GQL relation types every column from its binding schema.**
+`SELECT * FROM GRAPH_TABLE (<graph> ... RETURN ...)` names no one source
+collection, so `PreparedSql::column_type` decides every column at compile,
+still never from values (`docs/lang/GQL_PROFILE_DESIGN.md` §6.1): a node
+property is its field's declared type when every label collection declares
+it alike, `text` when they differ or none declares it (design Q8); an edge
+property is `text`; a comparison is `bool`. A `$n` the `Parse` left
+undeclared and the statement compares with a declared property is described
+with that property's type (`PreparedSql::param_types`), and the `Bind`
+decodes it so. A seed key no row holds is zero rows and `SELECT 0`, never an
+error. Every row of the relation carries no owner (`SqlRow::owner()` is
+`None`).
 
 ### 3.2 Values out: text is the format, binary is what a driver asks for
 
@@ -218,12 +257,34 @@ binary request is HONOURED for the closed set that has a binary encoding here
 and every other OID is sent as its TEXT bytes, which is exactly right for a
 type the client does not know either.
 
+A list reaches the wire as `SqlValue::Json(array)`. Under an array OID (§3.1)
+it is written as a PostgreSQL array, each element encoded as a cell of the
+element type (a `jsonb` element is its JSON text, so a string element is
+`"s"` with its quotes):
+
+* **Text:** `array_out`'s form, `{a,"b c",NULL}`; an empty list is `{}`. A
+  JSON null element is `NULL`. An element is double-quoted when it is
+  empty, reads as `NULL` in any case, or holds `{`, `}`, `,`, `"`, `\` or
+  white space; inside the quotes `"` and `\` are escaped with `\`.
+* **Binary:** `array_send`'s form: ndim `1`, the has-null flag, the element
+  OID, the length and lower bound `1`, then each element length-prefixed
+  (`-1` for NULL). An empty list is ndim `0` with no dimension pair, as
+  PostgreSQL sends `'{}'`.
+
+A SQL NULL list is a NULL cell. A value under an array OID that is not a
+JSON array is sent as its text, as any other mismatch is.
+
 ### 3.3 Values in: `$n`
 
 A `$n` is decoded by the OID the `Parse` DECLARED, in the format the `Bind`
-named. A position the `Parse` left undeclared is answered `text` (25) in
-`ParameterDescription` — a real type whose value maps onto `Param::Text` with
-nothing inferred — and a text parameter with no declared OID at all is read
+named. A position the `Parse` left undeclared is answered in
+`ParameterDescription` with the type the statement gives it
+(`PreparedSql::param_types`, whose spellings map to OIDs as columns do), and
+the statement then decodes that position by that OID at `Bind`, so the value
+is read as the type the client was told. Every statement compiled today
+gives none, so such a position is answered `text` (25) — a real type whose
+value maps onto `Param::Text` with nothing inferred — and a text parameter
+with no declared OID at all is read
 by SHAPE (a whole number, then a number, then text), because `Param`'s type
 is read from WHERE it is used and handing `Param::Text("42")` to an `INT`
 column refuses where `Param::Int(42)` does not.
@@ -231,6 +292,17 @@ column refuses where `Param::Int(42)` does not.
 **So a client that wants an INT parameter says so.** `rust-postgres` spells
 that `prepare_typed(sql, &[Type::INT8])`; pgjdbc spells it `setLong`; psycopg
 sends the OID. This is the door, and it is the one the protocol already has.
+
+**An array parameter is a list.** A `$n` declared with an array OID (§3.1)
+decodes to `Param::Json(array)`, in either format: text `{a,"b c",NULL}`
+with the §3.2 quoting (an unquoted `NULL` in any case is a null element, a
+quoted `"NULL"` is the text), or binary `array_send` layout. Each element is
+decoded as a parameter of the element type would be, and a null element is
+JSON null. Refused by name with `22023`: more than one dimension, a
+malformed literal, an element its type cannot read, a non-finite `float8`
+element (JSON has no spelling for it), a binary element OID other than the
+declared one, and a truncated or over-long binary value. An UNDECLARED text
+parameter shaped like `{1,2}` is still read by shape, as text.
 
 ---
 
@@ -356,6 +428,7 @@ it back.
 | `SqlError::Refused` (Tier 2 / Tier 3), `SqlError::Unsupported`, `Error::Unsupported` | `0A000` | `feature_not_supported` |
 | a boolean leaf with NO membership set (`core/engine/src/query/plan.rs`: a geometry predicate, a traversal, a JSON equality, a text phrase, `IS NULL` / `IS MISSING`) | `0A000` | `feature_not_supported` |
 | `SqlError::Syntax` | `42601` | `syntax_error` |
+| `SqlError::Coded { sqlstate, .. }`: an error PostgreSQL raises with its own code, carried as data from where it is raised -- a GQL evaluation's division by zero (`22012`), integer overflow (`22003`), bad cast input (`22P02`, `22007`), `LN`/`SQRT`/`POWER` argument (`2201E`, `2201F`), value of the wrong kind (`42804`); a GQL statement's unknown variable (`42703`), variable bound twice (`42712`), ungrouped variable (`42803`), unknown function or wrong argument count (`42883`), impossible cast (`42846`) | that `sqlstate` | PostgreSQL's name for it |
 | `no collection named …`, `Error::NotFound` | `42P01` | `undefined_table` |
 | `Error::Corrupt`, `kernel::Error::Corrupt*` | `XX001` | `data_corrupted` |
 | `QueryError::Cancelled`, `Error::Cancelled` | `57014` | `query_canceled` |
@@ -371,8 +444,8 @@ it back.
 | a statement in a failed block | `25P02` | `in_failed_sql_transaction` |
 | anything else the store refuses | `XX000` | `internal_error` |
 
-The four codes a statement reaches through `sekejap_lang` alone, each shown
-as the statement that produces it. The harness runs these against the same
+Codes a statement reaches through `sekejap_lang` alone, each shown as the
+statement that produces it. The harness runs these against the same
 mapping function the wire surface uses (`dist/src/pg/types.rs::wire_error`),
 so the table above and these blocks cannot disagree:
 
@@ -394,6 +467,16 @@ SELECT _key FROM posts WHERE
 ```sql refused
 -- refused 42P01: an undefined table
 SELECT _key FROM nowhere
+```
+
+```sql refused
+-- refused 22012: a division by zero in a GQL body
+SELECT * FROM GRAPH_TABLE (base RETURN 1 / 0 AS v)
+```
+
+```sql refused
+-- refused 42703: a GQL variable no statement binds
+SELECT * FROM GRAPH_TABLE (base RETURN x AS v)
 ```
 
 **The one departure from "a refusal is `0A000`", stated.** The single-writer
@@ -449,6 +532,8 @@ SELECT session_user
 |---|---|
 | `dist/tests/pg_wire.rs` | The BYTES. Every frame is built in the test from the protocol's own layout and every reply parsed back the same way: the startup exchange and the parameters a client reads off it, the `SSLRequest` refusal, the simple protocol, the extended protocol with a declared `$n`, a rebind that parses nothing, portal suspend and resume, the `0xFFFF` count, each SQLSTATE, the transaction statuses, `LISTEN` ordering around a commit and a rollback, the cursors, and the two named refusals. |
 | `dist/tests/pg_server.rs` | The real `sekejap-pg` binary on a free localhost port, driven by `postgres` 0.19 — a client nothing here wrote, which speaks the extended protocol with BINARY parameters and BINARY results, reads `ParameterDescription` before it will encode a value, and cancels out of band. Plus `psql` itself when it is installed, and the DBeaver connect sequence with its catalog half asserted to be a NAMED REFUSAL. |
+| `dist/tests/pg_wire_gql.rs` | A GQL statement on the wire: `Parse`/`Describe` answers typed columns (`text`, `int8`, `bool`) and the parameter type its comparison gives it before any row exists; `Bind`/`Execute` rows in text and binary under those types; a missing seed is zero rows; a rebind without a new `Parse`; the simple protocol and `EXPLAIN`. |
+| `dist/tests/pg_wire_gql_types.rs` | The list plumbing, a byte at a time against `array_out` / `array_send` written out by hand: the array OIDs, `TEXT[]` and `INT8[]` cells in text and binary (empty lists, NULL elements, quoting), their round trip through the parameter decoder, array parameters to `Param::Json`, the named refusals, `SqlRow::owner`, and `PreparedSql::param_types`. |
 
 Both hold their oracle in the test process. `pg_server.rs` MEASURES the cost
 of one full scan and asserts a floor, so the cancel test is a test rather

@@ -52,7 +52,7 @@ message. `int32_t` on the wire.
 | 2 | `SekejapStatus_Corrupt` | a page or a log failed verification. Nothing was changed |
 | 3 | `SekejapStatus_Unsupported` | a format, policy or configuration this build does not implement |
 | 4 | `SekejapStatus_Io` | the directory, the file or the medium refused |
-| 5 | `SekejapStatus_Invalid` | the caller's arguments: a null pointer, text that is not UTF-8, JSON that does not parse, a collection that is not in the catalog, a parameter of the wrong type, a syntax error |
+| 5 | `SekejapStatus_Invalid` | the caller's arguments: a null pointer, text that is not UTF-8, JSON that does not parse, a collection that is not in the catalog, a parameter of the wrong type, a syntax error, an error PostgreSQL raises with its own SQLSTATE (`SqlError::Coded`: a division by zero, an unknown variable; the message ends with `(SQLSTATE xxxxx)`) |
 | 6 | `SekejapStatus_Busy` | a bound refused rather than waiting: a work budget, a statement deadline, a cancel, a second writer, a reader slot |
 | 7 | `SekejapStatus_UnknownRow` | the named row is not in the collection, on a call that needs it to exist -- an edge endpoint |
 | 8 | `SekejapStatus_Unknown` | nothing above classified it, including a panic caught at the boundary. The message is still there |

@@ -307,27 +307,27 @@ const POSTS: usize = 12;
 const DIM: usize = 4;
 /// The four people, in key order, and the city each is in.
 const PEOPLE: [(&str, &str, &str); 4] = [
-    ("alice", "Alice", "Jakarta"),
-    ("bob", "Bob", "Bandung"),
-    ("carol", "Carol", "Surabaya"),
-    ("dave", "Dave", "Jakarta"),
+    ("alice", "Alice", "Lisbon"),
+    ("bob", "Bob", "Kyoto"),
+    ("carol", "Carol", "Denpasar"),
+    ("dave", "Dave", "Lisbon"),
 ];
 /// One title per post, in key order.
 const TITLES: [&str; POSTS] = [
-    "kebun raya",
-    "pasar pagi",
-    "warung kopi",
-    "sawah luas",
-    "danau biru",
-    "hutan kota",
-    "kantor pos",
-    "sekolah dasar",
-    "jembatan tua",
-    "bengkel motor",
-    "desa wisata",
-    "pasar malam",
+    "botanic garden",
+    "morning market",
+    "coffee stall",
+    "wide field",
+    "blue lake",
+    "city forest",
+    "post office",
+    "primary school",
+    "old bridge",
+    "motor workshop",
+    "tourist village",
+    "night market",
 ];
-const CITIES: [&str; 3] = ["jakarta", "bandung", "surabaya"];
+const CITIES: [&str; 3] = ["lisbon", "kyoto", "denpasar"];
 
 /// The longitude and latitude of post `n` (1-based).
 fn post_point(n: usize) -> (f64, f64) {
@@ -342,10 +342,10 @@ const PLACES: usize = 200;
 const KINDS: [&str; 8] = [
     "depot", "farm", "home", "mill", "park", "port", "school", "shop",
 ];
-/// The small vocabulary `name` and `body` are written from. `kebun` and
-/// `sawah` are the two words §0 promises a `tsquery` matches rows with.
+/// The small vocabulary `name` and `body` are written from. `garden` and
+/// `field` are the two words §0 promises a `tsquery` matches rows with.
 const VOCABULARY: [&str; 8] = [
-    "kebun", "sawah", "pasar", "kopi", "danau", "hutan", "desa", "taman",
+    "garden", "field", "market", "coffee", "lake", "forest", "village", "grove",
 ];
 /// The first year of `born`: row `n` (0-based) is born in `FIRST_YEAR + n`,
 /// so the 200 rows cover 1900 … 2099 and 1990, 1991 and 1993 are each one row.
@@ -436,7 +436,7 @@ fn build_fixture(path: &Path) -> Result<(), Error> {
             &[
                 json!(format!("p{n:02}")),
                 json!(TITLES[n - 1]),
-                json!(format!("{} di kota {}", TITLES[n - 1], CITIES[(n - 1) % 3])),
+                json!(format!("{} in {}", TITLES[n - 1], CITIES[(n - 1) % 3])),
                 json!(n as i64 * 10),
                 json!(n as f64 / 2.0),
                 json!(n % 2 == 0),
@@ -561,7 +561,7 @@ fn build_place(db: &Db) -> Result<(), Error> {
         let mut params = vec![
             json!(format!("p{n:03}")),
             json!(format!("{word} {n:03}")),
-            json!(format!("{word} {next} di kota {}", CITIES[n % 3])),
+            json!(format!("{word} {next} in {}", CITIES[n % 3])),
             json!(KINDS[n % KINDS.len()]),
             json!(year as i64),
             // Every seventh row's `rating` is WRITTEN as null.

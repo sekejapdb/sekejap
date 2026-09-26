@@ -74,12 +74,12 @@ local tx = db:tx_begin()
 tx:put("places", "kuta", '{"_key":"kuta","name":"Kuta","area":"south"}')
 tx:commit()                                  -- or tx:rollback()
 
--- graph: link two rows, then walk the edge in SQL/PGQ
+-- graph: link two rows, then walk the edge in GQL
 db:link("tourists", "chloe", "visited", "places", "ubud")
 db:query([[
-  SELECT place FROM GRAPH_TABLE (base
+  SELECT * FROM GRAPH_TABLE (base
     MATCH (t IS tourists WHERE t._key = 'chloe')-[e IS visited]->(p IS places)
-    COLUMNS (p.name AS place))
+    RETURN p.name AS place)
 ]])
 -- `base` is the reserved name of the base graph context that db:link()
 -- (no context argument) writes into (docs/core/GRAPH_CONTRACT.md §2.1);

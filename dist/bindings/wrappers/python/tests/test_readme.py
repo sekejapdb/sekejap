@@ -72,7 +72,7 @@ def test_every_python_block_runs_and_prints_what_the_readme_says(tmp_path, monke
     ]
     # The one-hop pattern finds the flight the README inserted and linked.
     assert answers[
-        "SELECT airline, hours FROM GRAPH_TABLE (base MATCH "
+        "SELECT * FROM GRAPH_TABLE (base MATCH "
         "(t:tourists WHERE t._key = 'chloe')-[:flew_on]->(f:flights) "
-        "COLUMNS (f.airline AS airline, f.duration_hours AS hours))"
+        "RETURN f.airline AS airline, f.duration_hours AS hours)"
     ] == [{"airline": "Qantas", "hours": 6}]

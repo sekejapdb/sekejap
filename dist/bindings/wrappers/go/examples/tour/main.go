@@ -52,8 +52,8 @@ func main() {
 		panic(err)
 	}
 	rows, _ = db.Query(
-		"SELECT k FROM GRAPH_TABLE (base MATCH (t:tourists WHERE t._key = $1)-[:flew_on]->(f:flights) "+
-			"COLUMNS (f.airline AS k))",
+		"SELECT * FROM GRAPH_TABLE (base MATCH (t:tourists WHERE t._key = $1)-[:flew_on]->(f:flights) "+
+			"RETURN f.airline AS k)",
 		"chloe")
 	show("Chloe's flight:", rows)
 

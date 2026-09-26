@@ -245,10 +245,10 @@ A relationship between two rows is called an **edge**. You query edges with a
 ```python
 # Follow one edge: which flight did Chloe arrive on?
 db.query("""
-    SELECT airline, hours
+    SELECT *
     FROM GRAPH_TABLE (base MATCH
         (t:tourists WHERE t._key = 'chloe')-[:flew_on]->(f:flights)
-        COLUMNS (f.airline AS airline, f.duration_hours AS hours))
+        RETURN f.airline AS airline, f.duration_hours AS hours)
 """)
 ```
 
@@ -263,14 +263,15 @@ You can follow the same kind of edge for several hops, and `{1,2}` means
 # Tourists within 2 "similar_taste" hops of Chloe.
 db.link("tourists", "chloe", "similar_taste", "tourists", "aiym")
 db.query("""
-    SELECT tourist
+    SELECT *
     FROM GRAPH_TABLE (base MATCH
         (c:tourists WHERE c._key = 'chloe')-[:similar_taste]->{1,2}(t:tourists)
-        COLUMNS (t.name AS tourist))
+        RETURN t.name AS tourist)
 """)
 ```
 
-A pattern starts at one row, named by its key, and walks out from it.
+A pattern usually starts at one row, named by its key, and walks out from
+it; with no key predicate it starts by scanning the collection instead.
 
 ### Location (spatial)
 
@@ -459,10 +460,10 @@ UPDATE places SET rating = 4.8 WHERE _key = 'uluwatu'
 DELETE FROM places WHERE category = 'closed'
 
 -- Graph traversal: forward -[:e]-> and backward <-[:e]-
-SELECT place
+SELECT *
 FROM GRAPH_TABLE (base MATCH
     (a:places WHERE a._key = 'seminyak-beach')-[:near]->{1,3}(dest:places)
-    COLUMNS (dest._key AS place))
+    RETURN dest._key AS place)
 
 -- Aggregation: COUNT / SUM / AVG / MIN / MAX, grouped
 SELECT category, COUNT(*) AS n, AVG(rating) AS avg_rating
@@ -470,12 +471,11 @@ FROM places
 GROUP BY category
 ORDER BY n DESC
 
--- Edge properties: an inline WHERE on the edge, and its fields in COLUMNS
-SELECT visitor, rating
+-- Edge properties: an inline WHERE on the edge, and its fields in RETURN
+SELECT *
 FROM GRAPH_TABLE (base MATCH
     (p:places WHERE p._key = 'uluwatu')<-[v:visited]-(t:tourists)
-    COLUMNS (t.name AS visitor, v.rating AS rating))
-ORDER BY rating DESC
+    RETURN t.name AS visitor, v.rating AS rating)
 
 -- Spatial, vector, and text
 SELECT * FROM places   WHERE ST_DWithin(geometry, ST_MakePoint(115.168, -8.690)::geography, 5000.0)

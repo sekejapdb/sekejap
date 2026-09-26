@@ -37,6 +37,19 @@ native, not a layer declared over tables.
     without the bit open with implicit ids. Cost: 8 bytes per edge, nothing per
     hop. Reason: scoring weighs how many and how strong the edges are; set
     semantics destroyed that at write time.
+    SHIPPED (additive `EDGE_ID_FEATURE = 0x40000`): `Database::create_edge`
+    always creates a new edge and returns its `EdgeId` (the tuple plus a
+    database-wide id from a forward-only allocator, never reused, kept under
+    key tag `0x09` and written once per commit). The id is the last key
+    segment, `ordered(id)` (2..=9 bytes) on the primary key and on its reverse
+    mirror; every read (`neighbors`, BFS, the query traversal and its bound
+    edge) reports it. `update_edge_properties(EdgeId, ..)` and
+    `delete_edge_by_id(EdgeId)` touch exactly one edge; an endpoint leaves its
+    set (2.7) only with its last edge. The tuple-keyed calls keep their
+    meaning: `put_edge`/`link`/`link_many` upsert the tuple's own edge, whose
+    implicit id is 0 and whose key carries no segment, so a file that never
+    calls `create_edge` never sets the bit and is unchanged byte for byte.
+    `delete_edge`/`unlink` by tuple remove every edge of the tuple.
 2.4 Properties (DECIDED): the property bag stays; an edge type MAY declare
     typed properties (`prereq(weight REAL, agree INT)`). Declared properties are
     encoded fixed-width in the posting and read by offset; undeclared ones live
@@ -77,8 +90,12 @@ native, not a layer declared over tables.
 
 4.1 The atomic is a budgeted BFS: seed(s), direction (out, in, both), edge type
     or all, minimum and maximum depth, visited and edge budgets, result limit,
-    cancellation, pageable. A node is never revisited (GQL ACYCLIC is the only
-    path mode in this phase).
+    cancellation, pageable. A node is never revisited: one visited set on
+    nodes, each node reported once, at its first depth. This is reachability,
+    not a GQL path mode. GQL `ACYCLIC` gives every path without a repeated
+    node, so two such paths to one node are two matches. A GQL path pattern
+    runs on this BFS (the `Reach` operator) only where the planner proves the
+    answers equal (`docs/lang/GQL_PROFILE_DESIGN.md` §4.6).
 4.2 The traversal binds the reaching edge to each result and can read its
     properties. BUILT (order-of-work item 1): `TraversalNode::via` carries the
     edge, `Projection::Fields` accepts `"@edge.<property>"` and
@@ -122,6 +139,21 @@ native, not a layer declared over tables.
     Work: `graph_edges` counts every edge decoded, a pruned one included --
     §4.3 prunes the frontier, not the reading; `graph_visited` counts every
     node admitted.
+    GQL profile (M2-C, `docs/lang/GQL_PROFILE_DESIGN.md` §3.2): the rule
+    above -- no row read for a per-hop predicate -- is the BFS atomic's. A
+    GQL pattern is not that atomic: it is a seeded chain of `Expand`
+    operators, and on it a per-element predicate MAY read the row. An inline
+    edge `WHERE` is evaluated per edge, over the bag the outgoing posting
+    carries or, for an incoming hop, one primary-posting read charged as
+    `graph_edges`; an inline node `WHERE` is evaluated per reached node,
+    each row read charged as `primary_reads`. A failing edge or node is
+    still never followed (the prune is per hop), and every read is charged
+    to the execution's budget, so it is bounded, never free. What stays
+    refused is a row-bound predicate with NO seed: a label scan whose
+    predicate no index answers is refused naming the index (design Q5,
+    `QL_CONTRACT` §6). A `MATCH ... WHERE` after the pattern is the
+    post-filter stage on completed matches. The BFS atomic, and its legacy
+    SQL surface, are unchanged.
 4.4 One predicate set applies to every hop in this phase; per-hop patterns
     (typed multi-hop with different predicates per hop) are Phase 3 surface
     over the same atomic.
@@ -203,7 +235,7 @@ L8 Element identity and typed properties are additive feature bits; old files
 1. 4.2 + 4.3: edge binding and per-hop pruning (no format change). BUILT.
 2. 2.4: typed edge properties (additive descriptor).
 3. 5.1–5.3: streamed paths, path aggregates as Score leaves, shortest path.
-4. 2.3: element identity (feature bit; its own commit).
+4. 2.3: element identity (feature bit; its own commit). BUILT.
 5. 6.1: RESTRICT and CASCADE.
 
 Each item: one Opus worker in its own worktree, a Grok oracle suite over random

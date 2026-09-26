@@ -125,8 +125,8 @@ and sekejap's contract does not mention it at any tier (none remain).
 
 | # | prior-engine capability | prior engine (file:line) | sekejap status | note |
 |---|---|---|---|---|
-| 58 | `SELECT … FROM MATCH (a)-[r]->(b)` spelling | sql.rs:48-53 | NOT ADOPTED — QL §1, §5 deviation 11 | the capability is T1 under `FROM GRAPH_TABLE (g MATCH … COLUMNS (…))`; §5 deviation 11 writes the mechanical migration, including `MATCH SHORTEST` → `ANY SHORTEST` and multi-FROM → `CROSS JOIN LATERAL`. A refusal with a named reason: the atomic exists, the spelling does not |
-| 59 | Direction, edge type, `*a..b` var-length | sql.rs:57, usage/graph-queries.md:35-55 | DONE — `lang/src/lib.rs:70-75` (`GRAPH_TABLE`, hops, quantifiers) | — |
+| 58 | `SELECT … FROM MATCH (a)-[r]->(b)` spelling | sql.rs:48-53 | NOT ADOPTED — QL §1, §5 deviation 11 | the capability is T1 under `FROM GRAPH_TABLE (g MATCH … RETURN …)` (the GQL body; M2-E removed the SQL/PGQ `COLUMNS (…)` body with no compatibility alias); §5 deviation 11 writes the mechanical migration, including `MATCH SHORTEST` → `ANY SHORTEST` and multi-FROM → `CROSS JOIN LATERAL`. A refusal with a named reason: the atomic exists, the spelling does not |
+| 59 | Direction, edge type, `*a..b` var-length | sql.rs:57, usage/graph-queries.md:35-55 | DONE — `lang/src/gql/parse/pattern.rs` (`GRAPH_TABLE`, hops, quantifiers) | — |
 | 60 | `MATCH SHORTEST (a)-[r*]->(b)` | sql.rs:4771-4786 | CONTRACT-T2 — §4.3 `ANY/ALL SHORTEST` | unweighted shortest-path atomic (graph contract 5.3) |
 | 61 | `PATH_AVG/SUM/MIN/MAX/PRODUCT/FIRST/LAST` | sql.rs:86-88 | CONTRACT-T2 — §4.3, graph contract 5.1 | streamed accumulators |
 | 62 | Edge-property reads `r.field` in projection/WHERE | usage/graph-queries.md:79 | CONTRACT-T2 — §4.3 inline element WHERE / graph contract 4.2-4.3 | per-hop predicates are the pending item 1 |

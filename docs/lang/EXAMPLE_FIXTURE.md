@@ -105,8 +105,8 @@ DROP TABLE posts_example
 | column | `Kind` | row `n` (1-based) holds |
 |---|---|---|
 | `_key` | `Text` | `p01` … `p12`. A declared field of every layout. |
-| `title` | `Text` | one of `kebun raya`, `pasar pagi`, `warung kopi`, `sawah luas`, `danau biru`, `hutan kota`, `kantor pos`, `sekolah dasar`, `jembatan tua`, `bengkel motor`, `desa wisata`, `pasar malam`, in that order |
-| `body` | `Text` | `<title> di kota <city>`, the city cycling `jakarta`, `bandung`, `surabaya` |
+| `title` | `Text` | one of `botanic garden`, `morning market`, `coffee stall`, `wide field`, `blue lake`, `city forest`, `post office`, `primary school`, `old bridge`, `motor workshop`, `tourist village`, `night market`, in that order |
+| `body` | `Text` | `<title> in <city>`, the city cycling `lisbon`, `kyoto`, `denpasar` |
 | `views` | `Int` | `10 × n`, so 10 … 120 |
 | `score` | `Real` | `n / 2`, so 0.5 … 6.0 |
 | `live` | `Bool` | true for even `n`, so 6 rows are live |
@@ -134,7 +134,7 @@ Indexes on `posts`:
 ## 3. `people` and the graph
 
 4 rows, keys `alice`, `bob`, `carol`, `dave`, with `name` (`Alice` …) and
-`city` (`Jakarta`, `Bandung`, `Surabaya`, `Jakarta`). One btree index,
+`city` (`Lisbon`, `Kyoto`, `Denpasar`, `Lisbon`). One btree index,
 `people_city`, on `city`.
 
 Edges, all in the BASE graph context, which `GRAPH_TABLE` spells `base`:
@@ -188,8 +188,8 @@ DROP TABLE place_example
 | column | `Kind` | row `n` (0-based) holds |
 |---|---|---|
 | `_key` | `Text` | `p000` … `p199`, a fixed width, so a key range is written without surprise |
-| `name` | `Text` | `<word> <nnn>`, the word cycling `kebun`, `sawah`, `pasar`, `kopi`, `danau`, `hutan`, `desa`, `taman` — two tokens, so `split_part(name, ' ', 1)` and `left(name, 3)` have something to cut |
-| `body` | `Text` | `<word> <next word> di kota <city>`, the same vocabulary and the city cycling `jakarta`, `bandung`, `surabaya`. Every eighth row (`n mod 8 = 0`) reads `kebun sawah …`, so `kebun & sawah` and the phrase `"kebun sawah"` both have rows |
+| `name` | `Text` | `<word> <nnn>`, the word cycling `garden`, `field`, `market`, `coffee`, `lake`, `forest`, `village`, `grove` — two tokens, so `split_part(name, ' ', 1)` and `left(name, 3)` have something to cut |
+| `body` | `Text` | `<word> <next word> in <city>`, the same vocabulary and the city cycling `lisbon`, `kyoto`, `denpasar`. Every eighth row (`n mod 8 = 0`) reads `garden field …`, so `garden & field` and the phrase `"garden field"` both have rows |
 | `kind` | `Text` | `depot`, `farm`, `home`, `mill`, `park`, `port`, `school`, `shop` by `n mod 8`, so each value has 25 rows |
 | `born` | `Int` | `1900 + n`, so the 200 rows cover 1900 … 2099 and 1990, 1991 and 1993 are one row each |
 | `rating` | `Real`, declared `DOUBLE PRECISION` | `(n mod 50) / 10`, except every seventh row (`n mod 7 = 0`, 29 rows), which is WRITTEN as null — so `rating IS NULL` finds rows, and is a different question from `tag IS MISSING` |

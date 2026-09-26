@@ -49,6 +49,17 @@ through one engine. A construct with no atomic underneath is REFUSED with a
 named tier and reason, never emulated. Contract:
 `docs/lang/QL_CONTRACT.md`; test map: `docs/lang/CONTRACT_TEST_MAP.md`.
 
+"Adds no execution" has one exact boundary: **lang may evaluate pure
+expressions over values core has already handed it; only core reads
+storage, holds state across rows, or charges a budget.** A row function over
+projected values (`lang/src/compile/row.rs`), the `UPDATE ... SET` closure
+that `Database::update_where` calls, and a GQL expression over a binding row
+(`docs/lang/GQL_PROFILE_DESIGN.md` §1.1) are all on the lang side of it:
+each takes values in and gives one value out, and reads nothing else. A
+property read, a traversal, a sort buffer, a group table or a page cursor is
+on the core side, because each touches a keyspace, remembers rows, or has a
+cost the meter must see.
+
 Because `Database` belongs to core, the four `Database::sql*` methods cannot
 be an inherent `impl` here -- the orphan rule forbids it. They are the
 `SqlDatabase` trait instead, with the same names and signatures; a caller adds

@@ -295,8 +295,8 @@ is a DECLARATION and this key governs only what happens without one:
 ```sql
 -- the automatic btree over `body` is off; the declared gin is not
 CREATE TABLE ix_post (body TEXT, n INT) WITH (index: none, fulltext: [body]);
-INSERT INTO ix_post (_key, body, n) VALUES ('p1', 'kebun raya di kota bandung', 1);
-SELECT _key FROM ix_post WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'kebun');
+INSERT INTO ix_post (_key, body, n) VALUES ('p1', 'botanic garden in kyoto', 1);
+SELECT _key FROM ix_post WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'garden');
 DROP TABLE ix_post
 ```
 

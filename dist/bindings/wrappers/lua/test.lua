@@ -66,13 +66,13 @@ local visited = db:neighbours("tourists", "chloe", "visited", "outgoing", 10)
 assert(visited:find("ubud"), "expected ubud among neighbours, got " .. tostring(visited))
 print("chloe visited: " .. visited)
 
--- Graph traversal in SQL/PGQ, over the same edge (0.17: GRAPH_TABLE, not e1's
+-- Graph traversal in GQL, over the same edge (0.17: GRAPH_TABLE, not e1's
 -- `FROM MATCH`). `base` is the reserved name of the base graph context that
 -- db:link() (no context argument) writes into -- GRAPH_CONTRACT.md §2.1.
 local traversal = db:query([[
-  SELECT place FROM GRAPH_TABLE (base
+  SELECT * FROM GRAPH_TABLE (base
     MATCH (t IS tourists WHERE t._key = 'chloe')-[e IS visited]->(p IS places)
-    COLUMNS (p.name AS place))
+    RETURN p.name AS place)
 ]])
 assert(traversal:find("Ubud"), "expected graph traversal to find Ubud, got " .. tostring(traversal))
 

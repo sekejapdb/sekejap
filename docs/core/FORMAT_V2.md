@@ -137,7 +137,10 @@ coordination and snapshot admission code.
 ## Extension boundary
 
 Current key allocation includes collection metadata/replicas, layout keys, live
-row-count records (`0x08`), collection names (`0x10`; named schemas and their
+row-count records (`0x08`), the graph EDGE-ID ALLOCATOR (`0x09`, three
+replicas `0x09 || copy` of `E4GEI01` packet `next: u64 BE`, behind
+`EDGE_ID_FEATURE = 0x40000`; the same bit admits an optional trailing
+`ordered(edge id)` segment on the `0x71`/`0x72` edge keys), collection names (`0x10`; named schemas and their
 tables under `0x10 0xFF`, behind `SCHEMA_FEATURE = 0x20000`), external-key mappings
 (`0x20`), entity rows (`0x40`) and vector payloads (`0x60`) in
 [core/engine/src/collections/mod.rs](../../core/engine/src/collections/mod.rs).
@@ -523,6 +526,14 @@ these persistent tags blindly.
   `len: u8 || schema: UTF-8` tail. `0xFF` never occurs in UTF-8, so no public
   name -- the bare UTF-8 after the tag, unchanged -- can collide with either.
   A file that never names a schema carries none of it.
+  `EDGE_ID_FEATURE = 0x40000` (2026-09-25) is independent EDGE IDENTITY
+  (`docs/core/GRAPH_CONTRACT.md` §2.3), and the mask is `0x7ffff`: an
+  id-bearing edge key is the frozen tuple key followed by `ordered(id)`,
+  on the primary `0x71` key and on its `0x72` mirror alike, and the
+  forward-only allocator lives under tag `0x09`. A tuple-keyed edge (id 0)
+  carries no segment, so a file that never creates an id-bearing edge
+  carries none of it; the first `create_edge` sets the bit in its own
+  transaction. The next unclaimed bit is `0x80000`.
   Every bit in it is
   additive: set in the same transaction as the first record that needs it,
   never cleared, and a file declaring a bit outside the mask is refused as

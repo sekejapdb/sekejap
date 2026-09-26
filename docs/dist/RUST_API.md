@@ -160,11 +160,33 @@ pub struct Rows { pub columns: Arc<Vec<String>>, pub rows: Vec<Row> }
 pub struct Row  { pub columns: Arc<Vec<String>>, pub id: EntityId, pub values: Vec<SqlValue> }
 
 impl Row {
+    pub fn owner(&self) -> Option<EntityId>;          // None for EntityId::NO_OWNER
     pub fn value(&self, column: &str) -> Option<&SqlValue>;
     pub fn json(&self, column: &str) -> Option<Value>;
     pub fn to_object(&self) -> Map<String, Value>;   // MISSING columns are omitted
 }
+
+impl EntityId {
+    pub const NO_OWNER: EntityId;                    // collection 0, sequence u64::MAX
+}
 ```
+
+`Row::id` is the stored row an answer row came from. A row of a DERIVED
+relation has no single owner, and because the field cannot become an
+`Option` in a minor release (`CONTRACT.md` Law 8) it carries the sentinel
+`EntityId::NO_OWNER` instead: collection 0 is never allocated, so no stored
+row can carry it. Read `Row::owner()` (and `sekejap_lang::SqlRow::owner()`
+one layer down), which answers `None` for the sentinel, rather than `.id`
+when a row may be derived. The rows that carry it are:
+- a group or whole-table aggregate row (`COUNT(*)`, `GROUP BY`, `DISTINCT`);
+- a catalog, `SHOW` or no-`FROM` row;
+- every GQL `GRAPH_TABLE` relation row (`docs/lang/GQL_PROFILE_DESIGN.md`
+  §6.2), which `Db::query`, `Db::prepare` and `Db::stream` run like any
+  other SELECT.
+
+A row `SELECT` over a collection names its stored row. Until this change a
+group reported `(its collection, 0)` and a catalog row reported
+`(0, its position)`; neither was ever a readable row.
 
 Both halves as a program — the body of a function returning
 `Result<(), sekejap::Error>`, run by `dist/rust/tests/doc_examples.rs`:
@@ -210,7 +232,17 @@ Ok(())
 
 `SqlValue` is `sekejap_lang::SqlValue`, re-exported: `Missing`, `Null`, `Bool`,
 `Int`, `Float`, `Text`, `Json`, `Id`. `Missing` is not `Null`, so `to_object`
-OMITS a missing column rather than writing `null` for it.
+OMITS a missing column rather than writing `null` for it. A LIST value is
+`Json` holding a JSON array (elements are JSON scalars, a null element is
+JSON null); there is no list variant. `PreparedSql::column_type` names such
+a column `TEXT[]`, `BIGINT[]` and so on, and the PostgreSQL wire sends it as
+a real array (`docs/dist/WIRE_CONTRACT.md` §3.1, §3.2).
+`sekejap_lang::PreparedSql::param_types() -> Vec<Option<&'static str>>` is
+the parameter twin of `column_type`: the type the statement itself gives
+each `$n` (entry `i` is `$i+1`), in the same spellings. A collection
+statement types its parameters by where they are used, at bind, so it is
+empty for one; a GQL plan gives a `$n` the declared type of the property
+it is compared with, when every comparison agrees.
 
 `Db::stream` is a callback and not an iterator because a compiled SELECT owns
 what its request borrows -- the term strings, the query vector, the geometries
