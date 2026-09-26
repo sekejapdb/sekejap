@@ -89,7 +89,7 @@ fn cfg() -> Config {
 const ROWS: u64 = 4_000;
 const PAGE: usize = 8192;
 const CATS: [&str; 8] = [
-    "cafe", "bar", "gym", "clinic", "school", "museum", "park", "hotel",
+    "cafe", "bakery", "gym", "clinic", "school", "museum", "park", "hotel",
 ];
 const WORDS: [&str; 10] = [
     "railway", "signal", "platform", "junction", "siding", "tunnel", "viaduct", "depot",

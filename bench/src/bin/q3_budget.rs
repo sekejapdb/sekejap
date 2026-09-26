@@ -102,7 +102,7 @@ fn counted<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
 // ── the two_ways fixture, copied field for field ──────────────────────────
 
 const CATS: [&str; 8] = [
-    "cafe", "bar", "gym", "clinic", "school", "museum", "park", "hotel",
+    "cafe", "bakery", "gym", "clinic", "school", "museum", "park", "hotel",
 ];
 const AREAS: [&str; 6] = ["north", "south", "east", "west", "central", "riverside"];
 const WORDS: [&str; 10] = [

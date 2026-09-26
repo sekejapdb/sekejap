@@ -30,7 +30,7 @@ use std::{
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 
 const CATS: [&str; 8] = [
-    "cafe", "bar", "gym", "clinic", "school", "museum", "park", "hotel",
+    "cafe", "bakery", "gym", "clinic", "school", "museum", "park", "hotel",
 ];
 const AREAS: [&str; 6] = ["north", "south", "east", "west", "central", "riverside"];
 const WORDS: [&str; 10] = [

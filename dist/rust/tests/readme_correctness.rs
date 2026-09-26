@@ -13,12 +13,12 @@
 //!
 //! The data (distances from the README's centre, 115.168 E 8.690 S):
 //!
-//! | restaurant    | area     | from the centre |
-//! |---------------|----------|-----------------|
-//! | warung-made   | Seminyak | about 0.9 km    |
-//! | la-lucciola   | Seminyak | about 1.4 km    |
-//! | nasi-uluwatu  | Uluwatu  | about 18 km     |
-//! | bebek-tepi    | Ubud     | about 23 km     |
+//! | restaurant     | area     | from the centre |
+//! |----------------|----------|-----------------|
+//! | warung-sunset  | Seminyak | about 0.9 km    |
+//! | beach-grill    | Seminyak | about 1.4 km    |
+//! | warung-uluwatu | Uluwatu  | about 18 km     |
+//! | rice-terrace   | Ubud     | about 23 km     |
 
 use sekejap::{Db, Direction, Rows};
 use serde_json::{json, Value};
@@ -124,10 +124,10 @@ fn bali() -> (tempfile::TempDir, Db) {
     db.link(("tourists", "aiym"), "similar_taste", ("tourists", "chloe")).unwrap();
 
     for (key, name, area, lon, lat) in [
-        ("warung-made", "Warung Made", "Seminyak", 115.160, -8.690),
-        ("la-lucciola", "La Lucciola", "Seminyak", 115.155, -8.692),
-        ("nasi-uluwatu", "Nasi Uluwatu", "Uluwatu", 115.085, -8.829),
-        ("bebek-tepi", "Bebek Tepi Sawah", "Ubud", 115.262, -8.506),
+        ("warung-sunset", "Warung Sunset", "Seminyak", 115.160, -8.690),
+        ("beach-grill", "Beach Grill", "Seminyak", 115.155, -8.692),
+        ("warung-uluwatu", "Warung Uluwatu", "Uluwatu", 115.085, -8.829),
+        ("rice-terrace", "Rice Terrace Cafe", "Ubud", 115.262, -8.506),
     ] {
         run(&db, &format!(
             r#"INSERT INTO restaurants (_key, name, area, geometry) VALUES ('{key}', '{name}', '{area}', '{{"type":"Point","coordinates":[{lon},{lat}]}}')"#
@@ -139,7 +139,7 @@ fn bali() -> (tempfile::TempDir, Db) {
         ("ayam-bakar", "Ayam Bakar", 55000, 32, "grilled healthy chicken with sambal", 115.160, -8.690, true, "[0.7, 0.3, 0.0, 0.0]"),
         ("ikan-bakar", "Ikan Bakar", 75000, 28, "grilled healthy fish with lime", 115.155, -8.692, true, "[0.6, 0.4, 0.0, 0.0]"),
         // not "healthy"
-        ("babi-guling", "Babi Guling", 85000, 30, "roast pork with grilled skin", 115.160, -8.690, true, "[0.2, 0.8, 0.0, 0.0]"),
+        ("bebek-betutu", "Bebek Betutu", 85000, 30, "slow roasted duck with grilled skin", 115.160, -8.690, true, "[0.2, 0.8, 0.0, 0.0]"),
         // 23 km away
         ("sate-lilit", "Sate Lilit", 45000, 26, "grilled healthy minced fish satay", 115.262, -8.506, true, "[0.7, 0.3, 0.0, 0.0]"),
         // too little protein
@@ -153,7 +153,7 @@ fn bali() -> (tempfile::TempDir, Db) {
             r#"INSERT INTO dishes (_key, name, price, protein_g, description, geometry, open_now, embedding) VALUES ('{key}', '{name}', {price}, {protein}, '{text}', '{{"type":"Point","coordinates":[{lon},{lat}]}}', {open}, '{emb}')"#
         ));
     }
-    db.link(("restaurants", "warung-made"), "serves", ("dishes", "ayam-bakar")).unwrap();
+    db.link(("restaurants", "warung-sunset"), "serves", ("dishes", "ayam-bakar")).unwrap();
     (dir, db)
 }
 
@@ -236,15 +236,15 @@ fn spatial_radius_in_metres_and_its_refused_degree_form() {
     let (_dir, db) = bali();
     let rows = query(&db, readme("SELECT name FROM restaurants
         WHERE ST_DWithin(geometry, ST_MakePoint(115.168, -8.690)::geography, 5000.0)"));
-    assert_eq!(sorted(texts(&rows, "name")), ["La Lucciola", "Warung Made"]);
+    assert_eq!(sorted(texts(&rows, "name")), ["Beach Grill", "Warung Sunset"]);
     // Contrast: 1 km keeps only the nearer one; 20 km adds Uluwatu, not Ubud.
     let rows = query(&db, "SELECT name FROM restaurants WHERE ST_DWithin(geometry, ST_MakePoint(115.168, -8.690)::geography, 1000.0)");
-    assert_eq!(texts(&rows, "name"), ["Warung Made"]);
+    assert_eq!(texts(&rows, "name"), ["Warung Sunset"]);
     let rows = query(&db, "SELECT name FROM restaurants WHERE ST_DWithin(geometry, ST_MakePoint(115.168, -8.690)::geography, 20000.0)");
-    assert_eq!(sorted(texts(&rows, "name")), ["La Lucciola", "Nasi Uluwatu", "Warung Made"]);
+    assert_eq!(sorted(texts(&rows, "name")), ["Beach Grill", "Warung Sunset", "Warung Uluwatu"]);
     // Nearest first from the centre.
     let rows = query(&db, "SELECT name FROM restaurants ORDER BY geometry <-> ST_MakePoint(115.168, -8.690)::geography LIMIT 4");
-    assert_eq!(texts(&rows, "name"), ["Warung Made", "La Lucciola", "Nasi Uluwatu", "Bebek Tepi Sawah"]);
+    assert_eq!(texts(&rows, "name"), ["Warung Sunset", "Beach Grill", "Warung Uluwatu", "Rice Terrace Cafe"]);
     // The PostGIS-degrees form is refused, never answered in metres.
     refused(&db, "SELECT name FROM restaurants WHERE ST_DWithin(geometry, ST_MakePoint(115.168, -8.690), 5000.0)", "needs geography");
 }
@@ -272,8 +272,8 @@ fn text_match_and_ranking() {
     // Contrast: OR takes every grilled dish; AND with another word, one other.
     let rows = query(&db, "SELECT name FROM dishes WHERE to_tsvector('simple', description) @@ to_tsquery('simple', 'grilled | chicken')");
     assert_eq!(rows.len(), 7);
-    let rows = query(&db, "SELECT name FROM dishes WHERE to_tsvector('simple', description) @@ to_tsquery('simple', 'grilled & pork')");
-    assert_eq!(texts(&rows, "name"), ["Babi Guling"]);
+    let rows = query(&db, "SELECT name FROM dishes WHERE to_tsvector('simple', description) @@ to_tsquery('simple', 'grilled & duck')");
+    assert_eq!(texts(&rows, "name"), ["Bebek Betutu"]);
 }
 
 #[test]
@@ -299,7 +299,7 @@ fn the_combined_query_and_each_condition_it_depends_on() {
         ("price BETWEEN 40000 AND 90000", "Lobster Bakar"),
         ("protein_g >= 25", "Gado Gado"),
         ("ST_DWithin(geometry, ST_MakePoint(115.168, -8.690)::geography, 5000.0)", "Sate Lilit"),
-        ("to_tsvector('simple', description) @@ to_tsquery('simple', 'grilled & healthy')", "Babi Guling"),
+        ("to_tsvector('simple', description) @@ to_tsquery('simple', 'grilled & healthy')", "Bebek Betutu"),
     ];
     let order = "ORDER BY 0.6 * bm25(description, 'grilled healthy') + 0.4 * (1 - (embedding <=> '[0.7,0.3,0.0,0.0]')) DESC LIMIT 10";
     for (dropped, dish) in conditions {
@@ -309,7 +309,7 @@ fn the_combined_query_and_each_condition_it_depends_on() {
             .filter(|c| *c != dropped)
             .collect();
         let sql = format!("SELECT name, price FROM dishes WHERE {} {order}", kept.join(" AND "));
-        // Babi Guling has no "healthy", so without the text match it is
+        // Bebek Betutu has no "healthy", so without the text match it is
         // in the rows but bm25 gives it nothing; the ranking still answers.
         let names = texts(&query(&db, &sql), "name");
         assert_eq!(names.len(), 3, "without `{dropped}`: {names:?}");
@@ -375,7 +375,7 @@ fn the_sql_tour() {
     run(&db, readme("ALTER TABLE places ADD COLUMN rating REAL"));
     run(&db, readme("INSERT INTO places (_key, name, category) VALUES ('uluwatu', 'Uluwatu Temple', 'temple')"));
     run(&db, readme("UPDATE places SET rating = 4.8 WHERE _key = 'uluwatu'"));
-    run(&db, "INSERT INTO places (_key, name, category) VALUES ('old-bar', 'Old Bar', 'closed')");
+    run(&db, "INSERT INTO places (_key, name, category) VALUES ('old-kiosk', 'Old Kiosk', 'closed')");
     assert_eq!(db.execute(readme("DELETE FROM places WHERE category = 'closed'"), &[]).unwrap(), 1);
     // Contrast: nothing left to delete.
     assert_eq!(db.execute("DELETE FROM places WHERE category = 'closed'", &[]).unwrap(), 0);
@@ -468,7 +468,7 @@ fn the_rust_example() {
             &[json!(115.168), json!(-8.690), json!(3000.0)],
         )
         .unwrap();
-    assert_eq!(sorted(texts(&nearby, "name")), ["La Lucciola", "Warung Made"]);
+    assert_eq!(sorted(texts(&nearby, "name")), ["Beach Grill", "Warung Sunset"]);
     // Contrast: the same prepared text at 1 km.
     let nearer = db
         .query(
@@ -476,7 +476,7 @@ fn the_rust_example() {
             &[json!(115.168), json!(-8.690), json!(1000.0)],
         )
         .unwrap();
-    assert_eq!(texts(&nearer, "name"), ["Warung Made"]);
+    assert_eq!(texts(&nearer, "name"), ["Warung Sunset"]);
     db.link(("tourists", "chloe"), "visited", ("places", "uluwatu")).unwrap();
     db.link_with(
         ("tourists", "aiym"), "visited", ("places", "uluwatu"),

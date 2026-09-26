@@ -80,7 +80,7 @@ type R<T> = Result<T, Box<dyn std::error::Error>>;
 type Rows = Result<Vec<u64>, String>;
 
 const CATS: [&str; 8] = [
-    "cafe", "bar", "gym", "clinic", "school", "museum", "park", "hotel",
+    "cafe", "bakery", "gym", "clinic", "school", "museum", "park", "hotel",
 ];
 const AREAS: [&str; 6] = ["north", "south", "east", "west", "central", "riverside"];
 const WORDS: [&str; 10] = [
@@ -402,9 +402,9 @@ fn cases() -> Vec<Case> {
     no("filter", "or_both_indexed", NO_DISJUNCTION,
         Some("SELECT k FROM v WHERE cat='cafe' OR area='north'")),
     no("filter", "in_list", NO_DISJUNCTION,
-        Some("SELECT k FROM v WHERE cat IN ('cafe','bar','gym')")),
+        Some("SELECT k FROM v WHERE cat IN ('cafe','bakery','gym')")),
     no("filter", "not_in", NO_DISJUNCTION,
-        Some("SELECT k FROM v WHERE cat NOT IN ('cafe','bar')")),
+        Some("SELECT k FROM v WHERE cat NOT IN ('cafe','bakery')")),
     no("filter", "neq", NO_DISJUNCTION, Some("SELECT k FROM v WHERE cat<>'cafe'")),
     run("filter", "between", |c| ids(c,
         &[real_range(c.price, Bound::Included(100.0), Bound::Included(300.0))], QueryOrder::EntityId, None),

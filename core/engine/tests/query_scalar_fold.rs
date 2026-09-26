@@ -82,7 +82,7 @@ fn fixture(dir: &std::path::Path) -> Fixture {
         )
         .unwrap();
     db.commit().unwrap();
-    const CATS: [&str; 4] = ["cafe", "bar", "gym", "clinic"];
+    const CATS: [&str; 4] = ["cafe", "bakery", "gym", "clinic"];
     for i in 1..=ROWS {
         let mut document = json!({ "cat": CATS[(i % 4) as usize] });
         match stored_price(i) {

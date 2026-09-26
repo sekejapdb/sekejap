@@ -48,7 +48,7 @@ const ROWS: u64 = 4_000;
 const K: usize = 10;
 const KINDS: u64 = 8;
 const CATS: [&str; 8] = [
-    "cafe", "bar", "gym", "clinic", "school", "museum", "park", "hotel",
+    "cafe", "bakery", "gym", "clinic", "school", "museum", "park", "hotel",
 ];
 
 fn geojson(lon: f64, lat: f64) -> Value {
