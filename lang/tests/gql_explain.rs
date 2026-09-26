@@ -12,7 +12,11 @@
 //! * it is built from the PLAN, never from the text: two spellings of one
 //!   statement explain identically (`two_spellings_*`);
 //! * a name unknown at prepare is shown as looked up again per execution
-//!   (`names_unknown_at_prepare_*`).
+//!   (`names_unknown_at_prepare_*`);
+//! * an `EXISTS { ... }` is an `ExistsApply` with its body's steps under it,
+//!   in its filter form or its mark form, the mark a hidden `BOOLEAN` slot,
+//!   and the body's own variables listed as local to it (M5-C,
+//!   `an_exists_is_*`).
 //!
 //! Workload names are invented: bands `b1` `b2`, people `p1` `p2`, songs
 //! `s1` `s2`.
@@ -335,4 +339,138 @@ fn a_value_slot_is_nullable_only_when_a_row_may_hold_null_there() {
         &[],
     );
     contains(&text, "n: BIGINT, nullable, bound at a LET of stage 1");
+}
+
+#[test]
+fn an_exists_is_an_exists_apply_with_its_steps_under_it() {
+    let dir = TempDir::new().unwrap();
+    let mut db = fixture(&dir);
+    // The filter form: a top-level conjunct, here negated.
+    let text = explain(
+        &mut db,
+        "base MATCH (p IS person WHERE p._key = $1) \
+         FILTER NOT EXISTS { MATCH (p)-[:performed]->(s IS song WHERE s.year > 2001) } \
+         RETURN p.name AS n",
+        &[Param::Text("p2".into())],
+    );
+    has(&text, "0 p: node of person, never null, bound at pattern 1 position 0");
+    has(
+        &text,
+        "1 s: node of song, never null, bound at pattern 2 position 2, local to an EXISTS body",
+    );
+    has(
+        &text,
+        "2. ExistsApply NOT EXISTS: per input row, steps 2.1-2.2 run from it until their first row; the row is kept when they give none -- charges nothing itself; the steps are rebuilt for each input row",
+    );
+    has(&text, "2.1. Seed p: the node already bound in p -- charges binding_rows");
+    has(
+        &text,
+        "2.2. Expand p -[:performed]-> s: outgoing edges, s a new node of song -- charges graph_edges, binding_rows",
+    );
+    has(&text, "far filter, per far node: (s.year > 2001) -- charges primary_reads");
+    has(&text, "3. Project n := p.name -- charges primary_reads, graph_edges");
+    has(&text, "rows: 1 in 1 page(s)");
+    // Not negated.
+    let text = explain(
+        &mut db,
+        "base MATCH (p IS person WHERE p._key = $1) \
+         FILTER EXISTS { (p)-[:performed]->(:song) } RETURN p.name AS n",
+        &[Param::Text("p2".into())],
+    );
+    has(
+        &text,
+        "2. ExistsApply EXISTS: per input row, steps 2.1-2.2 run from it until their first row; the row is kept when they give one -- charges nothing itself; the steps are rebuilt for each input row",
+    );
+    // The mark form: a RETURN item reads the hidden slot the apply writes.
+    let text = explain(
+        &mut db,
+        "base MATCH (p IS person WHERE p._key = $1) \
+         RETURN p.name AS n, EXISTS { (p)-[:member_of]->(:band) } AS member",
+        &[Param::Text("p2".into())],
+    );
+    has(&text, "1 #1: BOOLEAN, never null, bound at an EXISTS of stage 1");
+    has(
+        &text,
+        "2. ExistsApply EXISTS into hidden slot #1: per input row, steps 2.1-2.2 run from it until their first row; TRUE when they give one, FALSE when none, and every row is kept -- charges nothing itself; the steps are rebuilt for each input row",
+    );
+    has(
+        &text,
+        "3. Project n := p.name, member := #1 -- charges primary_reads, graph_edges",
+    );
+    has(&text, "columns: n TEXT, member BOOLEAN");
+}
+
+/// M5-E: a union in a first part is one `Union` over its branches, each
+/// printed with its own slots and steps; `UNION` is the existing `Distinct`
+/// after it.
+#[test]
+fn a_union_explains_each_branch_with_its_slots_and_steps() {
+    let dir = TempDir::new().unwrap();
+    let mut db = fixture(&dir);
+    let text = explain(
+        &mut db,
+        "base MATCH (s IS song WHERE s._key = 's1') RETURN s.title AS title \
+         UNION MATCH (p IS person WHERE p._key = 'p1')-[:performed]->(s IS song) \
+         RETURN s.title AS title",
+        &[],
+    );
+    has(&text, "GQL plan over graph `base` (the base graph), 1 stage");
+    has(&text, "0 title: TEXT, nullable, returned by stage 1");
+    has(&text, "branch 1 slots:");
+    has(&text, "branch 2 slots:");
+    has(&text, "0 s: node of song, never null, bound at pattern 1 position 0");
+    has(&text, "0 p: node of person, never null, bound at pattern 1 position 0");
+    has(
+        &text,
+        "1. Union DISTINCT of 2 branches, then Distinct: branch order, then row order -- branch 1 is steps 1.1-1.2, branch 2 is steps 1.3-1.5; charges nothing of its own",
+    );
+    has(&text, "1.1. Seed s: key lookup of 's1' in song -- charges key_postings, binding_rows");
+    has(&text, "1.2. Project title := s.title -- charges primary_reads, graph_edges");
+    has(&text, "1.3. Seed p: key lookup of 'p1' in person -- charges key_postings, binding_rows");
+    has(&text, "1.5. Project title := s.title -- charges primary_reads, graph_edges");
+    has(&text, "2. Distinct -- holds sort_bytes");
+    has(&text, "columns: title TEXT");
+    has(&text, "rows: 2 in 1 page(s)");
+    // UNION ALL has no Distinct.
+    let all = explain(
+        &mut db,
+        "base MATCH (s IS song WHERE s._key = 's1') RETURN s.title AS title \
+         UNION ALL MATCH (s IS song WHERE s._key = 's2') RETURN s.title AS title",
+        &[],
+    );
+    has(
+        &all,
+        "1. Union ALL of 2 branches: branch order, then row order -- branch 1 is steps 1.1-1.2, branch 2 is steps 1.3-1.4; charges nothing of its own",
+    );
+    assert!(!all.contains("Distinct"), "{all}");
+}
+
+/// M5-E, Q25: a union after `NEXT` reads the incoming table once and holds
+/// it for its branches, each of which runs over the whole of it.
+#[test]
+fn a_union_after_next_is_buffered_once_for_its_branches() {
+    let dir = TempDir::new().unwrap();
+    let mut db = fixture(&dir);
+    let text = explain(
+        &mut db,
+        "base MATCH (p IS person WHERE p._key = 'p1') RETURN p \
+         NEXT MATCH (p)-[:performed]->(s IS song) RETURN s.title AS title \
+         UNION ALL MATCH (p)-[:member_of]->(b IS band) RETURN b.name AS title",
+        &[],
+    );
+    has(&text, "GQL plan over graph `base` (the base graph), 2 stages");
+    has(&text, "NEXT: stage 2 reads the rows stage 1 returned, and nothing else of them");
+    has(
+        &text,
+        "3. Buffered Union ALL of 2 branches: the rows stage 1 returned, held once and read by each branch from its start; branch order, then row order -- branch 1 is steps 3.1-3.3, branch 2 is steps 3.4-3.6; holds sort_bytes",
+    );
+    // Each branch's slots start with the incoming columns.
+    has(&text, "0 p: node of person, never null, returned by stage 1");
+    has(&text, "3.1. Seed p: the node already bound in p -- charges binding_rows");
+    has(
+        &text,
+        "3.5. Expand p -[:member_of]-> b: outgoing edges, b a new node of band -- charges graph_edges, binding_rows",
+    );
+    has(&text, "3.6. Project title := b.name -- charges primary_reads, graph_edges");
+    has(&text, "rows: 3 in 1 page(s)");
 }

@@ -123,21 +123,27 @@ fn a_variable_or_property_named_columns_is_not_the_removed_body() {
 /// Every construct the profile will build later, written where a statement
 /// puts it, with the keyword and the milestone its refusal must name.
 const REFUSED: &[(&str, &str, &str)] = &[
-    // M5: brief §11 step 5
-    (
-        "MATCH (a) OPTIONAL MATCH (a)-[e]->(b), (a)-[f]->(c) RETURN b.y AS y",
-        "OPTIONAL MATCH with comma patterns",
-        "M5",
-    ),
-    ("MATCH (a) WHERE EXISTS { MATCH (a)-[e]->(b) } RETURN a.y AS y", "EXISTS", "M5"),
-    ("MATCH (a) CALL (a) { MATCH (a)-[e]->(b) RETURN b } RETURN a.y AS y", "CALL", "M5"),
-    ("MATCH (a) RETURN a.y AS y UNION MATCH (b) RETURN b.y AS y", "UNION", "M5"),
     // M6: host functions inside the body
     ("MATCH (a) WHERE st_dwithin(a.g, $1, 10) RETURN a.y AS y", "host function", "M6"),
     ("MATCH (a) RETURN to_tsvector(a.y) AS n", "host function", "M6"),
     ("MATCH (a) RETURN a.v::vector AS n", "host function", "M6"),
     ("MATCH (a) RETURN cast(a.g AS geometry) AS n", "host function", "M6"),
     // P1: after the P0 release
+    (
+        "OPTIONAL { MATCH (a)-[e]->(b) } RETURN b.y AS y",
+        "OPTIONAL block",
+        "P1",
+    ),
+    (
+        "MATCH (a) OPTIONAL CALL (a) { MATCH (a)-[e]->(b) RETURN b.y AS z } RETURN a.y AS y",
+        "OPTIONAL CALL",
+        "P1",
+    ),
+    (
+        "MATCH (a) CALL (a) { MATCH (a)-[e]->(b) RETURN b.y AS z NEXT RETURN z } RETURN a.y AS y",
+        "NEXT inside CALL",
+        "P1",
+    ),
     ("MATCH ALL SHORTEST (a)-[e]->(b) RETURN b.y AS y", "ALL SHORTEST", "P1"),
     ("MATCH SIMPLE (a)-[e]->(b) RETURN b.y AS y", "SIMPLE", "P1"),
     ("MATCH ANY SHORTEST TRAIL (a)-[e]->*(b) RETURN b.y AS y", "selector with a path mode", "P1"),
@@ -147,6 +153,11 @@ const REFUSED: &[(&str, &str, &str)] = &[
     ("MATCH (a:%) RETURN a.y AS y", "label wildcard", "P1"),
     ("MATCH (a) RETURN a.y AS y INTERSECT MATCH (b) RETURN b.y AS y", "INTERSECT", "P1"),
     ("MATCH (a) RETURN a.y AS y EXCEPT MATCH (b) RETURN b.y AS y", "EXCEPT", "P1"),
+    (
+        "MATCH (a) RETURN a.y AS y UNION MATCH (b) RETURN b.y AS y UNION ALL MATCH (c) RETURN c.y AS y",
+        "mixed UNION",
+        "P1",
+    ),
     // Not adopted: another spelling exists.
     ("MATCH (a) RETURN path_sum(a) AS n", "PATH_SUM", "not adopted"),
     ("MATCH (a) RETURN path_product(a) AS n", "PATH_PRODUCT", "not adopted"),

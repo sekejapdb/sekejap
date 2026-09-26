@@ -27,8 +27,17 @@
 //! * an `OPTIONAL MATCH` of a path pattern, two in a row, and one that
 //!   opens a stage (`optional_path_patterns_*`, `two_optional_matches_*`,
 //!   `an_optional_match_opening_*`);
-//! * one pattern per `OPTIONAL MATCH` (design Q3): comma patterns are
-//!   refused by name (`comma_patterns_*`);
+//! * comma patterns after `OPTIONAL MATCH` are optional TOGETHER (M5-A
+//!   lifts the M3-F refusal, design Q3 -> Q17): when any one of them has no
+//!   match for a bound value, the whole combined match is empty, and every
+//!   pattern's introduced variables go `NULL` together, not a half-filled
+//!   row (`two_optional_patterns_are_null_together`); a variable a later
+//!   comma pattern reuses joins exactly as in a plain `MATCH`, up to an
+//!   `ExpandInto` when both its ends are already bound
+//!   (`a_shared_variable_between_optional_patterns_joins_as_an_expand_into`);
+//! * ISO's block form `OPTIONAL { MATCH ...; MATCH ... }` is not this
+//!   release's comma form: it stays refused by name (`OPTIONAL block`, P1,
+//!   Q17), pinned in `lang/tests/gql_parse.rs`, not here;
 //! * `EXPLAIN` prints the operator, its inner steps and the nullable slots
 //!   (`explain_shows_*`).
 //!
@@ -473,28 +482,60 @@ fn an_optional_match_opening_a_stage_keeps_the_one_empty_row() {
     assert_eq!(lines(&answer), ["t2"]);
 }
 
+/// M5-A: `OPTIONAL MATCH p1, p2` matches every pattern optional TOGETHER.
+/// `t2` has an `enables` match (`t3`) but no `supported_by` match, `t3` and
+/// `t4` the reverse: since the two patterns share `t` and are planned as one
+/// combined match (as a plain `MATCH` with comma patterns is), a pattern
+/// with no match for that `t` empties the WHOLE combination, so BOTH
+/// introduced variables go `NULL` -- never `e4|NULL` for `t4`, whose
+/// `supported_by` alone matches. `t1` has two `supported_by` matches and one
+/// `enables` match: the combined match gives their cross join, two rows.
 #[test]
-fn comma_patterns_in_one_optional_match_are_refused_by_name() {
+fn two_optional_patterns_are_null_together() {
     let dir = TempDir::new().unwrap();
     let db = fixture(&dir);
-    let error = run_with(
-        &db,
-        "base MATCH (t IS topic) \
-         OPTIONAL MATCH (t)-[:supported_by]->(ev IS evidence), (t)-[:enables]->(u IS topic) \
-         RETURN t._key AS k",
-        &[],
-    )
-    .err()
-    .expect("refused");
-    match error {
-        SqlError::Refused {
-            keyword, reason, ..
-        } => {
-            assert_eq!(keyword, "OPTIONAL MATCH with comma patterns");
-            assert!(reason.contains("M5"), "{reason}");
-        }
-        other => panic!("not refused by name: {other}"),
-    }
+    let body = "base MATCH (t IS topic) \
+                OPTIONAL MATCH (t)-[:supported_by]->(ev IS evidence), \
+                                (t)-[:enables]->(nx IS topic) \
+                RETURN t._key AS k, ev._key AS ev, nx._key AS nx ORDER BY k, ev, nx";
+    let answer = run(&db, body, &[]);
+    assert_eq!(answer.columns, ["k", "ev", "nx"]);
+    assert_eq!(
+        lines(&answer),
+        ["t1|e1|t2", "t1|e2|t2", "t2|NULL|NULL", "t3|NULL|NULL", "t4|NULL|NULL"]
+    );
+    // COUNT over either NULL side is 0, as over a PostgreSQL LEFT JOIN: t1's
+    // two combined rows count 2 for both sides; the other topics, whose
+    // combined match is empty, count 0 for both, not 1 for the side that
+    // matched alone.
+    let counted = "base MATCH (t IS topic) \
+                    OPTIONAL MATCH (t)-[:supported_by]->(ev IS evidence), \
+                                    (t)-[:enables]->(nx IS topic) \
+                    RETURN t._key AS k, COUNT(ev) AS ev_count, COUNT(nx) AS nx_count \
+                    GROUP BY t._key ORDER BY k";
+    let answer = run(&db, counted, &[]);
+    assert_eq!(
+        lines(&answer),
+        ["t1|2|2", "t2|0|0", "t3|0|0", "t4|0|0"]
+    );
+}
+
+/// A later comma pattern that reuses a variable an earlier one of the SAME
+/// `OPTIONAL MATCH` introduced joins exactly as in a plain `MATCH`
+/// (`comma_patterns_join_on_a_shared_variable`, `gql_patterns.rs`): here
+/// both ends of the second pattern's edge (`t` and `next`) are already
+/// bound, so it plans as an `ExpandInto`.
+#[test]
+fn a_shared_variable_between_optional_patterns_joins_as_an_expand_into() {
+    let dir = TempDir::new().unwrap();
+    let db = fixture(&dir);
+    let body = "base MATCH (t IS topic) \
+                OPTIONAL MATCH (t)-[e1:enables]->(next IS topic), (t)-[e2:enables]->(next) \
+                RETURN t._key AS k, next._key AS next ORDER BY k";
+    let answer = run(&db, body, &[]);
+    assert_eq!(lines(&answer), ["t1|t2", "t2|t3", "t3|NULL", "t4|NULL"]);
+    let text = explain_sql(&db, &statement(body), &[]).unwrap();
+    contains(&text, "already bound (ExpandInto)");
 }
 
 // ── EXPLAIN ────────────────────────────────────────────────────────────────

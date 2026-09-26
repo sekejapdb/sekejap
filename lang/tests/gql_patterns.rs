@@ -544,6 +544,19 @@ fn an_unindexed_label_scan_predicate_is_refused_naming_the_index() {
         assert!(message.contains("`song`"), "{message}");
         assert!(message.contains("`year`"), "{message}");
         assert!(message.contains("CREATE INDEX"), "{message}");
+        // The message names the explicit scan form (design §2.6, M5-F).
+        assert!(message.contains("FILTER"), "{message}");
+    }
+    // That form is accepted: a scan with a row test after the pattern.
+    let answer = run(&db, "base MATCH (s IS song) FILTER s.year = 2001 RETURN s._key", &[]);
+    assert!(!bag(&answer).is_empty());
+    // The refusal applies unchanged inside EXISTS and CALL bodies.
+    for body in [
+        "base MATCH (p IS person) FILTER EXISTS { MATCH (s IS song WHERE s.year > 2001) } RETURN p._key",
+        "base MATCH (p IS person) CALL () { MATCH (s IS song WHERE s.year > 2001) RETURN s._key AS k } RETURN k",
+    ] {
+        let message = run_with(&db, body, &[]).unwrap_err().to_string();
+        assert!(message.contains("CREATE INDEX"), "{body}: {message}");
     }
     // The same predicate on a node REACHED from a seed is a charged row
     // read, which the contract allows.
