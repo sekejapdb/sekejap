@@ -14,11 +14,23 @@
 //!   again (`an_undeclared_parameter_*`);
 //! * the simple protocol serves the same statement (`a_simple_query_*`);
 //! * an `ARRAY_AGG` column (M3-B) is described as its array type and its
-//!   cells are PostgreSQL arrays in text and in binary (`an_array_agg_*`).
+//!   cells are PostgreSQL arrays in text and in binary (`an_array_agg_*`);
+//! * (M3-E) the slices of a portal with a row limit, and the `FETCH`es of a
+//!   declared cursor, concatenate to the answer the simple protocol streams,
+//!   for path searches, `OPTIONAL MATCH`, a grouped `RETURN` and an outer
+//!   `ORDER BY` + `LIMIT` (`a_portal_with_a_row_limit_*`,
+//!   `a_declared_cursor_*`);
+//! * (M3-E) `CancelRequest` and `statement_timeout` stop a GQL walk with
+//!   `57014` and the connection answers the next statement
+//!   (`a_cancel_request_*`, `a_statement_timeout_*`), and a portal refused
+//!   that way stays refused (`a_portal_refused_part_way_*`).
+//! * an unaliased outer SELECT column is named as PostgreSQL names one
+//!   (M3-D2), in RowDescription before any row exists
+//!   (`an_outer_selects_unaliased_columns_are_named_*`).
 //!
 //! No socket is opened: every frame is built here from the protocol's own
 //! layout and every reply parsed back the same way. Workload names are
-//! invented: bands `b1` `b2`, people `p1` `p2` `p3`.
+//! invented: bands `b1` `b2`, people `p1` `p2` `p3` and `p00`-`p29`.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -26,7 +38,10 @@ mod common;
 use kernel::store::Config;
 use sekejap_core::collections::{Database, GraphContextId};
 use sekejap_core::Kind;
-use sekejap_dist::pg::{connection::Connection, types::oid};
+use sekejap_dist::pg::{
+    connection::{CancelToken, Connection},
+    types::oid,
+};
 use sekejap_dist::service::ServiceDatabase;
 use serde_json::json;
 use std::time::Duration;
@@ -376,6 +391,94 @@ fn an_array_agg_column_is_a_postgresql_array_in_text_and_binary() {
     assert_eq!(tag(&got), "SELECT 0");
 }
 
+#[test]
+fn an_outer_select_is_described_with_its_parameter_types_and_orders_and_limits() {
+    // M3-D: one parameter table for the body and the outer SELECT. `$2` is
+    // read inside the pattern and by the outer WHERE, `$3` is the outer
+    // LIMIT: the ParameterDescription carries each one's real type, and the
+    // rows come back in the outer ORDER BY's order, cut by its LIMIT.
+    let fixture = build();
+    let mut connection = connect(&fixture.service);
+    let sql = "SELECT g.name, g.age FROM GRAPH_TABLE (base \
+         MATCH (b IS band WHERE b._key = $1)<-[:member_of]-(p IS person WHERE p.age > $2) \
+         RETURN p.name AS name, p.age AS age) AS g \
+         WHERE g.age <> $2 ORDER BY g.age DESC LIMIT $3";
+    let mut batch = parse_message("outer", sql, &[]);
+    batch.extend_from_slice(&describe_statement("outer"));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    assert_eq!(types_of(&got), "1tTZ");
+    assert_eq!(
+        parameter_oids(first(&got, b't')),
+        [oid::TEXT, oid::INT8, oid::INT8]
+    );
+    assert_eq!(
+        columns(first(&got, b'T')),
+        [("name".to_owned(), oid::TEXT), ("age".to_owned(), oid::INT8)]
+    );
+    // In the order the rows arrive: not sorted here.
+    let ordered = |frames: &[Frame]| -> Vec<Vec<Option<String>>> {
+        frames
+            .iter()
+            .filter(|f| f.typ == b'D')
+            .map(|f| {
+                raw_cells(f)
+                    .into_iter()
+                    .map(|cell| cell.map(|bytes| String::from_utf8(bytes).unwrap()))
+                    .collect()
+            })
+            .collect()
+    };
+    for (params, expected) in [
+        (
+            ["b1", "0", "5"],
+            vec![
+                vec![some("person one"), some("41")],
+                vec![some("person two"), some("25")],
+            ],
+        ),
+        (["b1", "0", "1"], vec![vec![some("person one"), some("41")]]),
+        (["b1", "41", "5"], vec![]),
+    ] {
+        let mut batch = bind_message("outer", &params, &[]);
+        batch.extend_from_slice(&execute_message());
+        batch.extend_from_slice(&sync_message());
+        let got = frames(&connection.feed(&batch));
+        assert_eq!(ordered(&got), expected, "{params:?}");
+        assert_eq!(tag(&got), format!("SELECT {}", expected.len()));
+    }
+    // A LIMIT below zero is refused with the parameter's code.
+    let mut batch = bind_message("outer", &["b1", "0", "-1"], &[]);
+    batch.extend_from_slice(&execute_message());
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    let (sqlstate, message) = error_fields(first(&got, b'E'));
+    assert_eq!(sqlstate, "22023", "{message}");
+}
+
+#[test]
+fn an_outer_selects_unaliased_columns_are_named_as_postgresql_names_them() {
+    // M3-D2, brief gap 3: an unaliased outer SELECT column is named as
+    // PostgreSQL names one -- an aggregate by its function, a function
+    // call by its function name, a cast by its declared type, and
+    // anything else `?column?` -- described in RowDescription before any
+    // row exists, exactly like every other column type.
+    let fixture = build();
+    let mut connection = connect(&fixture.service);
+    let sql = "SELECT count(*), avg(g.age), g.age::text, LOWER(g.name), g.age + 1 \
+         FROM GRAPH_TABLE (base \
+         MATCH (b IS band WHERE b._key = $1)<-[:member_of]-(p IS person) \
+         RETURN p.name AS name, p.age AS age) AS g \
+         GROUP BY g.age::text, LOWER(g.name), g.age + 1";
+    let mut batch = parse_message("named", sql, &[]);
+    batch.extend_from_slice(&describe_statement("named"));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    assert_eq!(types_of(&got), "1tTZ");
+    let names: Vec<String> = columns(first(&got, b'T')).into_iter().map(|(name, _)| name).collect();
+    assert_eq!(names, ["count", "avg", "text", "lower", "?column?"]);
+}
+
 /// `(SQLSTATE, message)` of an `ErrorResponse`.
 fn error_fields(frame: &Frame) -> (String, String) {
     let mut sqlstate = String::new();
@@ -464,4 +567,323 @@ fn a_binder_error_reaches_the_wire_with_its_postgresql_sqlstate() {
         let (sqlstate, message) = error_fields(first(&got, b'E'));
         assert_eq!(sqlstate, code, "`{ret}`: {message}");
     }
+}
+
+// ── failed transaction block, and duplicate cursor names (M3-W) ─────────
+//
+// Where behaviour is not graph-specific, this surface matches PostgreSQL: a
+// GQL statement is a statement like any other to `BEGIN`'s block state and
+// to `DECLARE`'s cursor names, both of `docs/dist/WIRE_CONTRACT.md` §1.3/§6.
+
+/// A GQL read issued after an earlier statement in the same `BEGIN` block
+/// failed is refused `25P02`, not answered -- the same rule §1.3 states for
+/// any statement, proved here over the graph path rather than the plain-SQL
+/// one `dist/tests/pg_wire.rs` proves it over.
+#[test]
+fn a_gql_read_in_a_failed_transaction_block_is_refused_25p02() {
+    let fixture = build();
+    let mut connection = connect(&fixture.service);
+    let sql = MEMBERS.replace("$1", "'b1'");
+
+    let _ = connection.feed(&query("BEGIN"));
+    let _ = connection.feed(&query("SELECT id FROM nowhere")); // aborts the block
+
+    let got = frames(&connection.feed(&query(&sql)));
+    assert_eq!(types_of(&got), "EZ", "the GQL read was answered instead of refused");
+    let (sqlstate, message) = error_fields(first(&got, b'E'));
+    assert_eq!(sqlstate, "25P02", "{message}");
+
+    let _ = connection.feed(&query("ROLLBACK"));
+    let got = frames(&connection.feed(&query(&sql)));
+    assert_eq!(types_of(&got), "TDDCZ", "after ROLLBACK the same GQL statement answers again");
+}
+
+/// `DECLARE <name> CURSOR FOR` a GQL statement, when `<name>` is already
+/// open, is `42P03 duplicate_cursor` rather than a silent replace, and the
+/// original cursor keeps its own answer -- the same rule proved over the
+/// plain-SQL path in `dist/tests/pg_wire.rs`.
+#[test]
+fn declaring_a_gql_cursor_with_a_name_already_open_is_refused_and_leaves_it_untouched() {
+    let fixture = build();
+    let mut connection = connect(&fixture.service);
+    let members_b1 = MEMBERS.replace("$1", "'b1'");
+    let members_b2 = MEMBERS.replace("$1", "'b2'");
+
+    let got = frames(&connection.feed(&query(&format!("DECLARE g CURSOR FOR {members_b1}"))));
+    assert_eq!(tag(&got), "DECLARE CURSOR");
+
+    // A second DECLARE of the same name, over a DIFFERENT seed, is refused.
+    let got = frames(&connection.feed(&query(&format!("DECLARE g CURSOR FOR {members_b2}"))));
+    let (sqlstate, message) = error_fields(first(&got, b'E'));
+    assert_eq!(sqlstate, "42P03");
+    assert!(message.contains("\"g\""), "{message}");
+
+    // The original cursor still answers band b1's two members, not b2's one.
+    let got = frames(&connection.feed(&query("FETCH ALL FROM g")));
+    assert_eq!(
+        text_rows(&got),
+        [
+            [some("person one"), some("41"), some("t")],
+            [some("person two"), some("25"), some("f")],
+        ]
+    );
+}
+
+// ── paging and cancellation on the wire (M3-E) ───────────────────────────
+//
+// A portal given a row limit and a declared cursor both page ONE execution
+// (`dist/src/pg/connection.rs`, "What a suspended portal holds"): the
+// slices a client reads, concatenated, are the answer the simple protocol
+// streams, in the same order. A portal whose execution was refused stays
+// refused -- the next `Execute` is an error, never rows or a completion --
+// and `CancelRequest` and `statement_timeout` stop a GQL walk with `57014`
+// and leave the connection usable.
+
+/// ```text
+/// person p00..p29 (name, age 20 + i)
+/// knows  p_i -> p_(i+1),  p_i -> p_(i+2),  p29 -> p00
+/// ```
+fn build_chain() -> Fixture {
+    let dir = TempDir::new().expect("a temp dir");
+    let path = dir.path().join("db");
+    {
+        let mut db = Database::create(&path, config()).expect("create");
+        let person = db
+            .create_collection(
+                "person",
+                vec![("name".into(), Kind::Text), ("age".into(), Kind::Int)],
+                Default::default(),
+            )
+            .unwrap();
+        let people: Vec<_> = (0..30)
+            .map(|i| {
+                db.put(
+                    person,
+                    &format!("p{i:02}"),
+                    &json!({"name": format!("person {i}"), "age": 20 + i}),
+                )
+                .unwrap()
+            })
+            .collect();
+        db.enable_graph().unwrap();
+        let knows = db.create_edge_type("knows").unwrap();
+        for i in 0..30 {
+            for step in [1, 2] {
+                if i + step < 30 {
+                    db.create_edge(GraphContextId::BASE, people[i], knows, people[i + step], &json!({}))
+                        .unwrap();
+                }
+            }
+        }
+        db.create_edge(GraphContextId::BASE, people[29], knows, people[0], &json!({}))
+            .unwrap();
+        db.commit().expect("commit");
+    }
+    let service = ServiceDatabase::open(&path, config()).expect("open service");
+    service.set_publish_interval(Duration::ZERO);
+    Fixture { _dir: dir, service }
+}
+
+/// GQL statements whose answers span several slices of [`SLICE`] rows.
+const PAGED: [&str; 5] = [
+    "SELECT * FROM GRAPH_TABLE (base MATCH p = (s IS person WHERE s._key = 'p00')\
+     -[:knows]->{1,5}(t) RETURN t._key AS t, PATH_LENGTH(p) AS n)",
+    "SELECT * FROM GRAPH_TABLE (base MATCH p = ANY SHORTEST (s IS person WHERE s._key = 'p00')\
+     -[:knows]->{1,20}(t) RETURN t._key AS t, PATH_LENGTH(p) AS n)",
+    "SELECT * FROM GRAPH_TABLE (base MATCH (a IS person) \
+     OPTIONAL MATCH (a)-[:knows]->(b IS person WHERE b.age > 40) RETURN a._key AS a, b._key AS b)",
+    "SELECT * FROM GRAPH_TABLE (base MATCH (a IS person)-[:knows]->{1,3}(t) \
+     RETURN a._key AS a, COUNT(*) AS n)",
+    "SELECT t, n FROM GRAPH_TABLE (base MATCH p = (s IS person WHERE s._key = 'p00')\
+     -[:knows]->{1,5}(t) RETURN t._key AS t, PATH_LENGTH(p) AS n) AS g \
+     ORDER BY n DESC, t LIMIT 40",
+];
+
+/// Rows one `Execute` or `FETCH` asks for.
+const SLICE: usize = 4;
+
+/// A GQL walk long enough to outrun a one-millisecond timeout and to reach
+/// the deadline's poll: every path of up to ten hops from every person.
+const LONG_WALK: &str = "SELECT * FROM GRAPH_TABLE (base MATCH (s IS person)-[:knows]->{1,10}(t) \
+                         RETURN COUNT(*) AS n)";
+
+/// Every `DataRow` as text cells, in the order they arrived.
+fn arrived_rows(frames: &[Frame]) -> Vec<Vec<Option<String>>> {
+    frames
+        .iter()
+        .filter(|f| f.typ == b'D')
+        .map(|f| {
+            raw_cells(f)
+                .into_iter()
+                .map(|cell| cell.map(|bytes| String::from_utf8(bytes).unwrap()))
+                .collect()
+        })
+        .collect()
+}
+
+/// The simple protocol's answer: one streamed execution, in order.
+fn streamed(connection: &mut Connection<'_>, sql: &str) -> Vec<Vec<Option<String>>> {
+    let got = frames(&connection.feed(&query(sql)));
+    assert_eq!(types_of(&got).chars().next(), Some('T'), "`{sql}`: {}", types_of(&got));
+    arrived_rows(&got)
+}
+
+/// One `Execute(portal, max_rows)` and a `Sync`.
+fn execute_slice(connection: &mut Connection<'_>, portal: &str, max_rows: i32) -> Vec<Frame> {
+    let mut batch = common::execute_message(portal, max_rows);
+    batch.extend_from_slice(&sync_message());
+    frames(&connection.feed(&batch))
+}
+
+/// Parse, bind and describe `sql` as the named portal `portal`.
+fn open_portal(connection: &mut Connection<'_>, portal: &str, sql: &str) -> Vec<Frame> {
+    let mut batch = parse_message(portal, sql, &[]);
+    batch.extend_from_slice(&common::bind_message(portal, portal, &[], &[]));
+    batch.extend_from_slice(&sync_message());
+    frames(&connection.feed(&batch))
+}
+
+#[test]
+fn a_portal_with_a_row_limit_pages_a_gql_answer_into_the_one_shot_answer() {
+    let fixture = build_chain();
+    let mut connection = connect(&fixture.service);
+    for sql in PAGED {
+        let whole = streamed(&mut connection, sql);
+        assert!(whole.len() > 2 * SLICE, "`{sql}` spans several slices: {}", whole.len());
+        assert_eq!(types_of(&open_portal(&mut connection, "p1", sql)), "12Z");
+        let mut paged = Vec::new();
+        loop {
+            let got = execute_slice(&mut connection, "p1", SLICE as i32);
+            let rows = arrived_rows(&got);
+            let kinds = types_of(&got);
+            paged.extend(rows.iter().cloned());
+            if kinds.ends_with("sZ") {
+                assert_eq!(rows.len(), SLICE, "`{sql}`: a suspended slice is full");
+                continue;
+            }
+            assert!(kinds.ends_with("CZ"), "`{sql}`: {kinds}");
+            assert_eq!(tag(&got), format!("SELECT {}", rows.len()), "`{sql}`");
+            break;
+        }
+        assert_eq!(paged, whole, "`{sql}`: the slices are not the one-shot answer");
+    }
+}
+
+#[test]
+fn a_declared_cursor_fetches_a_gql_answer_in_pages_equal_to_the_one_shot_answer() {
+    let fixture = build_chain();
+    let mut connection = connect(&fixture.service);
+    for sql in PAGED {
+        let whole = streamed(&mut connection, sql);
+        let got = frames(&connection.feed(&query(&format!("DECLARE c CURSOR FOR {sql}"))));
+        assert_eq!(tag(&got), "DECLARE CURSOR", "`{sql}`: {}", types_of(&got));
+        let mut paged = Vec::new();
+        loop {
+            let got = frames(&connection.feed(&query(&format!("FETCH {SLICE} FROM c"))));
+            let rows = arrived_rows(&got);
+            assert_eq!(tag(&got), format!("FETCH {}", rows.len()), "`{sql}`");
+            if rows.is_empty() {
+                break;
+            }
+            paged.extend(rows);
+        }
+        assert_eq!(paged, whole, "`{sql}`: the FETCHes are not the one-shot answer");
+        let got = frames(&connection.feed(&query("CLOSE c")));
+        assert_eq!(tag(&got), "CLOSE CURSOR");
+    }
+}
+
+#[test]
+fn a_cancel_request_stops_a_gql_walk_with_57014_and_the_connection_stays_usable() {
+    let fixture = build_chain();
+    let token = CancelToken::new();
+    let mut connection = Connection::new(&fixture.service, common::key(8), token.clone());
+    let _ = connection.feed(&common::startup());
+    let expected = streamed(&mut connection, LONG_WALK);
+
+    // The simple protocol. The token is sticky, so the walk stops at its
+    // first check point rather than racing a second thread.
+    token.cancel();
+    let got = frames(&connection.feed(&query(LONG_WALK)));
+    assert_eq!(types_of(&got), "EZ", "no row and no completion");
+    let (sqlstate, message) = error_fields(first(&got, b'E'));
+    assert_eq!(sqlstate, "57014", "{message}");
+    assert!(message.contains("canceling statement"), "{message}");
+    assert!(!token.is_cancelled(), "the ReadyForQuery cleared the cancel");
+    assert_eq!(streamed(&mut connection, LONG_WALK), expected, "usable again");
+
+    // The extended protocol, through a portal with a row limit.
+    assert_eq!(types_of(&open_portal(&mut connection, "p1", PAGED[0])), "12Z");
+    token.cancel();
+    let got = execute_slice(&mut connection, "p1", SLICE as i32);
+    assert_eq!(types_of(&got), "EZ");
+    assert_eq!(error_fields(first(&got, b'E')).0, "57014");
+    assert!(!token.is_cancelled(), "the Sync cleared the cancel");
+    assert_eq!(streamed(&mut connection, LONG_WALK), expected, "usable again");
+}
+
+#[test]
+fn a_statement_timeout_stops_a_gql_walk_with_57014_and_the_connection_stays_usable() {
+    let fixture = build_chain();
+    let mut connection = connect(&fixture.service);
+    let expected = streamed(&mut connection, LONG_WALK);
+
+    let got = frames(&connection.feed(&query("SET statement_timeout = '1ms'")));
+    assert_eq!(tag(&got), "SET");
+    let got = frames(&connection.feed(&query(LONG_WALK)));
+    assert_eq!(types_of(&got), "EZ", "no row and no completion");
+    let (sqlstate, message) = error_fields(first(&got, b'E'));
+    assert_eq!(sqlstate, "57014", "{message}");
+    assert!(
+        message.contains("statement timeout") && message.contains("microseconds"),
+        "the timeout's message, not the cancel's: {message}"
+    );
+
+    // A declared cursor: the DECLARE is what runs the walk, so it is the
+    // statement refused, and no cursor is left to FETCH from.
+    let got = frames(&connection.feed(&query(&format!("DECLARE c CURSOR FOR {LONG_WALK}"))));
+    assert_eq!(error_fields(first(&got, b'E')).0, "57014");
+    let got = frames(&connection.feed(&query("FETCH 1 FROM c")));
+    assert_eq!(error_fields(first(&got, b'E')).0, "34000", "no cursor was opened");
+
+    let _ = connection.feed(&query("SET statement_timeout = 0"));
+    assert_eq!(streamed(&mut connection, LONG_WALK), expected, "cleared, the walk completes");
+}
+
+#[test]
+fn a_portal_refused_part_way_stays_refused_and_never_completes() {
+    // A refused execution is an INCOMPLETE answer (design §3.5): the next
+    // `Execute` on the same portal is an error again -- never rows, never
+    // a `CommandComplete` that would pass the answer off as whole.
+    let fixture = build_chain();
+    let token = CancelToken::new();
+    let mut connection = Connection::new(&fixture.service, common::key(9), token.clone());
+    let _ = connection.feed(&common::startup());
+
+    // Cancelled.
+    assert_eq!(types_of(&open_portal(&mut connection, "p1", PAGED[0])), "12Z");
+    token.cancel();
+    let got = execute_slice(&mut connection, "p1", SLICE as i32);
+    assert_eq!(types_of(&got), "EZ");
+    assert_eq!(error_fields(first(&got, b'E')).0, "57014");
+    for _ in 0..2 {
+        let got = execute_slice(&mut connection, "p1", SLICE as i32);
+        assert_eq!(types_of(&got), "EZ", "the refused portal answered rows or a completion");
+        assert_eq!(error_fields(first(&got, b'E')).0, "57014", "the same refusal again");
+    }
+
+    // Timed out.
+    let _ = connection.feed(&query("SET statement_timeout = '1ms'"));
+    assert_eq!(types_of(&open_portal(&mut connection, "p2", LONG_WALK)), "12Z");
+    let got = execute_slice(&mut connection, "p2", 1);
+    assert_eq!(error_fields(first(&got, b'E')).0, "57014");
+    let _ = connection.feed(&query("SET statement_timeout = 0"));
+    let got = execute_slice(&mut connection, "p2", 1);
+    assert_eq!(types_of(&got), "EZ", "the timed-out portal answered rows or a completion");
+    assert_eq!(error_fields(first(&got, b'E')).0, "57014");
+
+    // A new portal of the same statement is a new execution, and runs.
+    assert_eq!(types_of(&open_portal(&mut connection, "p3", PAGED[0])), "12Z");
+    let got = execute_slice(&mut connection, "p3", 0);
+    assert!(types_of(&got).ends_with("CZ"), "{}", types_of(&got));
 }
