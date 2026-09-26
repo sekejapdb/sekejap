@@ -882,3 +882,69 @@ fn the_cached_plan_answers_what_a_fresh_compile_answers_for_every_binding() {
         assert_eq!(&keys_of(&cached), oracle.get(&bucket).expect("bucket"));
     }
 }
+
+#[test]
+fn a_stored_row_has_an_owner_and_the_sentinel_has_none() {
+    let tmp = dir();
+    let db = Db::open(tmp.path()).expect("open");
+    posts(&db);
+    db.put(("posts", "p1"), &document(1)).expect("put");
+    let rows = db
+        .query("SELECT _key FROM posts WHERE _key = 'p1'", &[])
+        .expect("query");
+    let row = rows.iter().next().expect("one row");
+    assert_eq!(row.owner(), Some(row.id), "a stored row names its owner");
+    assert_ne!(row.id, sekejap::EntityId::NO_OWNER);
+
+    // A row of a derived relation carries the sentinel and has no owner.
+    let derived = sekejap::Row {
+        columns: row.columns.clone(),
+        id: sekejap::EntityId::NO_OWNER,
+        values: row.values.clone(),
+    };
+    assert_eq!(derived.owner(), None);
+}
+
+/// A GQL statement runs through the SQL calls the crate already has --
+/// `query`, `prepare` / `query_with`, `stream` -- and every row it answers
+/// is a row of a relation: it has no owner (`docs/dist/RUST_API.md` §3).
+#[test]
+fn a_gql_statement_runs_through_the_sql_calls_with_owner_less_rows() {
+    let tmp = dir();
+    let db = Db::open(tmp.path()).expect("open");
+    db.create_collection("band", &[("name", FieldKind::Text)])
+        .expect("band");
+    db.create_collection("person", &[("name", FieldKind::Text)])
+        .expect("person");
+    db.put(("band", "b1"), &json!({"name": "band one"})).expect("put");
+    db.put(("band", "b2"), &json!({"name": "band two"})).expect("put");
+    for (key, name, band) in [("p1", "person one", "b1"), ("p2", "person two", "b1"), ("p3", "person three", "b2")] {
+        db.put(("person", key), &json!({ "name": name })).expect("put");
+        db.link(("person", key), "member_of", ("band", band)).expect("link");
+    }
+    let sql = "SELECT * FROM GRAPH_TABLE (base \
+               MATCH (b IS band WHERE b._key = $1)<-[:member_of]-(p IS person) \
+               RETURN p.name AS name)";
+    let names = |rows: &sekejap::Rows| {
+        let mut names: Vec<Value> = rows
+            .iter()
+            .map(|row| {
+                assert_eq!(row.owner(), None, "a relation row has no owner");
+                row.json("name").expect("the name column")
+            })
+            .collect();
+        names.sort_by_key(|v| v.to_string());
+        names
+    };
+    let rows = db.query(sql, &[json!("b1")]).expect("query");
+    assert_eq!(rows.column_names(), ["name"]);
+    assert_eq!(names(&rows), [json!("person one"), json!("person two")]);
+
+    // Prepared once, bound three times, compiled once.
+    let mut statement = db.prepare(sql).expect("prepare");
+    assert_eq!(names(&statement.query_with(&[json!("b2")]).expect("b2")), [json!("person three")]);
+    assert!(statement.query_with(&[json!("b9")]).expect("b9").is_empty(), "a missing seed is zero rows");
+    assert_eq!(names(&statement.query_with(&[json!("b1")]).expect("b1")).len(), 2);
+    assert_eq!(statement.rebindable(), Some(true));
+    assert_eq!(statement.counters(), (3, 1));
+}

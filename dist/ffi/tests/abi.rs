@@ -344,6 +344,55 @@ fn a_query_answers_a_json_array_of_objects_keyed_by_column_name() {
     assert!(!plan.is_empty(), "the plan is text, not an empty string");
 }
 
+/// A GQL statement runs through `sekejap_query` and the prepared-statement
+/// calls unchanged: the answer is the same JSON array of objects keyed by
+/// column name, and a relation row carries no row identity.
+#[test]
+fn a_gql_statement_answers_through_the_same_query_calls() {
+    let db = Fixture::open();
+    db.create("band", &json!([text_field("name")]));
+    db.create("person", &json!([text_field("name")]));
+    assert_eq!(db.put("band", "b1", &json!({ "name": "band one" })), 0);
+    for (key, name) in [("p1", "person one"), ("p2", "person two")] {
+        assert_eq!(db.put("person", key, &json!({ "name": name })), 0);
+        let linked = unsafe {
+            sekejap_link(
+                db.db,
+                c("person").as_ptr(),
+                c(key).as_ptr(),
+                c("member_of").as_ptr(),
+                c("band").as_ptr(),
+                c("b1").as_ptr(),
+            )
+        };
+        assert_eq!(linked, 0);
+    }
+    let sql = "SELECT * FROM GRAPH_TABLE (base \
+               MATCH (b IS band WHERE b._key = $1)<-[:member_of]-(p IS person) \
+               RETURN p.name AS name, b._key AS band)";
+    let mut answer = db.query(sql, &json!(["b1"]));
+    answer
+        .as_array_mut()
+        .expect("an array")
+        .sort_by_key(|row| row.to_string());
+    assert_eq!(
+        answer,
+        json!([
+            { "name": "person one", "band": "b1" },
+            { "name": "person two", "band": "b1" },
+        ]),
+        "one object per row, keyed by the RETURN columns, and nothing else"
+    );
+    assert_eq!(db.query(sql, &json!(["b9"])), json!([]), "a missing seed is zero rows");
+
+    let statement = unsafe { sekejap_prepare(db.db, c(sql).as_ptr()) };
+    assert!(!statement.is_null(), "{:?}", last(db.db));
+    let rows = take_json(unsafe { sekejap_stmt_query(statement, c(&json!(["b1"]).to_string()).as_ptr()) });
+    assert_eq!(rows.as_array().expect("an array").len(), 2);
+    assert_eq!(unsafe { sekejap_stmt_rebindable(statement) }, 1);
+    unsafe { sekejap_stmt_free(statement) };
+}
+
 #[test]
 fn a_paged_query_hands_back_the_same_rows_as_one_query_in_pages_of_the_stated_size() {
     let db = Fixture::open();
