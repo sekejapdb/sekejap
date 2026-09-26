@@ -101,6 +101,10 @@ pub(crate) enum HostEx {
         left: Ex,
         right: Ex,
     },
+    /// Whether `SET LOCAL ef_search` is set when the statement runs: the
+    /// condition under which a sort over an approximately ordered seed may
+    /// stop early (`lineage.rs`). Never written by a user; lowered only.
+    EfSearchSet,
 }
 
 impl HostEx {
@@ -110,6 +114,7 @@ impl HostEx {
             Self::Text { .. } => Vec::new(),
             Self::Spatial { left, .. } | Self::Distance { left, .. } => vec![left],
             Self::Vector { left, right, .. } => vec![left, right],
+            Self::EfSearchSet => Vec::new(),
         }
     }
 
@@ -124,7 +129,7 @@ impl HostEx {
     /// The value type of the form.
     pub(crate) fn value_type(&self) -> ValueType {
         match self {
-            Self::Text { score: false, .. } | Self::Spatial { .. } => ValueType::Bool,
+            Self::Text { score: false, .. } | Self::Spatial { .. } | Self::EfSearchSet => ValueType::Bool,
             Self::Text { score: true, .. } | Self::Distance { .. } | Self::Vector { .. } => ValueType::Float,
         }
     }
@@ -161,7 +166,7 @@ impl HostEx {
                 }
             }
             Self::Distance { shape: s, .. } => shape(s, &mut typed),
-            Self::Vector { .. } => {}
+            Self::Vector { .. } | Self::EfSearchSet => {}
         }
         out
     }
@@ -182,7 +187,7 @@ impl HostEx {
                 metres.iter().for_each(literal);
             }
             Self::Distance { shape, .. } => shape_literals(shape).into_iter().for_each(literal),
-            Self::Vector { .. } => {}
+            Self::Vector { .. } | Self::EfSearchSet => {}
         }
         out
     }
@@ -215,6 +220,7 @@ impl HostEx {
             },
             Self::Distance { left, shape } => format!("ST_DISTANCE({}, {})", show(left), shape_text(shape)),
             Self::Vector { op, left, right } => format!("({} {} {})", show(left), vec_op(*op), show(right)),
+            Self::EfSearchSet => "SET LOCAL ef_search is set".to_owned(),
         }
     }
 }

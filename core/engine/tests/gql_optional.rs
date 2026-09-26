@@ -311,7 +311,7 @@ fn a_malformed_optional_plan_is_refused_at_open() {
     let plan = OpSpec::OptionalApply {
         input: Box::new(input(&mut host)),
         inner: Box::new(OpSpec::Sort {
-            monotone_first: false,
+            monotone_first: None,
             input: Box::new(inner(&mut host)),
             keys: Box::new([SortKey {
                 expr: key,

@@ -429,7 +429,7 @@ pub(super) fn build_in<'q>(
         }
         OpSpec::Sort { input, keys, .. } => {
             let (input, width) = build(input, params)?;
-            (Box::new(sort::Sort::new(input, keys, None, false)), width)
+            (Box::new(sort::Sort::new(input, keys, None, None)), width)
         }
         OpSpec::Page {
             input,

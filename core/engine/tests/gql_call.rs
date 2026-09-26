@@ -164,7 +164,7 @@ fn returns_x(host: &mut TestHost, body: OpSpec) -> OpSpec {
 fn sorted(host: &mut TestHost, body: OpSpec, limit: Option<u64>) -> OpSpec {
     let x = host.expr(E::Slot(3));
     let sort = OpSpec::Sort {
-        monotone_first: false,
+        monotone_first: None,
         input: Box::new(body),
         keys: Box::new([SortKey {
             expr: x,

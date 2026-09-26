@@ -124,7 +124,7 @@ pub(crate) enum SeedOrder {
     /// order is that index's `ef`-bounded shortlist instead: APPROXIMATE by
     /// the caller's request (design §3.6).
     Vector {
-        index: IndexId,
+        index: Option<IndexId>,
         approximate: Option<IndexId>,
         metric: VectorMetric,
         query: Ex,
@@ -286,6 +286,7 @@ impl Program {
                 let left = self.value(left, row, cx)?;
                 host::spatial_value(None, &left, shape, None, cx.params)?
             }
+            HostEx::EfSearchSet => BindingValue::Bool(crate::compile::ef_search().is_some()),
             HostEx::Vector { op, left, right } => {
                 let (left, right) = (self.value(left, row, cx)?, self.value(right, row, cx)?);
                 let (value, lanes) = host::vector_value(*op, &left, &right)?;
@@ -609,18 +610,24 @@ impl Program {
                 }
                 Some(query) => {
                     lanes = query;
-                    match (crate::compile::ef_search(), approximate) {
-                        (Some(ef), Some(approximate)) => QueryOrder::ApproximateVector {
+                    // Exact unless the transaction asked (Oracle's `FETCH
+                    // APPROX`, Spanner's `APPROX_` functions): approximate
+                    // only under `ef_search` and through an approximate
+                    // index; with no exact index and no knob the rows come
+                    // unordered and the sort orders them all, exactly.
+                    match (crate::compile::ef_search(), index, approximate) {
+                        (Some(ef), _, Some(approximate)) => QueryOrder::ApproximateVector {
                             index: *approximate,
                             query: &lanes,
                             metric: *metric,
                             ef,
                         },
-                        _ => QueryOrder::ExactVector {
+                        (_, Some(index), _) => QueryOrder::ExactVector {
                             index: *index,
                             query: &lanes,
                             metric: *metric,
                         },
+                        (_, None, _) => QueryOrder::Driver,
                     }
                 }
             },

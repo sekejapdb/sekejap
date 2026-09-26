@@ -26,6 +26,7 @@
 use super::eval::{IndexSeed, SeedFilter, SeedOrder};
 use super::expr::Ex;
 use super::host::HostEx;
+use sekejap_core::collections::gql::BindingValue;
 use super::plan::{ready, show, Access, FilterAt, Op, Planner};
 use super::schema::BindingSchema;
 use super::stage::TableOp;
@@ -280,10 +281,10 @@ impl Planner<'_> {
     /// once) with only streaming operators after it. Ascending only: that is
     /// the direction of nearness. Anything else keeps the scan and the full
     /// sort, which are exact too.
-    pub(super) fn order_seed(&mut self, key: &Ex, descending: bool) -> SqlResult2<bool> {
-        let Ex::Host(host) = key else { return Ok(false) };
+    pub(super) fn order_seed(&mut self, key: &Ex, descending: bool) -> SqlResult2<Option<Ex>> {
+        let Ex::Host(host) = key else { return Ok(None) };
         let HostEx::Vector { op, left, right } = &**host else {
-            return Ok(false);
+            return Ok(None);
         };
         let metric = match op {
             VecOp::L2 => VectorMetric::SquaredL2,
@@ -291,25 +292,25 @@ impl Planner<'_> {
             VecOp::Cosine => VectorMetric::Cosine,
         };
         if descending || self.floor != 0 {
-            return Ok(false);
+            return Ok(None);
         }
         let (property, query) = if right.refs().is_empty() { (left, right) } else { (right, left) };
         if !query.refs().is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(Lineage {
             mark,
             origin: Ex::NodeProperty(_, field),
         }) = of(&self.schema, property)
         else {
-            return Ok(false);
+            return Ok(None);
         };
         match self.ops.first() {
             Some(Op::Seed { mark: m, .. }) if *m == mark => {}
-            _ => return Ok(false),
+            _ => return Ok(None),
         }
         if !self.ops[1..].iter().all(streaming) {
-            return Ok(false);
+            return Ok(None);
         }
         let collection = match &self.ops[0] {
             Op::Seed {
@@ -320,40 +321,54 @@ impl Planner<'_> {
                 source: SeedSource::Index { seed },
                 ..
             } if self.program().seed_at(*seed).order.is_none() => self.program().seed_collection(*seed),
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
         let info = self.db.collection_info(collection).map_err(SqlError::from)?;
         let Some(dimension) = info.layout.fields.iter().find_map(|(name, kind)| match kind {
             Kind::Vector(dimension) if **name == *field => Some(*dimension),
             _ => None,
         }) else {
-            return Ok(false);
+            return Ok(None);
         };
         let indexes = self.db.list_indexes(collection).map_err(SqlError::from)?;
-        let Some(index) = ready(&indexes, &field, IndexFamily::ExactVector) else {
-            return Ok(false);
-        };
+        let exact = ready(&indexes, &field, IndexFamily::ExactVector);
         let approximate = ready(&indexes, &field, IndexFamily::VamanaGraph)
             .or_else(|| ready(&indexes, &field, IndexFamily::QuantizedVector));
+        // The index EXPLAIN names, and the condition the sort stops early
+        // under: always, over an exact index; only under `ef_search`, over an
+        // approximate one alone -- without the knob that seed is read
+        // unordered and the sort orders every row, exactly.
+        let (named, condition) = match (exact, approximate) {
+            (Some(exact), _) => (exact, Ex::Const(BindingValue::Bool(true))),
+            (None, Some(approximate)) => (approximate, Ex::Host(Box::new(HostEx::EfSearchSet))),
+            (None, None) => return Ok(None),
+        };
         // What the order is if the execution opened now: EXPLAIN reads the
         // knob when EXPLAIN runs, as the execution does when it opens.
-        let exactness = match (crate::compile::ef_search(), approximate) {
-            (None, _) => "exact".to_owned(),
-            (Some(ef), Some(info)) => format!(
+        let exactness = match (crate::compile::ef_search(), exact, approximate) {
+            (Some(ef), _, Some(info)) => format!(
                 "APPROXIMATE (ef={ef}) through `{}` under SET LOCAL ef_search: the shortlist bounds the whole answer",
                 info.name
             ),
-            (Some(_), None) => "exact: SET LOCAL ef_search is unused, the column has no approximate index".to_owned(),
+            (None, Some(_), _) => "exact".to_owned(),
+            (Some(_), Some(_), None) => {
+                "exact: SET LOCAL ef_search is unused, the column has no approximate index".to_owned()
+            }
+            (None, None, Some(info)) => format!(
+                "exact: the column has no exact index, so the rows are read unordered and sorted whole; SET LOCAL ef_search reads `{}` in order, APPROXIMATELY, and CREATE INDEX ... USING exact reads it in order exactly",
+                info.name
+            ),
+            (_, None, None) => unreachable!("an index was found above"),
         };
         let order = SeedOrder::Vector {
-            index: index.id,
+            index: exact.map(|info| info.id),
             approximate: approximate.map(|info| info.id),
             metric,
             query: query.clone(),
             dimension,
         };
         let part = (
-            index.name.clone(),
+            named.name.clone(),
             format!("ordered by {}, {exactness}", show(key, &self.schema)),
         );
         let created = matches!(&self.ops[0], Op::Seed { source: SeedSource::Scan { .. }, .. }).then(|| {
@@ -385,6 +400,6 @@ impl Planner<'_> {
             };
         }
         self.program_mut().seed_mut(seed).order = Some(order);
-        Ok(true)
+        Ok(Some(condition))
     }
 }

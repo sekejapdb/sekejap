@@ -19,6 +19,7 @@
 //! every page before that. No spill: past the cap the page is refused.
 
 use super::super::super::{QueryResult, WorkResource};
+use super::super::host::ExprId;
 use super::super::plan::SortKey;
 use super::super::value::{BindingRow, BindingValue};
 use super::{ExecCx, Held, Op, Operator};
@@ -31,8 +32,10 @@ pub(super) struct Sort<'q> {
     input: Option<Op<'q>>,
     keys: &'q [SortKey],
     keep: Option<u64>,
-    /// The input arrives ordered by the first key, in its direction.
-    monotone_first: bool,
+    /// The condition under which the input arrives ordered by the first key,
+    /// evaluated on the first row; `monotone` holds its answer.
+    monotone_first: Option<ExprId>,
+    monotone: bool,
     /// The rows still to hand out, LAST row first, so `pop` gives the next.
     sorted: Vec<Entry<'q>>,
     held: Held,
@@ -90,12 +93,13 @@ impl PartialEq for Entry<'_> {
 impl Eq for Entry<'_> {}
 
 impl<'q> Sort<'q> {
-    pub(super) fn new(input: Op<'q>, keys: &'q [SortKey], keep: Option<u64>, monotone_first: bool) -> Self {
+    pub(super) fn new(input: Op<'q>, keys: &'q [SortKey], keep: Option<u64>, monotone_first: Option<ExprId>) -> Self {
         Self {
             input: Some(input),
             keys,
             keep,
             monotone_first,
+            monotone: false,
             sorted: Vec::new(),
             held: Held::default(),
         }
@@ -107,6 +111,11 @@ impl<'q> Sort<'q> {
         let mut best = BinaryHeap::new();
         let mut seq = 0;
         while let Some(row) = input.next(cx)? {
+            if seq == 0 {
+                if let Some(condition) = self.monotone_first {
+                    self.monotone = matches!(cx.eval(condition, &row)?, BindingValue::Bool(true));
+                }
+            }
             let keys = self
                 .keys
                 .iter()
@@ -136,7 +145,7 @@ impl<'q> Sort<'q> {
                     // Full, over an input ordered by the first key: a row
                     // strictly worse on it than the worst kept one ends the
                     // read, since every later row is at least as bad.
-                    if self.monotone_first
+                    if self.monotone
                         && best.peek().is_some_and(|worst: &Entry<'_>| {
                             key_order(&self.keys[0], &entry.keys[0], &worst.keys[0]) == Ordering::Greater
                         })

@@ -61,7 +61,7 @@ use super::bind::{bind_match, column_name, outer_column_name};
 use super::convert;
 use super::expr::{is_group, Ex, Lowering};
 use super::horizontal::Horizontal;
-use super::plan::{FilterAt, Op, Planner};
+use super::plan::{show, FilterAt, Op, Planner};
 use super::schema::{BindingSchema, Name, Provenance, SlotInfo};
 use super::subquery::{holds_exists, statement_holds_exists};
 use super::types::{aggregate_type, described, spelling};
@@ -121,9 +121,10 @@ pub(crate) enum TableOp {
         shown: Shown,
     },
     Distinct,
-    /// `monotone`: fed by an index-ordered seed on the first key
-    /// (`lineage.rs`), so a limited sort stops early.
-    Sort { keys: Box<[SortKey]>, shown: Vec<String>, monotone: bool },
+    /// `monotone`: the condition under which an index-ordered seed feeds
+    /// the first key (`lineage.rs`), so a limited sort stops early, and how
+    /// `EXPLAIN` words it (`None` when it always holds).
+    Sort { keys: Box<[SortKey]>, shown: Vec<String>, monotone: Option<(ExprId, Option<String>)> },
     Page {
         offset: Option<CountExpr>,
         limit: Option<CountExpr>,
@@ -163,7 +164,7 @@ impl TableOp {
             Self::Sort { keys, monotone, .. } => OpSpec::Sort {
                 input,
                 keys: keys.clone(),
-                monotone_first: *monotone,
+                monotone_first: monotone.as_ref().map(|(condition, _)| *condition),
             },
             Self::Page { offset, limit } => OpSpec::Page {
                 input,
@@ -209,10 +210,14 @@ impl TableOp {
             Self::Sort { shown, monotone, .. } => format!(
                 "Sort by {} -- stable; holds sort_bytes (only offset + limit rows under a LIMIT){}",
                 shown.join(", "),
-                if *monotone {
-                    "; fed in the seed's index order, it stops at the first row past the worst it keeps"
-                } else {
-                    ""
+                match monotone {
+                    Some((_, None)) => {
+                        "; fed in the seed's index order, it stops at the first row past the worst it keeps".to_owned()
+                    }
+                    Some((_, Some(when))) => format!(
+                        "; when {when}, fed in the seed's index order, it stops at the first row past the worst it keeps"
+                    ),
+                    None => String::new(),
                 }
             ),
             Self::Page { offset, limit } => {
@@ -745,7 +750,7 @@ impl Planner<'_> {
                 let key = key.clone();
                 self.order_seed(&key, ret.order_by[0].descending)?
             }
-            _ => false,
+            _ => None,
         };
         let mut next = BindingSchema::default();
         // A column that is exactly a node or a property with lineage keeps
@@ -973,7 +978,7 @@ impl Planner<'_> {
         ret: &Return,
         order: &[Option<usize>],
         output: &BindingSchema,
-        monotone: bool,
+        monotone: Option<Ex>,
     ) -> SqlResult2<()> {
         let stage_schema = std::mem::replace(&mut self.schema, output.clone());
         let result: SqlResult2<()> = (|| {
@@ -996,6 +1001,13 @@ impl Planner<'_> {
                     descending: key.descending,
                 });
             }
+            let monotone = monotone.map(|condition| {
+                let when = match &condition {
+                    Ex::Const(_) => None,
+                    other => Some(show(other, &self.schema)),
+                };
+                (self.expr(condition), when)
+            });
             self.ops.push(Op::Table(TableOp::Sort {
                 keys: keys.into(),
                 shown,
