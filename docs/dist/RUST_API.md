@@ -320,6 +320,7 @@ its own name. Law 4: a scan is called a scan.
 |---|---|---|
 | `Db::transaction() -> Result<Tx<'_>>` | take the writer | `let mut tx = db.transaction()?;` |
 | `Tx::put/put_many/delete/link/link_with/unlink/execute` | the same calls as §2-§4, with NO commit | `tx.put(("posts","p1"), &doc)?;` |
+| `Tx::query(&mut self, sql, params) -> Result<Rows>` | a row-returning statement INSIDE the transaction: it sees the transaction's own writes and what its `SET LOCAL` set (`ef_search`); not cached | `let rows = tx.query("SELECT ...", &[])?;` |
 | `Tx::commit(self) -> Result<()>` | `Database::commit` (`collections/mod.rs:1957`) | `tx.commit()?;` |
 | `Tx::rollback(self) -> Result<()>` | `Database::rollback` (`:1982`) | `tx.rollback()?;` |
 
@@ -328,6 +329,13 @@ is what an application that writes one row at a time expects and what the 0.16
 callers were built on. `Tx` is the opposite bargain -- many writes, one barrier --
 and the two are the whole story: there is no third auto-commit toggle to get
 wrong. A `Tx` dropped without `commit` ROLLS BACK, and says so in its docs.
+
+`SET LOCAL ef_search = n` run through `Tx::execute` holds until the `Tx` ends
+-- commit, rollback or drop -- as in PostgreSQL, and a vector order reads it
+when the statement runs, so `Tx::query` after it is approximate with that
+shortlist and a `Db::query` after the `Tx` is exact again, its cached plan
+included. Run through `Db::execute`, which commits at once, it ends with its
+own statement: that is PostgreSQL's `SET LOCAL` outside a transaction block.
 
 Every write in §2-§4 goes THROUGH a `Tx`, including the ones that open and
 commit one of their own, and in service mode a `Tx` writes through the

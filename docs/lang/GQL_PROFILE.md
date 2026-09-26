@@ -177,9 +177,11 @@ engine intersects. A condition written later, in a `FILTER` or in the outer
 `WHERE`, joins that read when it is about the same node and nothing in
 between chooses among rows or counts them (no `ORDER BY`, `LIMIT`,
 `DISTINCT`, grouping, path selector, `CALL` or `UNION`, and never out of an
-`EXISTS`, `CALL` or `UNION` body). A `LIMIT` over `ORDER BY` an `<->` or
+`EXISTS`, `CALL` or `UNION` body). A `LIMIT` over `ORDER BY` a `<->`, `<=>` or
 `<#>` distance of that node reads its exact vector index in order and stops
-early; this needs a `NOT NULL` vector column.
+early. As in PostgreSQL, a row with no vector sorts last with a `NULL`
+distance, and an all-zero vector's cosine distance is NaN, after every
+number and before `NULL`.
 
 **Exact unless asked.** Inside a body, a vector order is exact. With
 `SET LOCAL ef_search = n` in the same transaction, and an approximate
