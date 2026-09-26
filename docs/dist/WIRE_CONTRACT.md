@@ -115,7 +115,11 @@ rows are STREAMED page by page and nothing is held.
 * **`Execute`** with NO row limit STREAMS (nothing held) and never sends a
   `RowDescription` — the client has one from `Describe`. With a row limit it
   hands out that many rows and answers `PortalSuspended`; the next `Execute`
-  on the same portal resumes. See §6.
+  on the same portal resumes. See §6. A portal whose run was REFUSED (an
+  error, a cancel, a `statement_timeout`) stays refused: every later
+  `Execute` or `Describe` of it repeats that error, never rows or a
+  `CommandComplete`, because a refused run is an incomplete answer. A new
+  `Bind` makes a new portal and a new run.
 * **`Flush`** is a no-op: `feed` returns everything it produced, so nothing
   is held back.
 * After an error, everything up to the next `Sync` is skipped, as the
@@ -125,7 +129,10 @@ rows are STREAMED page by page and nothing is held.
 `ReadyForQuery` reports `I` idle, `T` inside a `BEGIN` block, `E` inside a
 block that has failed. A statement issued in a failed block is refused
 `25P02` until `COMMIT` (which rolls back and reports `ROLLBACK`) or
-`ROLLBACK`.
+`ROLLBACK`. This is not a write-only rule: a READ is refused exactly the
+same, a GQL statement exactly as a plain-SQL one, and so is a repeated
+`BEGIN` -- PostgreSQL's own `IsTransactionExitStmt` names only `COMMIT` and
+`ROLLBACK` as exempt, and this surface names the same two.
 
 ### 1.4 Asynchronous
 
@@ -387,6 +394,13 @@ with no row limit, which STREAMS and holds nothing, or add a `LIMIT`.
 `MOVE` is a `FETCH` whose rows are discarded, over the same held answer, so
 it costs no walk. `FETCH` past the end returns nothing and is not an error.
 
+**`DECLARE <name>` for a name already open is `42P03 duplicate_cursor`**,
+named after the cursor, not a silent replace -- checked before `<select>` is
+even parsed, so the refusal costs no walk and the OLD cursor keeps its own
+answer and position untouched. A `DECLARE` refused for any other reason (a
+cancel, a `statement_timeout`) opens no cursor either, and likewise leaves
+every already-open cursor exactly as it was.
+
 ---
 
 ## 7. Transactions
@@ -440,6 +454,7 @@ it back.
 | `SqlError::Parameter`, `Error::InvalidInput` | `22023` | `invalid_parameter_value` |
 | no prepared statement by that name | `26000` | `invalid_sql_statement_name` |
 | no portal or cursor by that name | `34000` | `invalid_cursor_name` |
+| `DECLARE` names a cursor that is already open | `42P03` | `duplicate_cursor` |
 | a frame this surface cannot read | `08P01` | `protocol_violation` |
 | a statement in a failed block | `25P02` | `in_failed_sql_transaction` |
 | anything else the store refuses | `XX000` | `internal_error` |

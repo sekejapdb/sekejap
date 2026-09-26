@@ -50,7 +50,10 @@
 //! holds the rows it has not yet handed out. That buffer is bounded by
 //! [`CURSOR_ROW_CAP`] and [`CURSOR_BYTES_CAP`], and an answer that passes
 //! either is REFUSED naming the ceiling, never truncated. An `Execute` with
-//! no row limit streams page by page and holds nothing.
+//! no row limit streams page by page and holds nothing. A portal whose run
+//! was refused holds that refusal instead, and repeats it to every later
+//! `Execute` and `Describe`: a refused run is an incomplete answer, and
+//! running the statement again would pass a new one off as its rest.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -166,6 +169,12 @@ struct Portal {
     delivered: usize,
     /// True once this portal has been run at all.
     executed: bool,
+    /// The error that refused this portal's run. A refused run is an
+    /// INCOMPLETE answer (`docs/lang/GQL_PROFILE_DESIGN.md` §3.5), so every
+    /// later `Execute` or `Describe` of the portal repeats this error rather
+    /// than running the statement again and passing a fresh answer off as
+    /// the rest of the refused one.
+    refused: Option<WireError>,
 }
 
 /// An open cursor (`QL_CONTRACT` §2, T2 -> T1 inside this session).
@@ -617,6 +626,7 @@ impl<'a> Connection<'a> {
                 tag: None,
                 delivered: 0,
                 executed: false,
+                refused: None,
             },
         );
         f::bind_complete(out);
@@ -709,13 +719,13 @@ impl<'a> Connection<'a> {
             let sql = portal.sql.clone();
             let params = portal.params.clone();
             let formats = portal.result_formats.clone();
-            match self.run_streaming(&sql, &params, &formats, false, out) {
-                Ok(()) => {
-                    if let Some(portal) = self.portals.get_mut(&name) {
-                        portal.executed = true;
-                    }
-                }
-                Err(error) => self.fail(out, &error),
+            let ran = self.run_streaming(&sql, &params, &formats, false, out);
+            if let Some(portal) = self.portals.get_mut(&name) {
+                portal.executed = true;
+                portal.refused = ran.as_ref().err().cloned();
+            }
+            if let Err(error) = ran {
+                self.fail(out, &error);
             }
             return;
         }
@@ -825,16 +835,20 @@ impl<'a> Connection<'a> {
                 format!("portal \"{name}\" does not exist"),
             ));
         };
+        if let Some(error) = &portal.refused {
+            return Err(error.clone());
+        }
         if portal.executed {
             return Ok(portal.answer.as_ref().map(|answer| answer.fields.clone()));
         }
         let sql = portal.sql.clone();
         let params = portal.params.clone();
         let formats = portal.result_formats.clone();
-        let outcome = self.run_buffered(&sql, &params, &formats, out)?;
+        let ran = self.run_buffered(&sql, &params, &formats, out);
         let portal = self.portals.get_mut(name).expect("checked above");
         portal.executed = true;
-        match outcome {
+        portal.refused = ran.as_ref().err().cloned();
+        match ran? {
             Outcome::Rows(mut answer) => {
                 answer.fields = apply_formats(&answer.fields, &formats);
                 let fields = answer.fields.clone();
@@ -976,12 +990,11 @@ impl<'a> Connection<'a> {
         params: &[Param],
         out: &mut Vec<u8>,
     ) -> Result<Outcome, WireError> {
-        if self.txn_failed {
-            return Err(WireError::new(
-                "25P02",
-                "current transaction is aborted, commands ignored until end of transaction block",
-            ));
-        }
+        // `session_statement`'s own failed-block guard runs before either of
+        // this function's two callers reach it, so `self.txn_failed` cannot
+        // be true here; a write is refused there, with the read it is now
+        // the same rule for.
+        debug_assert!(!self.txn_failed, "session_statement refuses a failed block first");
         let result = if self.txn.is_some() {
             let guard = self.txn.as_mut().expect("checked above");
             guard.sql(sql, params)
@@ -1087,6 +1100,21 @@ impl<'a> Connection<'a> {
     ) -> Result<Option<Outcome>, WireError> {
         let first = word(sql, 0);
         let upper = sql.to_ascii_uppercase();
+
+        // §1.3, §7: once a statement inside this `BEGIN` block has failed,
+        // every later statement is refused until the block ends -- a READ
+        // exactly as a write, a GQL walk exactly as a plain-SQL one, and
+        // even a repeated `BEGIN`. PostgreSQL's own `IsTransactionExitStmt`
+        // names only `COMMIT` (`END`) and `ROLLBACK` (`ABORT`) as exempt;
+        // this check runs before the dispatch below so nothing downstream
+        // -- `is_read`'s walk included -- ever sees a statement the block
+        // has already refused.
+        if self.txn_failed && !matches!(first.as_str(), "COMMIT" | "END" | "ROLLBACK" | "ABORT") {
+            return Err(WireError::new(
+                types::IN_FAILED_TRANSACTION,
+                "current transaction is aborted, commands ignored until end of transaction block",
+            ));
+        }
 
         // A catalog query is an ordinary statement: `sekejap_lang` answers the
         // `pg_catalog` / `information_schema` views as virtual rows
@@ -1314,6 +1342,17 @@ impl<'a> Connection<'a> {
         let name = unquote(&word(sql, 1)).to_ascii_lowercase();
         if name.is_empty() {
             return Err(WireError::new(types::SYNTAX_ERROR, "DECLARE needs a name"));
+        }
+        // PostgreSQL checks a portal-name collision before it plans or runs
+        // anything: the refusal names the cursor and the OLD one is left
+        // exactly as it was, never replaced. Checked here, before `body` is
+        // even parsed out, so a refusal for THIS reason costs no walk and
+        // touches nothing else in `self.cursors`.
+        if self.cursors.contains_key(&name) {
+            return Err(WireError::new(
+                types::DUPLICATE_CURSOR,
+                format!("cursor \"{name}\" already exists"),
+            ));
         }
         let upper = sql.to_ascii_uppercase();
         let Some(at) = upper.find(" FOR ") else {

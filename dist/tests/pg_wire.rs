@@ -711,6 +711,74 @@ fn a_transaction_block_reports_its_status_and_a_rollback_leaves_no_row() {
     assert_eq!(rows_of(&got).len(), 1, "a commit wrote one row");
 }
 
+/// A statement issued after an earlier one in the same `BEGIN` block failed
+/// is refused `25P02`, never answered -- a READ exactly as a write already
+/// was, and even a repeated `BEGIN`: PostgreSQL's own `IsTransactionExitStmt`
+/// names only `COMMIT` and `ROLLBACK` as exempt.
+#[test]
+fn a_read_in_a_failed_transaction_block_is_refused_25p02_not_answered() {
+    let fixture = build(4);
+    let mut connection = connect(&fixture.service, 1);
+
+    let status = |reply: &[u8]| -> u8 {
+        let got = frames(reply);
+        got.last().expect("ReadyForQuery").body[0]
+    };
+
+    assert_eq!(status(&connection.feed(&query("BEGIN"))), b'T');
+    let reply = connection.feed(&query("SELECT id FROM nowhere"));
+    assert_eq!(status(&reply), b'E', "the block is now aborted");
+
+    // A READ, not a write: today this is answered. It must be refused.
+    let got = ask(&mut connection, "SELECT id FROM place WHERE n < 2 ORDER BY n");
+    let (sqlstate, message) = error_fields(first(&got, b'E').expect("an ErrorResponse"));
+    assert_eq!(sqlstate, "25P02", "a read in a failed block was answered: {message}");
+    assert!(rows_of(&got).is_empty(), "no row is handed out from a refused block");
+
+    // A repeated BEGIN is refused the same way, not a silent no-op.
+    let reply = connection.feed(&query("BEGIN"));
+    let got = frames(&reply);
+    assert_eq!(
+        error_fields(first(&got, b'E').expect("an ErrorResponse")).0,
+        "25P02",
+        "BEGIN is not one of PostgreSQL's two exempt statements either"
+    );
+
+    // ROLLBACK ends the block, and reads answer again.
+    assert_eq!(status(&connection.feed(&query("ROLLBACK"))), b'I');
+    let got = ask(&mut connection, "SELECT id FROM place WHERE n < 2 ORDER BY n");
+    assert!(first(&got, b'E').is_none(), "after ROLLBACK a read answers again");
+    assert_eq!(rows_of(&got).len(), 2);
+}
+
+/// The same rule over the extended protocol: `Parse` (a syntax check, not an
+/// execution) still succeeds, but `Bind`/`Execute` of the read never answer
+/// a row -- `25P02` instead, and the block-ending `COMMIT` rolls back and
+/// reports `ROLLBACK`, as PostgreSQL's does.
+#[test]
+fn a_failed_transaction_block_refuses_a_read_over_the_extended_protocol_too() {
+    let fixture = build(4);
+    let mut connection = connect(&fixture.service, 1);
+
+    let _ = connection.feed(&query("BEGIN"));
+    let _ = connection.feed(&query("SELECT id FROM nowhere"));
+
+    let mut batch = parse_message("s1", "SELECT id FROM place WHERE n < 2 ORDER BY n", &[]);
+    batch.extend_from_slice(&bind_message("p1", "s1", &[], &[0]));
+    batch.extend_from_slice(&execute_message("p1", 0));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    // ParseComplete still arrives -- a syntax check, not an execution -- and
+    // the Bind/Execute of the failed block answer 25P02 rather than rows.
+    assert_eq!(types_of(&got).first(), Some(&'1'), "Parse alone is not blocked");
+    let (sqlstate, message) = error_fields(first(&got, b'E').expect("an ErrorResponse"));
+    assert_eq!(sqlstate, "25P02", "{message}");
+    assert!(rows_of(&got).is_empty());
+
+    let status = |reply: &[u8]| -> u8 { frames(reply).last().expect("ReadyForQuery").body[0] };
+    assert_eq!(status(&connection.feed(&query("COMMIT"))), b'I');
+}
+
 // ── §9.3 LISTEN / NOTIFY ─────────────────────────────────────────────────
 
 /// §9.3: a notification is emitted by a COMMITTED batch, never before it,
@@ -853,6 +921,97 @@ fn a_declared_cursor_fetches_forward_in_pages_and_then_closes() {
         error_fields(first(&got, b'E').expect("an ErrorResponse")).0,
         "34000",
         "a closed cursor is invalid_cursor_name"
+    );
+}
+
+/// `DECLARE <name>` for a name already open is `42P03 duplicate_cursor`, not
+/// a silent replace, and the ORIGINAL cursor's answer and position survive
+/// the refused attempt untouched.
+#[test]
+fn declaring_a_cursor_with_a_name_already_open_is_refused_and_leaves_it_untouched() {
+    let fixture = build(ROWS);
+    let mut connection = connect(&fixture.service, 1);
+
+    let got = ask(
+        &mut connection,
+        "DECLARE c CURSOR FOR SELECT id FROM place WHERE n < 5 ORDER BY n",
+    );
+    assert_eq!(tag(&got), "DECLARE CURSOR");
+    let got = ask(&mut connection, "FETCH 2 FROM c");
+    assert_eq!(
+        rows_of(&got)
+            .iter()
+            .map(|row| row[0].clone().expect("a key"))
+            .collect::<Vec<_>>(),
+        vec!["k000000".to_owned(), "k000001".to_owned()]
+    );
+
+    // A second DECLARE of the same name, over an ENTIRELY different query,
+    // is refused rather than silently taking over.
+    let got = ask(
+        &mut connection,
+        "DECLARE c CURSOR FOR SELECT id FROM place WHERE n < 100 ORDER BY n",
+    );
+    let (sqlstate, message) = error_fields(first(&got, b'E').expect("an ErrorResponse"));
+    assert_eq!(sqlstate, "42P03");
+    assert!(message.contains("\"c\""), "{message}");
+
+    // The ORIGINAL cursor is untouched: it resumes over its ORIGINAL 5-row
+    // answer, not the refused DECLARE's 100.
+    let got = ask(&mut connection, "FETCH ALL FROM c");
+    assert_eq!(
+        rows_of(&got)
+            .iter()
+            .map(|row| row[0].clone().expect("a key"))
+            .collect::<Vec<_>>(),
+        vec!["k000002".to_owned(), "k000003".to_owned(), "k000004".to_owned()],
+        "the original cursor's remaining 3 rows"
+    );
+}
+
+/// A `DECLARE` refused for a reason OTHER than the duplicate name -- here a
+/// `CancelRequest`, fired before the frame is even sent so the walk stops at
+/// its very first check point rather than racing a second thread -- creates
+/// no cursor, and leaves every OTHER already-open cursor exactly as it was.
+#[test]
+fn a_declare_refused_by_cancellation_creates_no_cursor_and_leaves_others_untouched() {
+    let fixture = build(ROWS);
+    let token = CancelToken::new();
+    let mut connection = Connection::new(&fixture.service, key(1), token.clone());
+    let _ = connection.feed(&startup());
+
+    let got = ask(
+        &mut connection,
+        "DECLARE c CURSOR FOR SELECT id FROM place WHERE n < 5 ORDER BY n",
+    );
+    assert_eq!(tag(&got), "DECLARE CURSOR");
+    let got = ask(&mut connection, "FETCH 1 FROM c");
+    assert_eq!(rows_of(&got)[0][0], Some("k000000".to_owned()));
+
+    token.cancel();
+    let got = ask(&mut connection, "DECLARE d CURSOR FOR SELECT id FROM place ORDER BY n");
+    assert_eq!(
+        error_fields(first(&got, b'E').expect("an ErrorResponse")).0,
+        "57014",
+        "the DECLARE itself is what runs the walk, so it is the statement cancelled"
+    );
+    assert!(!token.is_cancelled(), "the ReadyForQuery cleared the cancel");
+
+    let got = ask(&mut connection, "FETCH 1 FROM d");
+    assert_eq!(
+        error_fields(first(&got, b'E').expect("an ErrorResponse")).0,
+        "34000",
+        "no cursor d was left half-open by the refused DECLARE"
+    );
+
+    // Cursor c, unrelated to the refused DECLARE, is exactly as it was.
+    let got = ask(&mut connection, "FETCH ALL FROM c");
+    assert_eq!(
+        rows_of(&got)
+            .iter()
+            .map(|row| row[0].clone().expect("a key"))
+            .collect::<Vec<_>>(),
+        vec!["k000001".to_owned(), "k000002".to_owned(), "k000003".to_owned(), "k000004".to_owned()]
     );
 }
 

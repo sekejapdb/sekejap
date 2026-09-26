@@ -805,6 +805,13 @@ pub const PROTOCOL_VIOLATION: &str = "08P01";
 /// `XX000 internal_error`: the store or the kernel refused for a reason
 /// none of the above names.
 pub const INTERNAL_ERROR: &str = "XX000";
+/// `25P02 in_failed_sql_transaction`: a statement other than `COMMIT` /
+/// `ROLLBACK` issued after an earlier statement in the same `BEGIN` block
+/// failed. PostgreSQL's own `IsTransactionExitStmt` names only those two as
+/// exempt -- a repeated `BEGIN` is refused the same as a read.
+pub const IN_FAILED_TRANSACTION: &str = "25P02";
+/// `42P03 duplicate_cursor`: `DECLARE` named a cursor that is already open.
+pub const DUPLICATE_CURSOR: &str = "42P03";
 
 /// What a cancel says. One sentence, in one place, because §9.2 makes the
 /// MESSAGE -- not the code -- what tells a cancel from a timeout.
