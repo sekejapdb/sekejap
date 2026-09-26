@@ -4,7 +4,8 @@
 //! Two crossings, each made once:
 //!
 //! * **In, from a caller:** [`from_param`], once per execution for every
-//!   bound `$n`. (A stored property enters through the engine's
+//!   bound `$n` (through `types::typed_param` for one the statement gives a
+//!   type, design §7). (A stored property enters through the engine's
 //!   `ElementReader`, which already reads an absent property and a stored
 //!   null as one `Null`; the SQL surface keeps the difference --
 //!   `crate::projected` maps an absent field to `SqlValue::Missing` -- and
@@ -37,7 +38,7 @@ pub(crate) fn from_param(param: &Param) -> BindingValue {
     }
 }
 
-/// A bound `$n` in a list position (`FOR x IN $n`): a JSON array, whose
+/// A bound `$n` in a list position (`FOR x IN $n`, `x IN $n`): a JSON array, whose
 /// elements become the list's values -- a string text, a whole number an
 /// integer, any other number a float, `true`/`false` a boolean, `null`
 /// NULL, and an object or array JSON. The list's element type is the one
@@ -51,7 +52,7 @@ pub(crate) fn list_param(param: &Param, n: usize) -> SqlResult2<BindingValue> {
         Param::Json(Value::Array(items)) => items,
         other => {
             return Err(SqlError::Parameter(format!(
-                "${n} is read as a list (`FOR ... IN ${n}`): bind a JSON array, not {}",
+                "${n} is read as a list (`FOR ... IN ${n}`, `... IN ${n}`): bind a JSON array, not {}",
                 match other {
                     Param::Vector(_) => "a vector",
                     Param::Json(_) => "a JSON value that is not an array",

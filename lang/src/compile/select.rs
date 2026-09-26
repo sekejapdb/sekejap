@@ -39,13 +39,6 @@ impl Compiler<'_> {
                     reason: super::dml::FROM_ALL,
                 })
             }
-            // `Compiler::statement` compiles a bare `SELECT *` over a GQL
-            // relation; any outer select list or clause lands here.
-            Source::Gql(_) => {
-                return Err(SqlError::unsupported(
-                    "an outer SELECT list or clause over a GQL relation is built with GQL profile M3-D, which compiles it as one more stage of the plan; until then write `SELECT * FROM GRAPH_TABLE (...)` and name the columns in RETURN",
-                ))
-            }
         };
 
         let mut filters: Vec<OwnedFilter> = Vec::new();

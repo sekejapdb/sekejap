@@ -33,10 +33,10 @@
 //! * scope errors name the variable (`scope_errors_*`);
 //! * the SQL surface of a GQL plan (M2-D): rows carry no owner, pages equal
 //!   the one-shot answer, a bind swaps the parameters and compiles nothing,
-//!   columns and parameters are typed from the binding schema, and an outer
-//!   SELECT list or clause is refused until M3-D builds it
+//!   and columns and parameters are typed from the binding schema
 //!   (`rows_carry_*`, `a_bind_*`, `columns_are_typed_*`,
-//!   `parameters_are_typed_*`, `an_outer_select_*`).
+//!   `parameters_are_typed_*`). The outer SELECT over the relation (M3-D)
+//!   is `gql_prepared.rs`.
 //!
 //! Workload names are invented: bands `b1` `b2`, people `p1`-`p3`, songs
 //! `s1`-`s4`, a venue `b1` that shares a band's key.
@@ -794,25 +794,20 @@ fn parameters_are_typed_from_where_each_is_compared() {
         types("base MATCH (p IS person WHERE $2 < p.age) WHERE p.name = $1 RETURN p._key"),
         [Some("TEXT"), Some("BIGINT")]
     );
-    // An edge property is undeclared, and a parameter used as two types
-    // is not decided here (the M3-D parameter table refuses it).
+    // An edge property is undeclared, so it decides nothing; a parameter
+    // used as two types is refused by the parameter table (M3-D), with
+    // PostgreSQL's `42P08`.
     assert_eq!(
-        types("base MATCH (p IS person WHERE p._key = $1)-[r:performed WHERE r.times > $2]->(s IS song WHERE s.year = $1) RETURN s._key"),
-        [None, None]
+        types("base MATCH (p IS person WHERE p._key = $1)-[r:performed WHERE r.times > $2]->(s IS song) RETURN s._key"),
+        [Some("TEXT"), None]
     );
-}
-
-#[test]
-fn an_outer_select_list_or_clause_is_refused_until_m3_d_builds_it() {
-    let dir = TempDir::new().unwrap();
-    let db = fixture(&dir);
-    let body = "base MATCH (p IS person WHERE p._key = 'p1') RETURN p.name AS name";
-    for text in [
-        format!("SELECT name FROM GRAPH_TABLE ({body})"),
-        format!("SELECT * FROM GRAPH_TABLE ({body}) WHERE name = 'x'"),
-        format!("SELECT * FROM GRAPH_TABLE ({body}) LIMIT 1"),
-    ] {
-        let error = prepare_sql(&db, &text, &[]).err().expect("refused");
-        assert!(error.to_string().contains("M3-D"), "{text}: {error}");
+    let conflict = "base MATCH (p IS person WHERE p._key = $1)-[r:performed]->(s IS song WHERE s.year = $1) RETURN s._key";
+    match prepare_sql(&db, &statement(conflict), &[]) {
+        Err(SqlError::Coded { sqlstate, message }) => {
+            assert_eq!(sqlstate, "42P08", "{message}");
+            assert!(message.contains("TEXT") && message.contains("BIGINT"), "{message}");
+        }
+        other => panic!("{:?}", other.err()),
     }
 }
+

@@ -1795,11 +1795,9 @@ fn a_text_search_inline_node_predicate_is_refused_naming_its_milestone() {
 ///
 /// M2-E: re-expressed with the key range as a GQL pattern `WHERE` (a
 /// post-filter on completed matches, the same role the legacy outer `WHERE`
-/// played) rather than an outer SQL clause, since an outer clause over a GQL
-/// relation is refused until M3-D. The ranking (`ORDER BY w DESC`) is
-/// dropped rather than ignored whole: the four rows are compared as an
-/// unordered (key, weight) set, which still proves the edge column is the
-/// reaching edge's own and not `Missing`.
+/// played). The ranking (`ORDER BY w DESC`) is the outer SELECT's over the
+/// relation (M3-D), so the four rows come back ranked by the reaching
+/// edge's own weight, which also proves the edge column is not `Missing`.
 ///
 /// The pattern splits the hop count into an UNNAMED repeat (`{0,5}`) plus
 /// one more NAMED hop: `r`, quantified directly (`-[r:...]->{1,6}`), is a
@@ -1813,17 +1811,18 @@ fn a_key_post_filter_beside_a_graph_table_keeps_the_traversal_driving() {
     let _ = weighted_graph(&mut f);
     let (columns, rows) = sql_rows(
         &mut f.db,
-        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+        "SELECT g.k, g.w FROM GRAPH_TABLE (routes MATCH \
             (a IS place WHERE a._key = $1)-[:weighted]->{0,5}(x IS place)-[r:weighted]->(b IS place) \
             WHERE b._key <= 'k00004' \
-            RETURN b._key AS k, r.weight AS w)",
+            RETURN b._key AS k, r.weight AS w) AS g \
+         ORDER BY g.w DESC",
         &[Param::Text("k00000".into())],
     );
     assert_eq!(columns, vec!["k".to_owned(), "w".to_owned()]);
     // The chain leaves k00000 for k00001..k00006 with weights 0.0..0.5; the
     // key range keeps the first four of them, each with the edge that
-    // reached it.
-    let mut got: Vec<(String, f64)> = rows
+    // reached it, heaviest first.
+    let got: Vec<(String, f64)> = rows
         .iter()
         .map(|row| {
             let key = match &row[0] {
@@ -1837,14 +1836,13 @@ fn a_key_post_filter_beside_a_graph_table_keeps_the_traversal_driving() {
             (key, weight)
         })
         .collect();
-    got.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(
         got,
         vec![
-            ("k00001".to_owned(), 0.0),
-            ("k00002".to_owned(), 0.1),
-            ("k00003".to_owned(), 0.2),
             ("k00004".to_owned(), 0.3),
+            ("k00003".to_owned(), 0.2),
+            ("k00002".to_owned(), 0.1),
+            ("k00001".to_owned(), 0.0),
         ]
     );
 }

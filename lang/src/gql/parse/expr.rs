@@ -153,6 +153,13 @@ impl Parser {
             self.bump();
         }
         self.bump();
+        if !matches!(self.peek(), Tok::LParen) {
+            return Ok(Expr::Member {
+                expr: Box::new(expr),
+                list: Box::new(self.gql_concat()?),
+                negated,
+            });
+        }
         self.expect(&Tok::LParen)?;
         Ok(Expr::In {
             expr: Box::new(expr),
@@ -498,11 +505,15 @@ impl Parser {
         })
     }
 
-    /// `var` or `var.property`, the cursor on the variable.
+    /// `var` or `var.property`, the cursor on the variable. In an outer
+    /// `SELECT`, `alias.column` is the relation's column.
     fn gql_reference(&mut self) -> SqlResult2<Expr> {
         let var = self.gql_name("a variable")?;
         if !self.eat(&Tok::Dot) {
             return Ok(Expr::Var(var));
+        }
+        if self.relation.as_ref() == Some(&var) {
+            return Ok(Expr::Var(self.gql_name("a column of the relation")?));
         }
         let property = self.gql_spelled("a property name")?;
         if matches!(self.peek(), Tok::Dot) {

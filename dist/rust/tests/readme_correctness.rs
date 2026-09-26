@@ -424,11 +424,9 @@ fn the_sql_tour() {
     let rows = query(&db, "SELECT category, COUNT(*) AS n FROM places GROUP BY category ORDER BY n ASC");
     assert_eq!(texts(&rows, "category"), ["temple", "beach"]);
 
-    // M2-E: the ranking (`ORDER BY rating DESC`/`ASC`) is dropped rather than
-    // weakened into something it does not test -- an outer clause over a
-    // GQL relation is refused until M3-D, and a RETURN stage's own ORDER BY
-    // is GQL profile M3-B, neither built yet. The edge property itself
-    // still projects correctly, checked as an unordered set.
+    // M2-E: the README statement below writes no ranking, so the edge
+    // property is checked as an unordered set. (An outer `ORDER BY` over a
+    // GQL relation is built, M3-D; `lang/tests/gql_prepared.rs` pins it.)
     let rows = query(&db, readme("SELECT *
         FROM GRAPH_TABLE (base MATCH
             (p:places WHERE p._key = 'uluwatu')<-[v:visited]-(t:tourists)

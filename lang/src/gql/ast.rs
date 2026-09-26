@@ -30,14 +30,31 @@ use crate::ast::CmpOp;
 use sekejap_core::collections::Direction;
 use std::fmt;
 
-/// `GRAPH_TABLE ( <graph> <body> ) [AS <alias>]`.
+/// `SELECT ... FROM GRAPH_TABLE ( <graph> <body> ) [AS <alias>] ...`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct GqlGraphTable {
     /// The graph context, a catalog identifier spelled as SQL spells one.
     pub(crate) graph: String,
     pub(crate) body: Pipeline,
     /// The relation's name in the outer `SELECT`.
-    pub(crate) alias: Option<String>,
+    pub(crate) alias: Option<Name>,
+    /// The outer `SELECT` over the relation (design §5.5), compiled as one
+    /// more stage of the plan; `None` for `SELECT * FROM GRAPH_TABLE (...)`
+    /// with no clause after it.
+    pub(crate) outer: Option<Outer>,
+}
+
+/// The outer `SELECT <items> ... [WHERE ..] [GROUP BY ..] [HAVING ..]
+/// [ORDER BY ..] [OFFSET ..] [LIMIT ..]` over a GQL relation: its `WHERE`,
+/// the rest as a `RETURN` over the relation's columns, whose `GROUP BY` and
+/// `ORDER BY` keys may be select-list positions, and its `HAVING`
+/// (PostgreSQL's meaning: a predicate on the finished group, naming only a
+/// group key or an aggregate; M3-D2, brief gap 2).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Outer {
+    pub(crate) where_: Option<Expr>,
+    pub(crate) select: Return,
+    pub(crate) having: Option<Expr>,
 }
 
 /// The stages of a body, separated by `NEXT`: each stage's `RETURN` is the
@@ -294,6 +311,13 @@ pub(crate) enum Expr {
         list: Vec<Expr>,
         negated: bool,
     },
+    /// `expr [NOT] IN <list>`: membership in a list VALUE, such as a list
+    /// parameter `$n` (design §7).
+    Member {
+        expr: Box<Expr>,
+        list: Box<Expr>,
+        negated: bool,
+    },
     /// `CASE [operand] WHEN .. THEN .. [...] [ELSE ..] END`: the simple form
     /// when `operand` is written, the searched form when it is not.
     Case {
@@ -436,6 +460,7 @@ impl Expr {
             | Self::Or(left, right)
             | Self::Concat(left, right)
             | Self::Nullif(left, right) => vec![&**left, &**right],
+            Self::Member { expr, list, .. } => vec![&**expr, &**list],
             Self::Not(inner) | Self::Neg(inner) => vec![&**inner],
             Self::IsNull { expr, .. } | Self::Cast { expr, .. } => vec![&**expr],
             Self::In { expr, list, .. } => std::iter::once(&**expr).chain(list).collect(),
@@ -516,6 +541,20 @@ impl CastType {
             Self::Timestamp => "TIMESTAMPTZ",
         }
     }
+
+    /// PostgreSQL's internal type name, which names an unaliased cast
+    /// column (`x::bigint` is the column `int8`).
+    pub(crate) fn pg_name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Int => "int8",
+            Self::Float => "float8",
+            Self::Bool => "bool",
+            Self::Json => "jsonb",
+            Self::Date => "date",
+            Self::Timestamp => "timestamptz",
+        }
+    }
 }
 
 /// The P0 scalar functions (brief §6): the math functions and the string
@@ -590,9 +629,20 @@ impl Func {
 
 impl fmt::Display for GqlGraphTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(outer) = &self.outer {
+            f.write_str("SELECT ")?;
+            outer.select.items(f)?;
+            f.write_str(" FROM ")?;
+        }
         write!(f, "GRAPH_TABLE ({} {})", self.graph, self.body)?;
         if let Some(alias) = &self.alias {
             write!(f, " AS {alias}")?;
+        }
+        if let Some(outer) = &self.outer {
+            if let Some(predicate) = &outer.where_ {
+                write!(f, " WHERE {predicate}")?;
+            }
+            outer.select.clauses(f, outer.having.as_ref())?;
         }
         Ok(())
     }
@@ -670,6 +720,14 @@ impl fmt::Display for Count {
 impl fmt::Display for Return {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("RETURN ")?;
+        self.items(f)?;
+        self.clauses(f, None)
+    }
+}
+
+impl Return {
+    /// `[DISTINCT] * | item, ...`.
+    fn items(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.distinct {
             f.write_str("DISTINCT ")?;
         }
@@ -685,9 +743,19 @@ impl fmt::Display for Return {
                 write!(f, " AS {alias}")?;
             }
         }
+        Ok(())
+    }
+
+    /// `[GROUP BY ..] [HAVING ..] [ORDER BY ..] [OFFSET n] [LIMIT n]`.
+    /// `having` is `None` for a body `RETURN`, which has no `HAVING`; the
+    /// outer `SELECT` (`GqlGraphTable`'s `Display`) passes its own.
+    fn clauses(&self, f: &mut fmt::Formatter<'_>, having: Option<&Expr>) -> fmt::Result {
         if let Some(keys) = &self.group_by {
             f.write_str(" GROUP BY ")?;
             list(f, keys)?;
+        }
+        if let Some(having) = having {
+            write!(f, " HAVING {having}")?;
         }
         for (at, item) in self.order_by.iter().enumerate() {
             f.write_str(if at == 0 { " ORDER BY " } else { ", " })?;
@@ -871,6 +939,11 @@ impl fmt::Display for Expr {
                 list(f, members)?;
                 f.write_str("))")
             }
+            Self::Member {
+                expr,
+                list,
+                negated,
+            } => write!(f, "({expr} {}IN {list})", if *negated { "NOT " } else { "" }),
             Self::Case {
                 operand,
                 branches,

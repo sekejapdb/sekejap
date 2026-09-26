@@ -56,14 +56,18 @@
 //! compile, never from values (design §6.1): a property of a node is its
 //! field's declared type when every label collection declares it alike, and
 //! `TEXT` when they differ or none declares it (Q8); an edge property is
-//! undeclared, so `TEXT`; a comparison is `BOOLEAN`. A `$n` compared with a
-//! declared property takes that property's type ([`GqlPlan::param_types`]).
-//! All of it is decided in `types.rs`.
+//! undeclared, so `TEXT`; a comparison is `BOOLEAN`. Each `$n` has ONE type
+//! in the whole statement, from the uses that decide one: a comparison
+//! with a declared property or a typed column, a count, a list position
+//! ([`GqlPlan::param_types`]); an execution checks each bound value against
+//! it when it opens. All of it is decided in `types.rs`.
 //!
 //! **Stages.** The statements around the patterns -- `LET`, `FILTER`,
 //! `FOR`, the `RETURN` with its grouping, sort and page -- and `NEXT`
 //! between stages are planned by `stage.rs` into the same operator list;
-//! a stage's `Project` is the boundary the next stage reads. An `OPTIONAL
+//! a stage's `Project` is the boundary the next stage reads. The outer
+//! `SELECT` over the relation is one more stage after the last, planned
+//! the same way (design §5.5). An `OPTIONAL
 //! MATCH` is planned exactly as a `MATCH` -- seeds, hops, placement, its
 //! `WHERE` after its pattern -- and those operators become the inner side
 //! of one [`OpSpec::OptionalApply`], so its `WHERE` decides whether a match
@@ -82,7 +86,7 @@ use super::eval::{Host, IndexSeed, Program};
 use super::expr::{Conjunct, Ex};
 use super::schema::{BindingSchema, SlotInfo};
 use super::stage::{StageView, TableOp};
-use super::types::{spelling, ParamUse};
+use super::types::{self, spelling, ParamUse};
 use crate::ast::CmpOp;
 use crate::{Param, SqlError, SqlResult2, SqlValue};
 use sekejap_core::collections::gql::{
@@ -119,14 +123,12 @@ pub(crate) struct GqlPlan {
     /// The type of each output column, which its declared SQL spelling
     /// and the printing of its values follow.
     types: Vec<ValueType>,
-    /// How many `$n` an execution must bind, and the type each one's
-    /// comparisons give it (`None`: not decided here).
-    params: Vec<Option<&'static str>>,
+    /// How many `$n` an execution must bind, and the one type the
+    /// statement gives each (`None`: no use decides it).
+    params: Vec<Option<ValueType>>,
     /// The `$n` (zero-based) an `OFFSET` or `LIMIT` reads, checked as a
     /// count when an execution opens (design Q13).
     counts: Vec<usize>,
-    /// The `$n` (zero-based) a `FOR` reads as a list: bound to a JSON array.
-    lists: Vec<usize>,
     /// The graph argument as written, and how it resolved.
     graph: String,
     context: ContextRef,
@@ -189,6 +191,11 @@ pub(super) enum FilterAt {
     AfterPattern,
     /// A `FILTER` statement, where it is written.
     Statement,
+    /// The outer `SELECT`'s `WHERE`, over the relation's rows.
+    Outer,
+    /// The outer `SELECT`'s `HAVING`, right after its `Aggregate`, over the
+    /// finished group (M3-D2, brief gap 2).
+    Having,
 }
 
 #[derive(Clone, Debug)]
@@ -229,11 +236,10 @@ impl GqlPlan {
             params: 0,
             uses: Vec::new(),
             counts: Vec::new(),
-            lists: Vec::new(),
             stages: Vec::new(),
             has_edges: false,
         };
-        let output = planner.pipeline(&graph.body, notices)?;
+        let output = planner.pipeline(&graph.body, graph.outer.as_ref(), notices)?;
         reach::choose(&mut planner.ops, &planner.program, &planner.stages);
         let reads_graph = planner.has_edges;
         let context = if graph.graph.eq_ignore_ascii_case("base") || !reads_graph {
@@ -278,7 +284,6 @@ impl GqlPlan {
             types: output.types,
             params,
             counts: planner.counts,
-            lists: planner.lists,
             graph: graph.graph.clone(),
             context,
             reads_graph,
@@ -303,10 +308,10 @@ impl GqlPlan {
         self.types.get(at).map(spelling)
     }
 
-    /// The SQL type each `$n` is compared as: entry `i` is `$i+1`, `None`
-    /// where no comparison decides it or two disagree.
+    /// The SQL type the statement gives each `$n`: entry `i` is `$i+1`,
+    /// `None` where no use decides it.
     pub(crate) fn param_types(&self) -> Vec<Option<&'static str>> {
-        self.params.clone()
+        self.params.iter().map(|ty| ty.as_ref().map(spelling)).collect()
     }
 
     /// Run one execution under `params`, handing `body` each page as it is
@@ -329,10 +334,6 @@ impl GqlPlan {
                 params.len()
             )));
         }
-        let mut values: Vec<BindingValue> = params.iter().map(convert::from_param).collect();
-        for &at in &self.lists {
-            values[at] = convert::list_param(&params[at], at + 1)?;
-        }
         for &at in &self.counts {
             if !matches!(params[at], Param::Int(n) if n >= 0) {
                 return Err(SqlError::Parameter(format!(
@@ -342,6 +343,14 @@ impl GqlPlan {
                 )));
             }
         }
+        let values = params
+            .iter()
+            .enumerate()
+            .map(|(at, param)| match self.params.get(at) {
+                Some(Some(ty)) => types::typed_param(param, ty, at + 1),
+                _ => Ok(convert::from_param(param)),
+            })
+            .collect::<SqlResult2<Vec<BindingValue>>>()?;
         let fresh;
         let root = match &self.root {
             Some(root) => root,
@@ -544,9 +553,8 @@ pub(super) struct Planner<'a> {
     pub(super) params: usize,
     /// What the statement's uses of each `$n` say about its type.
     pub(super) uses: Vec<ParamUse>,
-    /// The `$n` (zero-based) read as `OFFSET`/`LIMIT` counts, and as lists.
+    /// The `$n` (zero-based) read as `OFFSET`/`LIMIT` counts.
     pub(super) counts: Vec<usize>,
-    pub(super) lists: Vec<usize>,
     /// The stages planned so far.
     pub(super) stages: Vec<StageView>,
     /// True once a pattern has an edge, so the graph argument is read.

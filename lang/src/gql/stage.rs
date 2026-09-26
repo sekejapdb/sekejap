@@ -37,29 +37,59 @@
 //! already bound). A variable the `RETURN` did not carry is out of scope,
 //! and naming it is an error that names the stage that dropped it
 //! (rule 4). A later stage's aggregate folds the whole incoming table.
+//!
+//! **The outer `SELECT`** over the relation (design §5.5) is ONE MORE
+//! STAGE, planned after the body's last: its scope is the relation's
+//! columns, its `WHERE` a `Filter` over them -- after the search, never
+//! pushed into it (brief §8.3) -- and the rest a `RETURN` with PostgreSQL's
+//! meaning: `*` is every column, a whole-number `GROUP BY` or `ORDER BY` key
+//! is the select-list item at that position, and an aggregate without
+//! `GROUP BY` folds the whole relation into one group rather than grouping
+//! by the other items. The body's last stage then names each column once
+//! and returns values only, since a relation's columns are what SQL reads.
 
-use super::ast::{AggFunc, Count, Expr, Pipeline, Return, ReturnItem, Stage, Statement};
-use super::bind::{bind_match, column_name};
+use super::ast::{
+    AggFunc, Count, Expr, Literal, Outer, Pipeline, Return, ReturnItem, Stage, Statement,
+};
+use super::bind::{bind_match, column_name, outer_column_name};
 use super::convert;
 use super::expr::{is_group, Ex, Lowering};
 use super::horizontal::Horizontal;
 use super::plan::{FilterAt, Op, Planner};
 use super::schema::{BindingSchema, Name, Provenance, SlotInfo};
 use super::types::{aggregate_type, described, spelling};
-use crate::sqlstate::{DATATYPE_MISMATCH, UNDEFINED_COLUMN};
+use crate::sqlstate::{DATATYPE_MISMATCH, INVALID_COLUMN_REFERENCE, UNDEFINED_COLUMN};
 use crate::{SqlError, SqlResult2};
 use sekejap_core::collections::gql::{
     AggSpec, CountExpr, ExprId, OpSpec, SlotId, SortKey, ValueType,
 };
 
 /// One stage as `EXPLAIN` shows it: its slots, where its operators start in
-/// the plan's list, and the names of the columns its `RETURN` projects
-/// (`None` for a hidden sort column).
+/// the plan's list, the names of the columns its `RETURN` projects (`None`
+/// for a hidden sort column), and whether it is the outer `SELECT`.
 #[derive(Clone, Debug)]
 pub(crate) struct StageView {
     pub(crate) schema: BindingSchema,
     pub(crate) first_op: usize,
     pub(crate) columns: Vec<Option<Name>>,
+    pub(crate) outer: bool,
+}
+
+/// A stage of the plan: one of the body, or the outer `SELECT`.
+enum Part<'p> {
+    Stage(&'p Stage),
+    Outer(&'p Outer),
+}
+
+/// What reads a stage's `RETURN`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reader {
+    /// The next stage of the body, through `NEXT`.
+    Next,
+    /// The outer `SELECT`, as the relation's columns.
+    Outer,
+    /// The caller: the statement's answer.
+    Caller,
 }
 
 /// An operator of the working-table grammar, as the planner holds it; each
@@ -207,33 +237,63 @@ struct Item<'r> {
 }
 
 impl Planner<'_> {
-    /// Bind and plan every stage of `pipeline`, in order.
+    /// Bind and plan every stage of `pipeline`, in order, then the outer
+    /// `SELECT` over it, if one is written.
     pub(crate) fn pipeline(
         &mut self,
         pipeline: &Pipeline,
+        outer: Option<&Outer>,
         notices: &mut Vec<String>,
     ) -> SqlResult2<Output> {
-        let last = pipeline.stages.len();
+        let parts: Vec<Part<'_>> = pipeline
+            .stages
+            .iter()
+            .map(Part::Stage)
+            .chain(outer.map(Part::Outer))
+            .collect();
         let mut input = BindingSchema::default();
         // The `Project` whose width is the NEXT stage's, fixed once that
         // stage has bound all its statements.
         let mut boundary: Option<usize> = None;
         let mut output = None;
-        for (at, stage) in pipeline.stages.iter().enumerate() {
+        for (at, part) in parts.iter().enumerate() {
             let number = u16::try_from(at + 1)
                 .map_err(|_| SqlError::unsupported("a GQL body of more than 65,535 stages"))?;
             self.schema = input;
             self.bound = (0..self.schema.width()).map(|i| SlotId(i as u16)).collect();
             let first_op = self.ops.len();
-            self.statements(stage, number, notices)?;
+            let select;
+            let mut having: Option<&Expr> = None;
+            let ret = match part {
+                Part::Stage(stage) => {
+                    self.statements(stage, number, notices)?;
+                    &stage.ret
+                }
+                Part::Outer(outer) => {
+                    if let Some(predicate) = &outer.where_ {
+                        let ex = self.lower(predicate, Horizontal::Refused, None, Role::Predicate)?;
+                        self.filter(vec![ex], FilterAt::Outer);
+                    }
+                    having = outer.having.as_ref();
+                    select = self.outer_select(&outer.select, having)?;
+                    &select
+                }
+            };
             if let Some(project) = boundary.take() {
                 self.set_width(project, self.schema.row_width());
             }
-            let (next, project, columns, out) = self.ret(&stage.ret, number, at + 1 == last)?;
+            let reader = match parts.get(at + 1) {
+                None => Reader::Caller,
+                Some(Part::Outer(_)) => Reader::Outer,
+                Some(Part::Stage(_)) => Reader::Next,
+            };
+            let is_outer = matches!(part, Part::Outer(_));
+            let (next, project, columns, out) = self.ret(ret, number, reader, is_outer, having)?;
             self.stages.push(StageView {
                 schema: self.schema.clone(),
                 first_op,
                 columns,
+                outer: matches!(part, Part::Outer(_)),
             });
             boundary = Some(project);
             input = next;
@@ -388,7 +448,7 @@ impl Planner<'_> {
         let ex = self.lower(list, Horizontal::Refused, None, Role::Value)?;
         let elem = match &ex {
             Ex::Param(at) => {
-                self.lists.push(*at);
+                self.note_list(*at, ValueType::Unknown, format!("FOR {var} IN {list}"))?;
                 ValueType::Unknown
             }
             _ => match self.slot_type(&ex)? {
@@ -416,14 +476,76 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// Plan a `RETURN`. Answers the next stage's input schema, the index of
-    /// the `Project` (whose width the next stage fixes), the projected
-    /// columns' names, and the columns of the answer if this stage is last.
+    /// The outer `SELECT` as its stage's `RETURN`, with PostgreSQL's
+    /// meaning: `*` is every column of the relation; a whole-number key of
+    /// `GROUP BY` or `ORDER BY` is the select-list item at that position
+    /// (`42P10` past the list); and an aggregate without `GROUP BY` --
+    /// anywhere in the items, the `ORDER BY` or `having` -- folds the whole
+    /// relation into one group, so a column beside it must be grouped
+    /// (`42803`), never grouped by implicitly. A `having` with no aggregate
+    /// of its own still forces that one group: PostgreSQL's `HAVING` alone
+    /// makes a query grouped.
+    fn outer_select(&self, select: &Return, having: Option<&Expr>) -> SqlResult2<Return> {
+        let mut select = select.clone();
+        if select.star {
+            select.star = false;
+            select.items = self
+                .schema
+                .names()
+                .map(|name| ReturnItem {
+                    expr: Expr::Var(name.clone()),
+                    alias: None,
+                })
+                .collect();
+        }
+        let items = select.items.clone();
+        let positional = |expr: &mut Expr, clause: &str| -> SqlResult2<()> {
+            let Expr::Literal(Literal::Num(n, true)) = expr else {
+                return Ok(());
+            };
+            let item = (*n >= 1.0)
+                .then(|| items.get(*n as usize - 1))
+                .flatten()
+                .ok_or_else(|| {
+                    SqlError::coded(
+                        INVALID_COLUMN_REFERENCE,
+                        format!("{clause} position {n} is not in select list"),
+                    )
+                })?;
+            *expr = item.expr.clone();
+            Ok(())
+        };
+        for key in select.group_by.iter_mut().flatten() {
+            positional(key, "GROUP BY")?;
+        }
+        for key in &mut select.order_by {
+            positional(&mut key.expr, "ORDER BY")?;
+        }
+        let aggregates = select.items.iter().map(|item| &item.expr).chain(select.order_by.iter().map(|key| &key.expr));
+        let forces_one_group = having.is_some() || aggregates.into_iter().any(Expr::has_aggregate);
+        if select.group_by.is_none() && forces_one_group {
+            select.group_by = Some(Vec::new());
+        }
+        Ok(select)
+    }
+
+    /// Plan a `RETURN` that `reader` reads. Answers the next stage's input
+    /// schema, the index of the `Project` (whose width the next stage
+    /// fixes), the projected columns' names, and the columns of the answer
+    /// if the caller reads it. `having` is the outer `SELECT`'s `HAVING`
+    /// (`None` for a body stage, which has none); `outer` is whether THIS
+    /// `RETURN` is the outer `SELECT`'s own (brief M3-D2 gap 3 -- its
+    /// naming rule is PostgreSQL's own, unlike a body stage's, and it is a
+    /// property of which `RETURN` this is, not of who reads it: the body's
+    /// LAST stage is read BY the outer SELECT, `reader == Reader::Outer`,
+    /// but keeps its own body naming).
     fn ret(
         &mut self,
         ret: &Return,
         number: u16,
-        last: bool,
+        reader: Reader,
+        outer: bool,
+        having: Option<&Expr>,
     ) -> SqlResult2<(BindingSchema, usize, Vec<Option<Name>>, Output)> {
         // `RETURN *`: every variable in scope, in slot order.
         let starred: Vec<ReturnItem> = if ret.star {
@@ -439,18 +561,32 @@ impl Planner<'_> {
         };
         let written = if ret.star { &starred } else { &ret.items };
         let mut items: Vec<Item<'_>> = Vec::new();
+        let next = match reader {
+            Reader::Next => "the next stage",
+            Reader::Outer => "the outer SELECT",
+            Reader::Caller => "",
+        };
         for item in written {
-            let name = item.alias.clone().unwrap_or_else(|| column_name(&item.expr));
-            if !last {
+            let name = item.alias.clone().unwrap_or_else(|| {
+                if outer {
+                    // PostgreSQL's own rule for a plain SELECT list, brief
+                    // M3-D2 gap 3 -- the body's own RETURN keeps
+                    // `column_name`'s rule, unchanged.
+                    outer_column_name(&item.expr)
+                } else {
+                    column_name(&item.expr)
+                }
+            });
+            if reader != Reader::Caller {
                 if item.alias.is_none() && !matches!(item.expr, Expr::Var(_) | Expr::Property { .. }) {
                     return Err(SqlError::unsupported(format!(
-                        "stage {number} returns `{}` without a name: a column the next stage reads is named, `{} AS name`",
+                        "stage {number} returns `{}` without a name: a column {next} reads is named, `{} AS name`",
                         item.expr, item.expr
                     )));
                 }
                 if items.iter().any(|seen| seen.name.as_ref() == Some(&name)) {
                     return Err(SqlError::unsupported(format!(
-                        "stage {number} returns two columns named `{name}`: the next stage names each column once; alias one (`AS other_name`)"
+                        "stage {number} returns two columns named `{name}`: {next} names each column once; alias one (`AS other_name`)"
                     )));
                 }
             }
@@ -485,15 +621,25 @@ impl Planner<'_> {
         let grouped = ret.group_by.is_some() || items.iter().any(|item| item.expr.has_aggregate());
         // The projection, from the stage's row or from the grouped row.
         let (stage_schema, computed, display) = if grouped {
-            let (post, computed, display) = self.aggregate(ret, &items[..visible], &items, number)?;
-            (Some(std::mem::replace(&mut self.schema, post)), Some(computed), Some(display))
+            let (post, computed, display) = self.aggregate(ret, &items[..visible], &items, having, number)?;
+            let stage_schema = std::mem::replace(&mut self.schema, post);
+            // `HAVING`: a `Filter` right after the `Aggregate`, over the
+            // finished group -- reading only its keys and its aggregates,
+            // via the same `computed` map the items below read (brief
+            // M3-D2 gap 2). Anything else is PostgreSQL's `42803`
+            // (`Lowering::resolve`, `expr.rs`).
+            if let Some(having) = having {
+                let ex = self.lower(having, Horizontal::Refused, Some(computed.as_slice()), Role::Predicate)?;
+                self.filter(vec![ex], FilterAt::Having);
+            }
+            (Some(stage_schema), Some(computed), Some(display))
         } else {
             (None, None, None)
         };
         let mut lowered = Vec::with_capacity(items.len());
         for (at, item) in items.iter().enumerate() {
             let ex = match &item.name {
-                Some(name) if last && at < visible => {
+                Some(name) if reader != Reader::Next && at < visible => {
                     let ex = self.lower(item.expr, Horizontal::Refused, computed.as_deref(), Role::Column(name))?;
                     self.final_column(&ex, name)?;
                     ex
@@ -538,8 +684,8 @@ impl Planner<'_> {
             self.sort(ret, &order, &next)?;
         }
         if ret.offset.is_some() || ret.limit.is_some() {
-            let offset = ret.offset.map(|c| self.count(c)).transpose()?;
-            let limit = ret.limit.map(|c| self.count(c)).transpose()?;
+            let offset = ret.offset.map(|c| self.count(c, "OFFSET")).transpose()?;
+            let limit = ret.limit.map(|c| self.count(c, "LIMIT")).transpose()?;
             self.ops.push(Op::Table(TableOp::Page { offset, limit }));
         }
         // What the next stage cannot see any more.
@@ -563,12 +709,16 @@ impl Planner<'_> {
     /// A grouped `RETURN`: the `Aggregate` operator, the schema of the row
     /// it produces, the keys and aggregates as written, each with its slot
     /// of that row, for the items to be bound against, and that schema with
-    /// each slot named by what it holds, for `EXPLAIN`.
+    /// each slot named by what it holds, for `EXPLAIN`. `having` (the outer
+    /// `SELECT`'s only, `None` for a body stage) is scanned for its own
+    /// aggregates too, so a `HAVING` that names one the select list did not
+    /// return still gets a slot of the grouped row.
     fn aggregate(
         &mut self,
         ret: &Return,
         returned: &[Item<'_>],
         items: &[Item<'_>],
+        having: Option<&Expr>,
         number: u16,
     ) -> SqlResult2<(BindingSchema, Vec<(Expr, SlotId)>, BindingSchema)> {
         let mut keys: Vec<&Expr> = Vec::new();
@@ -593,6 +743,9 @@ impl Planner<'_> {
         let mut aggregates: Vec<&Expr> = Vec::new();
         for item in items {
             collect_aggregates(item.expr, &mut aggregates);
+        }
+        if let Some(having) = having {
+            collect_aggregates(having, &mut aggregates);
         }
         let mut post = BindingSchema::default();
         let mut display = BindingSchema::default();
@@ -783,7 +936,7 @@ impl Planner<'_> {
     }
 
     /// An `OFFSET` or `LIMIT` count, its `$n` noted as a count.
-    fn count(&mut self, count: Count) -> SqlResult2<CountExpr> {
+    fn count(&mut self, count: Count, clause: &str) -> SqlResult2<CountExpr> {
         Ok(match count {
             Count::Lit(n) => CountExpr::Lit(n),
             Count::Param(n) => {
@@ -791,7 +944,7 @@ impl Planner<'_> {
                     SqlError::Parameter("parameters are numbered from $1".into())
                 })?;
                 self.params = self.params.max(n);
-                self.note_count(at);
+                self.note_count(at, clause)?;
                 CountExpr::Param(at)
             }
         })

@@ -71,6 +71,28 @@ pub(super) fn raise(sqlstate: &'static str, message: impl fmt::Display) -> Fault
     Fault::Sql(SqlError::coded(sqlstate, message))
 }
 
+/// `value = ANY(items)`: true on a match, unknown when none matched and a
+/// comparison was unknown, false otherwise. Stops at the first match, so a
+/// later item is never evaluated.
+fn any_equal(
+    value: &BindingValue,
+    items: impl IntoIterator<Item = Evaluated<BindingValue>>,
+) -> Evaluated<BindingValue> {
+    let mut unknown = false;
+    for item in items {
+        match compare(CmpOp::Eq, value, &item?)? {
+            BindingValue::Bool(true) => return Ok(BindingValue::Bool(true)),
+            BindingValue::Null => unknown = true,
+            _ => {}
+        }
+    }
+    Ok(if unknown {
+        BindingValue::Null
+    } else {
+        BindingValue::Bool(false)
+    })
+}
+
 /// A value of a kind the operation does not take: `42804`.
 pub(super) fn mismatch(message: impl fmt::Display) -> Fault {
     raise(DATATYPE_MISMATCH, message)
@@ -217,20 +239,27 @@ impl Program {
                 if is_null(&value) {
                     return Ok(BindingValue::Null);
                 }
-                let mut unknown = false;
-                for member in list {
-                    match compare(CmpOp::Eq, &value, &self.value(member, row, cx)?)? {
-                        BindingValue::Bool(true) => return Ok(BindingValue::Bool(true)),
-                        BindingValue::Null => unknown = true,
-                        _ => {}
-                    }
-                }
-                if unknown {
-                    BindingValue::Null
-                } else {
-                    BindingValue::Bool(false)
-                }
+                any_equal(&value, list.iter().map(|member| self.value(member, row, cx)))?
             }
+            // `x = ANY(list)`: no element is false even for a NULL `x`, and
+            // a NULL list is unknown.
+            Ex::Member(value, list) => match self.value(list, row, cx)? {
+                BindingValue::Null => BindingValue::Null,
+                BindingValue::List(list) if list.items.is_empty() => BindingValue::Bool(false),
+                BindingValue::List(list) => {
+                    let value = self.value(value, row, cx)?;
+                    if is_null(&value) {
+                        return Ok(BindingValue::Null);
+                    }
+                    any_equal(&value, list.items.iter().cloned().map(Ok))?
+                }
+                other => {
+                    return Err(mismatch(format!(
+                        "IN takes a list here, not {}",
+                        types::described(&types::value_type(&other))
+                    )))
+                }
+            },
             Ex::Case {
                 operand,
                 branches,

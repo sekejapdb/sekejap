@@ -167,7 +167,7 @@ impl Compiler<'_> {
         }
         let Source::Table(table) = &statement.source else {
             return Err(SqlError::unsupported(
-                "an aggregate over GRAPH_TABLE or FROM ALL: the aggregate atomic folds the candidates of ONE collection's plan; a GQL relation's rows are already RETURNed by its own stage, and folding them again in an outer SELECT is GQL profile M3-D (design §5.5)",
+                "an aggregate over FROM ALL: the aggregate atomic folds the candidates of ONE collection's plan",
             ));
         };
         let c = collection(self.db, table)?;

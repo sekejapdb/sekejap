@@ -101,6 +101,10 @@ pub(super) struct Parser {
     /// the length of a GQL body inside `GRAPH_TABLE`, so no word changes
     /// meaning in plain SQL (`docs/lang/GQL_PROFILE_DESIGN.md` §5.3).
     pub(crate) dialect: Dialect,
+    /// The alias of the GQL relation an outer `SELECT` reads, while that
+    /// SELECT's expressions are parsed: `alias.column` names a column of
+    /// the relation (design §5.5).
+    pub(crate) relation: Option<crate::gql::schema::Name>,
 }
 
 /// The language the cursor is in.
@@ -156,6 +160,7 @@ pub(super) fn parse(text: &str) -> SqlResult2<Stmt> {
         last_geo_cast: None,
         last_geo_srid: false,
         dialect: Dialect::Sql,
+        relation: None,
     };
     let statement = parser.statement()?;
     parser.eat(&Tok::Semicolon);
@@ -194,11 +199,11 @@ impl Parser {
     /// The cursor, so a decision that turns out not to hold can be undone.
     /// Used by the two DML statements that have to LOOK at their `WHERE`
     /// before they know which atomic they are.
-    fn mark(&self) -> usize {
+    pub(crate) fn mark(&self) -> usize {
         self.at
     }
 
-    fn reset(&mut self, mark: usize) {
+    pub(crate) fn reset(&mut self, mark: usize) {
         self.at = mark;
     }
 
@@ -481,6 +486,9 @@ impl Parser {
                 if let Some(items) = self.session_select()? {
                     return Ok(Stmt::SessionRows(items));
                 }
+                if let Some(from) = self.gql_relation_ahead() {
+                    return Ok(Stmt::Gql(Box::new(self.gql_select(from)?)));
+                }
                 Ok(Stmt::Select(Box::new(self.select()?)))
             }
             "SHOW" => self.show(),
@@ -530,6 +538,9 @@ impl Parser {
                             ))
                         }
                     });
+                }
+                if let Some(from) = self.gql_relation_ahead() {
+                    return Ok(Stmt::ExplainGql(Box::new(self.gql_select(from)?)));
                 }
                 Ok(Stmt::Explain(Box::new(self.select()?)))
             }

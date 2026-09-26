@@ -304,8 +304,8 @@ fn optional_evidence_preserves_a_topic_without_evidence_brief_9_6() {
 // ── after NEXT, and counting ───────────────────────────────────────────────
 
 /// Brief §9.2 as written, apart from the invented names and the outer
-/// `ORDER BY`, which is written in the last `RETURN` until the outer SELECT
-/// over a GQL relation is built (M3-D).
+/// `ORDER BY`, which is written in the last `RETURN` here; the outer SELECT
+/// over a GQL relation (M3-D, `gql_prepared.rs`) orders the same way.
 fn collaborators() -> &'static str {
     "base \
      MATCH (band IS band WHERE band._key = $1) \

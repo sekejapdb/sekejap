@@ -3,6 +3,30 @@ use super::*;
 impl Parser {
     // ── SELECT ───────────────────────────────────────────────────────────
 
+    /// With the cursor on `SELECT`: how far ahead the statement's `FROM`
+    /// stands when it reads a GQL relation -- the first `FROM` outside any
+    /// parentheses, followed by `GRAPH_TABLE` -- and `None` for any other
+    /// statement. Decided BEFORE the select list is read, because over a
+    /// GQL relation that list is GQL (`docs/lang/GQL_PROFILE_DESIGN.md`
+    /// §5.5), and a collection SELECT keeps its own grammar unchanged.
+    pub(super) fn gql_relation_ahead(&self) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut ahead = 1;
+        loop {
+            match self.peek_at(ahead) {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth = depth.checked_sub(1)?,
+                Tok::Eof | Tok::Semicolon => return None,
+                _ if depth == 0 && self.word_at(ahead).as_deref() == Some("FROM") => {
+                    return (self.word_at(ahead + 1).as_deref() == Some("GRAPH_TABLE"))
+                        .then_some(ahead);
+                }
+                _ => {}
+            }
+            ahead += 1;
+        }
+    }
+
     pub(super) fn select(&mut self) -> SqlResult2<SelectStmt> {
         self.expect_word("SELECT")?;
         // `SELECT DISTINCT col` is a group with no accumulators -- the same
@@ -34,12 +58,9 @@ impl Parser {
             }
         }
         self.expect_word("FROM")?;
-        let source = if self.word().as_deref() == Some("GRAPH_TABLE") {
-            // A `GRAPH_TABLE (...)` body is parsed as GQL only (owner
-            // decision 1, M2-E): the SQL/PGQ `COLUMNS (...)` body has no
-            // compatibility alias.
-            Source::Gql(Box::new(self.gql_graph_table()?))
-        } else if self.word().as_deref() == Some("ALL") && !matches!(self.peek_at(1), Tok::Dot) {
+        // A `FROM GRAPH_TABLE` never reaches here: `gql_relation_ahead`
+        // sends the statement to the GQL relation's own SELECT.
+        let source = if self.word().as_deref() == Some("ALL") && !matches!(self.peek_at(1), Tok::Dot) {
             self.bump();
             Source::All
         } else {

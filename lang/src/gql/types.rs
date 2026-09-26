@@ -15,7 +15,14 @@
 //!   list values and a `$n` bound as a list are typed by the same rule
 //!   ([`shared`]);
 //! * [`aggregate_type`] types an aggregate and refuses one over an element,
-//!   for the vertical and the horizontal aggregates alike.
+//!   for the vertical and the horizontal aggregates alike;
+//! * the statement's ONE parameter table (design §7): each `$n` gets the
+//!   type every use that decides one agrees on -- the outer SELECT's, every
+//!   stage's and every inline predicate's alike -- and two uses that
+//!   disagree are PostgreSQL's `42P08` at prepare, naming both
+//!   ([`Planner::note_params`], [`Planner::param_types`]); and each value
+//!   bound to a typed `$n` is checked against that type when an execution
+//!   opens ([`typed_param`]).
 
 use super::ast::{AggFunc, ArithOp, CastType, Func};
 use super::convert;
@@ -23,8 +30,8 @@ use super::elements;
 use super::expr::Ex;
 use super::plan::{show, Planner};
 use crate::functions::is_time_type;
-use crate::sqlstate::DATATYPE_MISMATCH;
-use crate::{SqlError, SqlResult2};
+use crate::sqlstate::{AMBIGUOUS_PARAMETER, DATATYPE_MISMATCH};
+use crate::{Param, SqlError, SqlResult2};
 use sekejap_core::collections::gql::{BindingValue, ListRef, SlotId, ValueType};
 use sekejap_core::Kind;
 
@@ -48,6 +55,25 @@ impl Planner<'_> {
             // An edge's bag declares nothing.
             Ex::EdgeProperty(..) | Ex::Concat(..) => ValueType::Text,
             Ex::Compare(..) | Ex::Not(_) | Ex::And(..) | Ex::Or(..) | Ex::IsNull(_) | Ex::In(..) => {
+                ValueType::Bool
+            }
+            // A `$n` list is converted when an execution opens; any other
+            // list operand is a list value.
+            Ex::Member(_, list) => {
+                if !matches!(**list, Ex::Param(_)) {
+                    let ty = self.slot_type(list)?;
+                    if !matches!(ty, ValueType::List(_) | ValueType::Unknown) {
+                        return Err(SqlError::coded(
+                            DATATYPE_MISMATCH,
+                            format!(
+                                "{}: `{}` is {}, not a list; a list of values is written `IN (a, b)`",
+                                show(ex, &self.schema),
+                                show(list, &self.schema),
+                                described(&ty)
+                            ),
+                        ));
+                    }
+                }
                 ValueType::Bool
             }
             Ex::Cast(_, to) => cast_type(*to),
@@ -174,7 +200,7 @@ impl Planner<'_> {
     /// aggregate `ex` holds, refusing a mixed-kind list, an argument of the
     /// wrong kind and a fold of elements when the statement is compiled.
     pub(super) fn typed(&self, ex: &Ex) -> SqlResult2<()> {
-        if matches!(ex, Ex::Graph(..) | Ex::List(_) | Ex::Fold(_)) {
+        if matches!(ex, Ex::Graph(..) | Ex::List(_) | Ex::Fold(_) | Ex::Member(..)) {
             self.slot_type(ex)?;
         }
         for child in ex.children() {
@@ -183,48 +209,91 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// Record what `ex` says about the type of each `$n` it reads: `$n`
-    /// against a property whose type is declared alike in every label
-    /// collection takes that type; any other use leaves it undecided, and
-    /// so do two uses that disagree. `ex` is bound against `self.schema`.
+    /// Record in the parameter table what `ex` says about each `$n` it
+    /// reads. `$n` compared with a value whose type is decided -- a
+    /// property its label collections all declare alike, or a column or
+    /// variable of a decided type -- takes that type; `x IN $n` makes `$n` a
+    /// list of `x`'s type; any other use accepts the type the others
+    /// decide. `ex` is bound against `self.schema`.
     ///
     /// Every lowered expression passes here, so this is also where the
     /// kinds M4-D decides at compile are checked ([`Planner::typed`]).
     pub(super) fn note_params(&mut self, ex: &Ex) -> SqlResult2<()> {
         self.typed(ex)?;
-        let mut uses = std::mem::take(&mut self.uses);
-        uses.resize(self.params.max(uses.len()), ParamUse::Unused);
-        let noted = self.param_uses(ex, &mut uses);
-        self.uses = uses;
-        noted
+        let mut uses = Vec::new();
+        self.param_uses(ex, &mut uses)?;
+        for (at, used) in uses {
+            self.deduce(at, used)?;
+        }
+        Ok(())
     }
 
-    /// `$at+1` is an `OFFSET` or `LIMIT` count: a `BIGINT`.
-    pub(super) fn note_count(&mut self, at: usize) {
-        self.uses.resize(self.params.max(self.uses.len()), ParamUse::Unused);
-        self.uses[at] = take_use(&mut self.uses[at]).and(ParamUse::Typed(ValueType::Int));
+    /// `$at+1` is the count of `clause` (`OFFSET` or `LIMIT`): a `BIGINT`,
+    /// checked from 0 to `i64::MAX` when an execution opens (Q13).
+    pub(super) fn note_count(&mut self, at: usize, clause: &str) -> SqlResult2<()> {
+        self.deduce(
+            at,
+            ParamUse::Typed {
+                ty: ValueType::Int,
+                at: format!("{clause} ${}", at + 1),
+            },
+        )?;
         if !self.counts.contains(&at) {
             self.counts.push(at);
         }
+        Ok(())
     }
 
-    fn param_uses(&self, ex: &Ex, uses: &mut [ParamUse]) -> SqlResult2<()> {
+    /// `$at+1` is read as a list of `elem` where `written` says.
+    pub(super) fn note_list(&mut self, at: usize, elem: ValueType, written: String) -> SqlResult2<()> {
+        self.deduce(
+            at,
+            ParamUse::Typed {
+                ty: ValueType::List(Box::new(elem)),
+                at: written,
+            },
+        )
+    }
+
+    /// Combine a use of `$at+1` with the uses before it.
+    fn deduce(&mut self, at: usize, used: ParamUse) -> SqlResult2<()> {
+        if self.uses.len() <= at {
+            self.uses.resize(at + 1, ParamUse::Unused);
+        }
+        let before = std::mem::replace(&mut self.uses[at], ParamUse::Unused);
+        self.uses[at] = before.and(used, at + 1)?;
+        Ok(())
+    }
+
+    fn param_uses(&self, ex: &Ex, uses: &mut Vec<(usize, ParamUse)>) -> SqlResult2<()> {
+        let typed = |ty: Option<ValueType>| match ty {
+            Some(ty) => ParamUse::Typed {
+                ty,
+                at: show(ex, &self.schema),
+            },
+            None => ParamUse::Undecided,
+        };
         match ex {
-            Ex::Param(at) => uses[*at] = take_use(&mut uses[*at]).and(ParamUse::Undecided),
+            Ex::Param(at) => uses.push((*at, ParamUse::Undecided)),
             Ex::Compare(_, left, right) => match (&**left, &**right) {
-                (Ex::Param(at), Ex::NodeProperty(slot, field))
-                | (Ex::NodeProperty(slot, field), Ex::Param(at)) => {
-                    let typed = match self.property_type(*slot, field)? {
-                        Some(
-                            ty @ (ValueType::Text | ValueType::Int | ValueType::Float | ValueType::Bool),
-                        ) => ParamUse::Typed(ty),
-                        _ => ParamUse::Undecided,
-                    };
-                    uses[*at] = take_use(&mut uses[*at]).and(typed);
+                (Ex::Param(at), other) | (other, Ex::Param(at)) if !matches!(other, Ex::Param(_)) => {
+                    uses.push((*at, typed(self.decided(other)?)));
+                    self.param_uses(other, uses)?;
                 }
                 _ => {
                     self.param_uses(left, uses)?;
                     self.param_uses(right, uses)?;
+                }
+            },
+            Ex::Member(value, list) => match &**list {
+                Ex::Param(at) => {
+                    let elem = self.decided(value)?.unwrap_or(ValueType::Unknown);
+                    uses.push((*at, typed(Some(ValueType::List(Box::new(elem))))));
+                    self.param_uses(value, uses)?;
+                }
+                _ => {
+                    self.param_uses(value, uses)?;
+                    self.param_uses(list, uses)?;
                 }
             },
             // Every other expression decides nothing about a `$n` itself;
@@ -238,14 +307,30 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// The SQL type each `$n` is compared as: entry `i` is `$i+1`, `None`
-    /// where no comparison decides it or two disagree.
-    pub(super) fn param_types(&mut self) -> Vec<Option<&'static str>> {
+    /// The type a value compared with a `$n` decides for it: a node
+    /// property's declared type, or a column's or variable's type -- but
+    /// not `TEXT`, which may stand for an undeclared property (Q8) whose
+    /// stored values are of any kind -- when it is a scalar a parameter
+    /// binds (`TEXT`, `BIGINT`, `DOUBLE PRECISION`, `BOOLEAN`).
+    fn decided(&self, ex: &Ex) -> SqlResult2<Option<ValueType>> {
+        let ty = match ex {
+            Ex::NodeProperty(slot, field) => self.property_type(*slot, field)?,
+            Ex::Slot(slot) => Some(self.schema.slot(*slot).ty.clone()).filter(|ty| *ty != ValueType::Text),
+            _ => None,
+        };
+        Ok(ty.filter(|ty| {
+            matches!(ty, ValueType::Text | ValueType::Int | ValueType::Float | ValueType::Bool)
+        }))
+    }
+
+    /// The type the statement gives each `$n`: entry `i` is `$i+1`, `None`
+    /// where no use decides it.
+    pub(super) fn param_types(&mut self) -> Vec<Option<ValueType>> {
         let mut uses = std::mem::take(&mut self.uses);
         uses.resize(self.params, ParamUse::Unused);
         uses.into_iter()
             .map(|u| match u {
-                ParamUse::Typed(ty) => Some(spelling(&ty)),
+                ParamUse::Typed { ty, .. } => Some(ty),
                 _ => None,
             })
             .collect()
@@ -339,6 +424,28 @@ pub(super) fn list_of(mut items: Vec<BindingValue>) -> Result<BindingValue, (Val
     }))
 }
 
+/// A bound `$n` the statement gives type `ty`, checked against it: `NULL`
+/// is a value of every type; an integer is also a `DOUBLE PRECISION`; a
+/// list is read by [`list_param`]; any other kind is refused naming `$n`.
+pub(super) fn typed_param(param: &Param, ty: &ValueType, n: usize) -> SqlResult2<BindingValue> {
+    let fits = match (ty, param) {
+        (ValueType::List(_), _) => return convert::list_param(param, n),
+        (_, Param::Null)
+        | (ValueType::Text, Param::Text(_))
+        | (ValueType::Int, Param::Int(_))
+        | (ValueType::Float, Param::Int(_) | Param::Float(_))
+        | (ValueType::Bool, Param::Bool(_)) => true,
+        _ => false,
+    };
+    if !fits {
+        return Err(SqlError::Parameter(format!(
+            "${n} is {}, from where the statement uses it, not {param:?}",
+            spelling(ty)
+        )));
+    }
+    Ok(convert::from_param(param))
+}
+
 /// Two label (or edge type) sets as one; empty, meaning any, absorbs.
 fn union<T: Copy + PartialEq>(a: &[T], b: &[T]) -> Box<[T]> {
     if a.is_empty() || b.is_empty() {
@@ -409,25 +516,49 @@ pub(super) fn spelling(ty: &ValueType) -> &'static str {
     }
 }
 
-/// What the comparisons of a statement say about one `$n`.
+/// What the uses of a statement so far say about one `$n`.
 #[derive(Clone, PartialEq)]
 pub(super) enum ParamUse {
     Unused,
-    Typed(ValueType),
+    /// Read only where any type is taken.
     Undecided,
-}
-
-/// A `$n`'s use so far, taken out to be combined with the next.
-fn take_use(slot: &mut ParamUse) -> ParamUse {
-    std::mem::replace(slot, ParamUse::Unused)
+    /// Of type `ty`, as the use written `at` first decided.
+    Typed { ty: ValueType, at: String },
 }
 
 impl ParamUse {
-    fn and(self, other: Self) -> Self {
-        match (self, other) {
+    /// This use and `other`, of `$n`: one type, or PostgreSQL's `42P08`
+    /// naming the two uses that disagree.
+    fn and(self, other: Self, n: usize) -> SqlResult2<Self> {
+        Ok(match (self, other) {
             (Self::Unused, next) | (next, Self::Unused) => next,
-            (Self::Typed(a), Self::Typed(b)) if a == b => Self::Typed(a),
-            _ => Self::Undecided,
-        }
+            (Self::Undecided, next) | (next, Self::Undecided) => next,
+            (Self::Typed { ty: a, at: first }, Self::Typed { ty: b, at: second }) => {
+                match agree(a, b) {
+                    Ok(ty) => Self::Typed { ty, at: first },
+                    Err((a, b)) => {
+                        return Err(SqlError::coded(
+                            AMBIGUOUS_PARAMETER,
+                            format!(
+                                "inconsistent types deduced for parameter ${n}: {} in `{first}` versus {} in `{second}`; one parameter has one type in the whole statement, the outer SELECT and every stage alike",
+                                spelling(&a),
+                                spelling(&b)
+                            ),
+                        ))
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// The one type two uses of a parameter agree on: [`unify`]'s, and for two
+/// lists a list of their elements' one type.
+fn agree(a: ValueType, b: ValueType) -> Result<ValueType, (ValueType, ValueType)> {
+    match (a, b) {
+        (ValueType::List(x), ValueType::List(y)) => unify(*x, *y)
+            .map(|elem| ValueType::List(Box::new(elem)))
+            .map_err(|(x, y)| (ValueType::List(Box::new(x)), ValueType::List(Box::new(y)))),
+        (a, b) => unify(a, b),
     }
 }

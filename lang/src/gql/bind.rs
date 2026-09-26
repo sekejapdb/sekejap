@@ -147,12 +147,36 @@ pub(crate) fn bind_match(
 }
 
 /// A column's name when `RETURN` gives it none: a property is named by the
-/// property, a variable by itself, anything else as PostgreSQL names it.
+/// property, a variable by itself, anything else `?column?`. This is the
+/// body's own rule; the design never asked a body `RETURN` to follow
+/// PostgreSQL's naming (`outer_column_name` below is the outer `SELECT`'s).
 pub(crate) fn column_name(expr: &Expr) -> Name {
     match expr {
         Expr::Property { property, .. } => Name::quoted(property),
         Expr::Var(name) => name.clone(),
         _ => Name::quoted("?column?"),
+    }
+}
+
+/// The outer `SELECT`'s column name when it gives one none: PostgreSQL's
+/// own rule for a plain SQL select list, applied to the relation's columns
+/// (brief M3-D2 gap 3). An aggregate is named by its function --
+/// `count`, `sum`, `avg`, `min`, `max`, `array_agg` -- a scalar function
+/// call or a graph function by its function name, a cast by PostgreSQL's
+/// internal type name (`int8`, `float8`, ...), and `CASE`, `COALESCE` and
+/// `NULLIF` by their keyword. Everything else (an operator, a plain column
+/// or variable) falls to [`column_name`]'s rule, which is `?column?` for
+/// anything that is not a property or a variable.
+pub(crate) fn outer_column_name(expr: &Expr) -> Name {
+    match expr {
+        Expr::Aggregate { func, .. } => Name::quoted(&func.written().to_ascii_lowercase()),
+        Expr::Call { func, .. } => Name::quoted(&func.written().to_ascii_lowercase()),
+        Expr::Graph { func, .. } => Name::quoted(&func.written().to_ascii_lowercase()),
+        Expr::Cast { to, .. } => Name::quoted(to.pg_name()),
+        Expr::Case { .. } => Name::quoted("case"),
+        Expr::Coalesce(_) => Name::quoted("coalesce"),
+        Expr::Nullif(..) => Name::quoted("nullif"),
+        _ => column_name(expr),
     }
 }
 

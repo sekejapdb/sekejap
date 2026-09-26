@@ -777,11 +777,8 @@ mod tests {
     /// run before each.
     fn searches(f: &Fixture, body: &str) -> Vec<(PathAutomaton, PathSearch, Vec<&'static str>)> {
         let text = format!("SELECT * FROM GRAPH_TABLE (base {body})");
-        let ast::Stmt::Select(select) = parser::parse(&text).unwrap() else {
-            panic!("a SELECT")
-        };
-        let ast::Source::Gql(graph) = select.source else {
-            panic!("a GQL body")
+        let ast::Stmt::Gql(graph) = parser::parse(&text).unwrap() else {
+            panic!("a GQL relation")
         };
         let plan = GqlPlan::compile(&f.db, &graph, &mut Vec::new())
             .unwrap_or_else(|error| panic!("`{body}`: {error}"));

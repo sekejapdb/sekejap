@@ -29,9 +29,9 @@
 //! argument as a value; their argument kinds and result types are decided
 //! by the planner's typing (`Planner::slot_type`), with the list literals'.
 //!
-//! What the M3-D parameter table decides -- one type per `$n` across every
-//! use -- is not decided here: a parameter's value is checked where it is
-//! used, per execution.
+//! What the parameter table decides -- one type per `$n` across every use
+//! (M3-D) -- is not decided here but in `types.rs`, from the lowered
+//! expressions.
 
 use super::ast::{ArithOp, CastType, Expr, Func, GraphFunc, Literal};
 use super::convert::{self, Element};
@@ -67,6 +67,9 @@ pub(crate) enum Ex {
     IsNull(Box<Ex>),
     /// `x IN (list)`; `NOT IN` is its `Not`, as in SQL.
     In(Box<Ex>, Vec<Ex>),
+    /// `x IN list`, membership in a list value: `x = ANY(list)`; `NOT IN`
+    /// is its `Not`.
+    Member(Box<Ex>, Box<Ex>),
     /// `operand` is evaluated ONCE and compared with each `WHEN` value in
     /// the simple form; each `WHEN` is a condition in the searched form.
     Case {
@@ -137,7 +140,8 @@ impl Ex {
             | Self::Or(left, right)
             | Self::Arith(_, left, right)
             | Self::Concat(left, right)
-            | Self::Nullif(left, right) => vec![&**left, &**right],
+            | Self::Nullif(left, right)
+            | Self::Member(left, right) => vec![&**left, &**right],
             Self::Not(inner)
             | Self::Neg(inner)
             | Self::IsNull(inner)
@@ -341,6 +345,20 @@ impl Lowering<'_> {
                     members.push(member);
                 }
                 let test = Ex::In(Box::new(value), members);
+                if *negated {
+                    Ex::Not(Box::new(test))
+                } else {
+                    test
+                }
+            }
+            // Each item is compared as `=` compares, so an element is
+            // compared by identity with the elements of a list of them.
+            Expr::Member {
+                expr,
+                list,
+                negated,
+            } => {
+                let test = Ex::Member(Box::new(self.lower(expr)?), Box::new(self.value(list)?));
                 if *negated {
                     Ex::Not(Box::new(test))
                 } else {

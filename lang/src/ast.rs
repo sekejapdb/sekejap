@@ -656,11 +656,6 @@ pub(super) enum Show {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Source {
     Table(String),
-    /// `GRAPH_TABLE (<graph> ... RETURN ...)`: the GQL body
-    /// (`docs/lang/GQL_PROFILE_DESIGN.md` §5), the only body `GRAPH_TABLE`
-    /// takes (owner decision 1, M2-E: the SQL/PGQ `COLUMNS (...)` body has
-    /// no compatibility alias).
-    Gql(Box<super::gql::ast::GqlGraphTable>),
     /// `FROM ALL`: every collection of the catalog at once (QL_CONTRACT §2).
     All,
 }
@@ -814,6 +809,13 @@ pub(super) enum IndexMethod {
 pub(super) enum Stmt {
     Select(Box<SelectStmt>),
     Explain(Box<SelectStmt>),
+    /// `SELECT ... FROM GRAPH_TABLE (<graph> ... RETURN ...) ...`: a GQL
+    /// relation and the outer SELECT over it
+    /// (`docs/lang/GQL_PROFILE_DESIGN.md` §5), the only body `GRAPH_TABLE`
+    /// takes (owner decision 1, M2-E: the SQL/PGQ `COLUMNS (...)` body has
+    /// no compatibility alias).
+    Gql(Box<super::gql::ast::GqlGraphTable>),
+    ExplainGql(Box<super::gql::ast::GqlGraphTable>),
     Insert {
         table: String,
         columns: Vec<String>,

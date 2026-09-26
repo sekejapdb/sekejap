@@ -10,9 +10,10 @@
 //!
 //! Everything the profile will build later is REFUSED here by name, with
 //! the milestone that builds it (`gql_refusals()`), never skipped and never
-//! approximated. And the SQL surface outside the body is unchanged: every
-//! row of the SQL refusal table is refused exactly as before, even in a
-//! statement that also holds a GQL body.
+//! approximated. And the SQL surface outside a GQL relation is unchanged:
+//! every row of the SQL refusal table is refused exactly as before, and none
+//! of them is given in the outer SELECT over a relation, which is read in
+//! the GQL dialect (M3-D).
 //!
 //! Workload names are invented: `person`, `band`, `song`, `wrote`,
 //! `performed`.
@@ -215,23 +216,20 @@ fn sql_tail(keyword: &str) -> String {
     format!("WHERE {keyword}")
 }
 
-/// What a parse came to, without the byte offset a syntax error carries
-/// (the two statements compared below differ in length before the tail).
-fn outcome(result: sekejap_lang::Result<()>) -> String {
-    match result {
-        Ok(()) => "parsed".into(),
-        Err(SqlError::Syntax { message, .. }) => format!("syntax: {message}"),
-        Err(other) => format!("{other}"),
-    }
-}
-
 #[test]
-fn every_sql_refusal_is_unchanged_outside_the_body_even_after_one() {
+fn every_sql_refusal_is_unchanged_in_sql_and_never_given_in_the_outer_select_of_a_gql_relation() {
     // A row refused at PARSE is refused as itself; a row refused later (at
-    // compile, where the catalog decides) parses. Either way the outer SQL
-    // after a GQL body is read exactly as it is after a table: the dialect
-    // of the body ends at its `)`. `sql_refusals.rs` and
+    // compile, where the catalog decides) parses. `sql_refusals.rs` and
     // `refusal_by_name.rs` pin the full refusal of every row.
+    //
+    // The outer SELECT over a GQL relation is read in the GQL dialect
+    // (design §5.3, §5.5; M3-D): its WHERE is a GQL expression, where a
+    // word the SQL table lists is an ordinary name -- or the GQL table's
+    // refusal -- and never the SQL table's reason, which describes the
+    // collection SELECT's atomics, not the relation's. (An operator GQL
+    // does not have, `name ~ 'x'`, ends the WHERE expression before it;
+    // what follows the outer SELECT is the statement's own tail, which the
+    // SQL table still reads.)
     let mut refused_at_parse = 0;
     for (keyword, tier, reason) in refusals() {
         if keyword.starts_with("CREATE ") {
@@ -251,7 +249,13 @@ fn every_sql_refusal_is_unchanged_outside_the_body_even_after_one() {
         let after_gql = parse_sql(&format!(
             "SELECT t FROM GRAPH_TABLE (g MATCH (a) RETURN a.t AS t) AS g {tail}"
         ));
-        assert_eq!(outcome(plain), outcome(after_gql), "`{tail}`");
+        let operator = !keyword.starts_with(|c: char| c.is_ascii_alphanumeric());
+        if let (false, Err(SqlError::Refused { reason: got, .. })) = (operator, &after_gql) {
+            assert!(
+                gql_refusals().iter().any(|(_, _, gql)| gql == got),
+                "`{tail}` after a GQL relation gave an SQL-table reason: {got}"
+            );
+        }
     }
     assert!(refused_at_parse > 40, "only {refused_at_parse} rows refused at parse");
 }

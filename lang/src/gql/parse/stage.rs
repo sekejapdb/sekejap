@@ -18,10 +18,33 @@
 //! The words are keywords only here, by position: `LET`, `FILTER`, `FOR`,
 //! `MATCH` and `OPTIONAL MATCH` where a statement starts, the `RETURN` clauses after the
 //! items. `NEXT` between stages is read by the body (`mod.rs`).
+//!
+//! The outer `SELECT` over a GQL relation (design §5.5) is read here too,
+//! in the GQL dialect, as the `RETURN` of one more stage whose `WHERE` is
+//! its `FILTER`:
+//!
+//! ```text
+//! select := SELECT [DISTINCT] ('*' | item (',' item)*) FROM GRAPH_TABLE (...) [[AS] alias]
+//!           [WHERE expr] [GROUP BY expr (',' expr)*] [HAVING expr]
+//!           [ORDER BY expr [ASC | DESC] (',' expr [ASC | DESC])*]
+//!           [LIMIT count] [OFFSET count]         -- in either order
+//! item   := expr [[AS] name]
+//! ```
+//!
+//! `alias.column` names a column of the relation. `DISTINCT` is the
+//! existing `Distinct` operator, over the projected row (M3-D2, brief
+//! gap 1); `SELECT DISTINCT ON (...)` stays refused by name, as it is on
+//! the plain SQL side, since picking a representative row per group needs
+//! a per-group ranking the aggregate atomic does not have. `HAVING` is a
+//! `Filter` right after the outer `Aggregate` (brief gap 2), reading only
+//! the group's keys and aggregates, PostgreSQL's `42803` otherwise; it may
+//! write HAVING with no `GROUP BY`, which then folds the whole relation
+//! into one group, as PostgreSQL does.
 
-use super::super::ast::{Count, OrderItem, Return, ReturnItem, Stage, Statement};
+use super::super::ast::{Count, GqlGraphTable, OrderItem, Outer, Return, ReturnItem, Stage, Statement};
+use super::super::ast::Expr;
 use crate::lexer::Tok;
-use crate::parser::Parser;
+use crate::parser::{Dialect, Parser};
 use crate::refuse;
 use crate::{SqlError, SqlResult2};
 
@@ -100,45 +123,9 @@ impl Parser {
     /// `RETURN` has been read.
     fn gql_return(&mut self) -> SqlResult2<Return> {
         let distinct = self.eat_word("DISTINCT");
-        let star = self.eat(&Tok::Star);
-        let mut items = Vec::new();
-        while !star {
-            let expr = self.gql_expr()?;
-            let alias = if self.eat_word("AS") {
-                Some(self.gql_name("an output column name")?)
-            } else {
-                None
-            };
-            items.push(ReturnItem { expr, alias });
-            if !self.eat(&Tok::Comma) {
-                break;
-            }
-        }
-        let group_by = if self.gql_eat_pair("GROUP", "BY") {
-            let mut keys = vec![self.gql_expr()?];
-            while self.eat(&Tok::Comma) {
-                keys.push(self.gql_expr()?);
-            }
-            Some(keys)
-        } else {
-            None
-        };
-        let mut order_by = Vec::new();
-        if self.gql_eat_pair("ORDER", "BY") {
-            loop {
-                let expr = self.gql_expr()?;
-                let descending = if self.eat_word("DESC") {
-                    true
-                } else {
-                    self.eat_word("ASC");
-                    false
-                };
-                order_by.push(OrderItem { expr, descending });
-                if !self.eat(&Tok::Comma) {
-                    break;
-                }
-            }
-        }
+        let (star, items) = self.gql_items(None)?;
+        let group_by = self.gql_group_by()?;
+        let order_by = self.gql_order_by()?;
         let offset = if self.eat_word("OFFSET") {
             Some(self.gql_count("OFFSET")?)
         } else {
@@ -158,6 +145,149 @@ impl Parser {
             offset,
             limit,
         })
+    }
+
+    /// `SELECT` over a GQL relation, the cursor on `SELECT` and its `FROM`
+    /// `from` tokens ahead (`Parser::gql_relation_ahead`). The relation is
+    /// read first, so the select list, read next, knows its alias.
+    pub(crate) fn gql_select(&mut self, from: usize) -> SqlResult2<GqlGraphTable> {
+        self.expect_word("SELECT")?;
+        let list = self.mark();
+        self.reset(list + from);
+        let mut relation = self.gql_graph_table()?;
+        let tail = self.mark();
+        self.reset(list);
+        let dialect = std::mem::replace(&mut self.dialect, Dialect::Gql);
+        let alias = std::mem::replace(&mut self.relation, relation.alias.clone());
+        let outer = self.gql_outer(list + from - 1, tail);
+        self.dialect = dialect;
+        self.relation = alias;
+        relation.outer = outer?;
+        Ok(relation)
+    }
+
+    /// The select list, up to the `FROM` at `from`, then the clauses from
+    /// `tail`, after the relation. `None` for `SELECT *` alone.
+    fn gql_outer(&mut self, from: usize, tail: usize) -> SqlResult2<Option<Outer>> {
+        let distinct = self.eat_word("DISTINCT");
+        if distinct && self.word().as_deref() == Some("ON") {
+            return Err(SqlError::Refused {
+                keyword: "DISTINCT ON".into(),
+                tier: crate::Tier::Three,
+                reason: "QL_CONTRACT §4.7: DISTINCT is a group with no accumulators; DISTINCT ON picks a representative ROW per group, which needs a per-group ranking the aggregate atomic does not have.",
+            });
+        }
+        let (star, items) = self.gql_items(Some(from))?;
+        if self.mark() != from {
+            return Err(self.gql_expected("`,` or `FROM`"));
+        }
+        self.reset(tail);
+        if matches!(
+            self.word().as_deref(),
+            Some("JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "NATURAL")
+        ) || matches!(self.peek(), Tok::Comma)
+        {
+            return Err(refuse::refuse("JOIN"));
+        }
+        let where_ = if self.eat_word("WHERE") {
+            Some(self.gql_expr()?)
+        } else {
+            None
+        };
+        let group_by = self.gql_group_by()?;
+        let having = if self.eat_word("HAVING") {
+            Some(self.gql_expr()?)
+        } else {
+            None
+        };
+        let order_by = self.gql_order_by()?;
+        let (mut offset, mut limit) = (None, None);
+        loop {
+            if offset.is_none() && self.eat_word("OFFSET") {
+                offset = Some(self.gql_count("OFFSET")?);
+            } else if limit.is_none() && self.eat_word("LIMIT") {
+                limit = Some(self.gql_count("LIMIT")?);
+            } else {
+                break;
+            }
+        }
+        let bare = star
+            && !distinct
+            && where_.is_none()
+            && group_by.is_none()
+            && having.is_none()
+            && order_by.is_empty()
+            && offset.is_none()
+            && limit.is_none();
+        Ok((!bare).then_some(Outer {
+            where_,
+            select: Return {
+                distinct,
+                star,
+                items,
+                group_by,
+                order_by,
+                offset,
+                limit,
+            },
+            having,
+        }))
+    }
+
+    /// `* | item, ...` of a `RETURN`, or of an outer `SELECT` whose `FROM`
+    /// stands at `from`, where an alias may be written without `AS`.
+    fn gql_items(&mut self, from: Option<usize>) -> SqlResult2<(bool, Vec<ReturnItem>)> {
+        if self.eat(&Tok::Star) {
+            return Ok((true, Vec::new()));
+        }
+        let mut items = Vec::new();
+        loop {
+            let expr = self.gql_expr()?;
+            let bare_alias = from.is_some_and(|from| self.mark() != from)
+                && matches!(self.peek(), Tok::Word(_) | Tok::Quoted(_));
+            let alias = if self.eat_word("AS") || bare_alias {
+                Some(self.gql_name("an output column name")?)
+            } else {
+                None
+            };
+            items.push(ReturnItem { expr, alias });
+            if !self.eat(&Tok::Comma) {
+                return Ok((false, items));
+            }
+        }
+    }
+
+    /// `[GROUP BY expr, ...]`.
+    fn gql_group_by(&mut self) -> SqlResult2<Option<Vec<Expr>>> {
+        if !self.gql_eat_pair("GROUP", "BY") {
+            return Ok(None);
+        }
+        let mut keys = vec![self.gql_expr()?];
+        while self.eat(&Tok::Comma) {
+            keys.push(self.gql_expr()?);
+        }
+        Ok(Some(keys))
+    }
+
+    /// `[ORDER BY expr [ASC | DESC], ...]`.
+    fn gql_order_by(&mut self) -> SqlResult2<Vec<OrderItem>> {
+        let mut order_by = Vec::new();
+        if self.gql_eat_pair("ORDER", "BY") {
+            loop {
+                let expr = self.gql_expr()?;
+                let descending = if self.eat_word("DESC") {
+                    true
+                } else {
+                    self.eat_word("ASC");
+                    false
+                };
+                order_by.push(OrderItem { expr, descending });
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        Ok(order_by)
     }
 
     /// Two words in a row, consumed only together.

@@ -17,13 +17,13 @@
 //! ## The grammar actually accepted
 //!
 //! ```text
-//! statement := select | explain | insert | update | delete
+//! statement := select | gql_select | explain | insert | update | delete
 //!            | create_table | create_index | drop | transaction | set_local
 //!            | bulk
 //!
 //! select    := SELECT [DISTINCT] items FROM source [WHERE conj]
 //!              [GROUP BY group] [HAVING having] [ORDER BY key] [LIMIT n]
-//! explain   := EXPLAIN select | EXPLAIN drop_table
+//! explain   := EXPLAIN select | EXPLAIN gql_select | EXPLAIN drop_table
 //!            | EXPLAIN update | EXPLAIN delete   -- predicated only; the
 //!                                                   plan is PREPARED, never
 //!                                                   run
@@ -34,7 +34,7 @@
 //!            | ('sum'|'min'|'max'|'avg') '(' name ')'
 //! group     := name ['/' n]        -- one key; `/ n` needs an Int index
 //! having    := aggregate cmp value (AND aggregate cmp value)*
-//! source    := name | gql_table | ALL
+//! source    := name | ALL
 //!                                        -- ALL is refused by name (§2)
 //! conj      := predicate (AND predicate)*
 //!
@@ -67,11 +67,18 @@
 //! -- `GRAPH_TABLE` takes (owner decision 1: the SQL/PGQ `GRAPH_TABLE (g
 //! -- MATCH ... COLUMNS (...))` body has no compatibility alias, and a
 //! -- `COLUMNS` written where this grammar stands is refused by name, naming
-//! -- `RETURN`). `SELECT * FROM gql_table` prepares and runs as a GQL plan
-//! -- (`Plan::Gql`); an outer select list or clause over it is refused until
-//! -- M3-D. Everything else of the profile is refused by name with its
+//! -- `RETURN`). `SELECT ... FROM gql_table ...` prepares and runs as ONE
+//! -- GQL plan (`Plan::Gql`): the outer SELECT is the plan's last stage, its
+//! -- select list and clauses GQL expressions over the relation's columns,
+//! -- `alias.column` naming one; `DISTINCT`, `HAVING` and a join are refused
+//! -- by name. Everything else of the profile is refused by name with its
 //! -- milestone (`gql_refusals()`).
-//! gql_table := GRAPH_TABLE '(' name stage ')' [AS name]
+//! gql_select:= SELECT ('*' | gexpr [[AS] name] (',' ...)*) FROM gql_table
+//!                [WHERE gexpr] [GROUP BY gexpr (',' gexpr)*]
+//!                [ORDER BY gexpr [ASC|DESC] (',' ...)*]
+//!                [LIMIT count] [OFFSET count]   -- either order; a whole
+//!                                                  number key is a position
+//! gql_table := GRAPH_TABLE '(' name stage ')' [[AS] name]
 //! stage     := (MATCH pattern (',' pattern)* [WHERE gexpr])* RETURN
 //!                gexpr [AS name] (',' gexpr [AS name])*
 //! pattern   := node (edge node)*
@@ -209,6 +216,11 @@ pub(crate) mod sqlstate {
     pub const INVALID_ARGUMENT_FOR_POWER_FUNCTION: &str = "2201F";
     /// `22P02 invalid_text_representation`.
     pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
+    /// `42P08 ambiguous_parameter`: two uses of one `$n` deduce two types.
+    pub const AMBIGUOUS_PARAMETER: &str = "42P08";
+    /// `42P10 invalid_column_reference`: a `GROUP BY` or `ORDER BY`
+    /// position past the select list.
+    pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
     /// `42703 undefined_column`: a variable no statement binds.
     pub const UNDEFINED_COLUMN: &str = "42703";
     /// `42712 duplicate_alias`: a variable bound twice in one stage.
@@ -517,10 +529,11 @@ impl PreparedSql {
     /// with this for a position its `Parse` left undeclared.
     ///
     /// A collection statement types its `$n` by where each is USED, at
-    /// bind, so this is empty for it. A GQL plan gives a `$n` the declared
-    /// type of the property it is compared with, when every comparison
-    /// agrees (`docs/lang/GQL_PROFILE_DESIGN.md` §7; the full parameter
-    /// table is M3-D).
+    /// bind, so this is empty for it. A GQL plan has ONE parameter table
+    /// for its body and its outer SELECT (`docs/lang/GQL_PROFILE_DESIGN.md`
+    /// §7): a `$n` compared with a declared property or a typed column
+    /// takes that type, a count is `BIGINT`, a list position `T[]`, and two
+    /// uses that disagree are refused at prepare (`42P08`).
     pub fn param_types(&self) -> Vec<Option<&'static str>> {
         match &self.plan {
             compile::Plan::Gql(gql) | compile::Plan::ExplainGql(gql) => gql.plan.param_types(),

@@ -9,7 +9,8 @@
 //! as SQL reads them.
 //!
 //! * `stage.rs`: the statements and the `RETURN` of a stage; `NEXT`
-//!   separates stages.
+//!   separates stages; and the outer `SELECT` over the relation, which is
+//!   read as one more `RETURN` (design §5.5).
 //! * `pattern.rs`: path patterns, element patterns and labels.
 //! * `expr.rs`: expressions: the M2 subset and the M3-C scalar pack.
 //!
@@ -34,6 +35,13 @@ use crate::{SqlError, SqlResult2};
 /// name where one is optional (`(a IS t)`: `IS` is not the variable).
 const STRUCTURAL: &[&str] = &["IS", "WHERE", "COST", "AS"];
 
+/// Words that may follow `GRAPH_TABLE (...)` in a `FROM`, and so are never
+/// read as the relation's alias.
+const RELATION_FOLLOWERS: &[&str] = &[
+    "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "UNION", "INTERSECT", "EXCEPT",
+    "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "WINDOW",
+];
+
 impl Parser {
     /// `GRAPH_TABLE ( <graph> <body> ) [AS <alias>]`, the cursor on
     /// `GRAPH_TABLE`.
@@ -51,8 +59,13 @@ impl Parser {
         });
         self.dialect = outer;
         let body = body?;
+        // `[AS] alias`, as SQL names a relation in `FROM`.
         let alias = if self.eat_word("AS") {
-            Some(self.name()?)
+            Some(self.gql_name("the relation's alias")?)
+        } else if matches!(self.peek(), Tok::Quoted(_))
+            || self.word().is_some_and(|word| !RELATION_FOLLOWERS.contains(&word.as_str()))
+        {
+            Some(self.gql_name("the relation's alias")?)
         } else {
             None
         };
@@ -60,6 +73,7 @@ impl Parser {
             graph,
             body: Pipeline { stages: body },
             alias,
+            outer: None,
         })
     }
 

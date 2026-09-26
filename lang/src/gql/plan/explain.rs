@@ -46,13 +46,20 @@ impl GqlPlan {
                 .get(at + 1)
                 .map_or(self.ops.len(), |next| next.first_op);
             let ops = &self.ops[stage.first_op..end];
-            if at > 0 {
+            if stage.outer {
                 out.push_str(&format!(
-                    "NEXT: stage {} reads the rows stage {at} returned, and nothing else of them\n",
-                    at + 1
+                    "outer SELECT: reads the rows stage {at} returned, as the relation's columns, and nothing else of them\n"
                 ));
+                out.push_str(&format!("stage {} (the outer SELECT):\n  slots:\n", at + 1));
+            } else {
+                if at > 0 {
+                    out.push_str(&format!(
+                        "NEXT: stage {} reads the rows stage {at} returned, and nothing else of them\n",
+                        at + 1
+                    ));
+                }
+                out.push_str(&format!("stage {}:\n  slots:\n", at + 1));
             }
-            out.push_str(&format!("stage {}:\n  slots:\n", at + 1));
             for at in 0..schema.width() {
                 let slot = SlotId(at as u16);
                 let info = schema.slot(slot);
@@ -222,6 +229,10 @@ impl GqlPlan {
                     FilterAt::Seed => "right after the seed",
                     FilterAt::AfterPattern => "after the pattern",
                     FilterAt::Statement => "as the FILTER statement",
+                    FilterAt::Outer => {
+                        "as the outer WHERE, over the relation's rows (not pushed into the search)"
+                    }
+                    FilterAt::Having => "as the outer HAVING, over the finished group",
                 };
                 out.push_str(&format!(
                     "{indent}{n}. Filter {place}: {} -- charges primary_reads, graph_edges\n",
@@ -373,6 +384,7 @@ pub(crate) fn show(ex: &Ex, schema: &BindingSchema) -> String {
         ),
         Ex::Concat(left, right) => format!("({} || {})", show(left, schema), show(right, schema)),
         Ex::IsNull(inner) => format!("({} IS NULL)", show(inner, schema)),
+        Ex::Member(needle, list) => format!("({} IN {})", show(needle, schema), show(list, schema)),
         Ex::In(needle, list) => format!(
             "({} IN ({}))",
             show(needle, schema),

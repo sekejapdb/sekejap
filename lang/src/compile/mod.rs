@@ -159,35 +159,9 @@ pub(crate) fn compile(
 }
 
 impl Compiler<'_> {
-    /// The GQL body of `SELECT * FROM GRAPH_TABLE (<graph> ... RETURN ...)`
-    /// with no outer clause: the one shape of a GQL relation compiled until
-    /// M3-D compiles the outer SELECT as one more stage (design §5.5).
-    fn bare_gql(select: &SelectStmt) -> Option<&crate::gql::ast::GqlGraphTable> {
-        let SelectStmt {
-            items,
-            source,
-            predicates,
-            distinct,
-            group,
-            having,
-            order,
-            limit,
-        } = select;
-        let Source::Gql(graph) = source else {
-            return None;
-        };
-        let bare = matches!(items.as_slice(), [(SelectItem::Star, None)])
-            && predicates.is_empty()
-            && !distinct
-            && group.is_none()
-            && having.is_empty()
-            && order.is_none()
-            && limit.is_none();
-        bare.then_some(&**graph)
-    }
-
-    /// Bind and plan a GQL body. The statement's parameters are kept, not
-    /// folded: an execution reads them when it opens.
+    /// Bind and plan a GQL relation and the outer SELECT over it. The
+    /// statement's parameters are kept, not folded: an execution reads them
+    /// when it opens.
     fn gql(&mut self, graph: &crate::gql::ast::GqlGraphTable) -> SqlResult2<GqlSqlPlan> {
         let plan = crate::gql::plan::GqlPlan::compile(self.db, graph, self.notices)?;
         Ok(GqlSqlPlan {
@@ -198,30 +172,25 @@ impl Compiler<'_> {
 
     fn statement(&mut self, statement: Stmt) -> SqlResult2<Plan> {
         Ok(match statement {
-            // `SELECT * FROM GRAPH_TABLE (<graph> ... RETURN ...)` is a GQL
-            // plan. An outer select list or clause over the relation takes
-            // the collection path, which refuses it by name (M3-D). A `FROM`
-            // that names a CATALOG relation takes the `Rows` driver: the
-            // statement is an ordinary SELECT whose candidates are a bounded
-            // list the compiler builds here (`rows.rs`).
-            Stmt::Select(select) => match Self::bare_gql(&select) {
-                Some(graph) => Plan::Gql(self.gql(graph)?),
-                None => match Self::catalog_source(&select) {
-                    Some(relation) => Plan::Rows(self.catalog_select(relation, *select, false)?),
-                    None => match self.aggregate(&select)? {
-                        Some(plan) => Plan::Aggregate(plan),
-                        None => Plan::Select(self.select(*select)?),
-                    },
+            // A GQL relation, with the outer SELECT over it, is ONE GQL plan
+            // (design §5.5). A `FROM` that names a CATALOG relation takes
+            // the `Rows` driver: the statement is an ordinary SELECT whose
+            // candidates are a bounded list the compiler builds here
+            // (`rows.rs`).
+            Stmt::Gql(graph) => Plan::Gql(self.gql(&graph)?),
+            Stmt::ExplainGql(graph) => Plan::ExplainGql(self.gql(&graph)?),
+            Stmt::Select(select) => match Self::catalog_source(&select) {
+                Some(relation) => Plan::Rows(self.catalog_select(relation, *select, false)?),
+                None => match self.aggregate(&select)? {
+                    Some(plan) => Plan::Aggregate(plan),
+                    None => Plan::Select(self.select(*select)?),
                 },
             },
-            Stmt::Explain(select) => match Self::bare_gql(&select) {
-                Some(graph) => Plan::ExplainGql(self.gql(graph)?),
-                None => match Self::catalog_source(&select) {
-                    Some(relation) => Plan::Rows(self.catalog_select(relation, *select, true)?),
-                    None => match self.aggregate(&select)? {
-                        Some(plan) => Plan::ExplainAggregate(plan),
-                        None => Plan::Explain(self.select(*select)?),
-                    },
+            Stmt::Explain(select) => match Self::catalog_source(&select) {
+                Some(relation) => Plan::Rows(self.catalog_select(relation, *select, true)?),
+                None => match self.aggregate(&select)? {
+                    Some(plan) => Plan::ExplainAggregate(plan),
+                    None => Plan::Explain(self.select(*select)?),
                 },
             },
             Stmt::SessionRows(items) => Plan::Rows(self.session_rows(&items)?),

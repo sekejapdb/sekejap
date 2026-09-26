@@ -184,8 +184,29 @@ path and element functions (`PATH_LENGTH`, `PATH_FIRST`, `PATH_LAST`,
 compiled, a list of mixed kinds refused. An aggregate in a `LET`, a
 `FILTER` or a `MATCH`'s `WHERE` is horizontal: it folds, per row, the list
 one list variable holds (`SUM(e.cost)` over one path's edges); in a
-`RETURN` it stays vertical, over rows (`lang/tests/gql_functions.rs`). An
-outer select list or clause over the relation is refused until M3-D.
+`RETURN` it stays vertical, over rows (`lang/tests/gql_functions.rs`). The
+outer `SELECT` over the relation -- a select list, `WHERE`, `GROUP BY`,
+`HAVING`, `ORDER BY` with several keys, `LIMIT` and `OFFSET` -- reads the
+`RETURN` columns, as `alias.column` or `column`, with PostgreSQL's meaning
+(no implicit grouping, a whole-number key is a select-list position,
+`NULL`s last ascending, `HAVING` alone forces one group over the whole
+relation), and is compiled as the plan's last stage, so paging, budgets and
+`EXPLAIN` stay one plan; its `WHERE` filters the relation's rows after the
+search and is never pushed into it, and its `HAVING` is a `Filter` right
+after the outer `Aggregate`, naming only a group key or an aggregate,
+PostgreSQL's `42803` otherwise. `SELECT DISTINCT` is the same `Distinct`
+operator the body's `RETURN DISTINCT` uses; `SELECT DISTINCT ON (...)` and
+a join with the relation are refused by name. An unaliased column is named
+as the body's `RETURN` names it -- a property by the property, a variable
+by itself, anything else `?column?` -- except the outer `SELECT`, which
+follows PostgreSQL's own rule: an aggregate by its function
+(`count`/`sum`/`avg`/`min`/`max`/`array_agg`), a function call by its
+function name, a cast by PostgreSQL's type name (`int8`, `float8`, `bool`,
+...), `CASE`/`COALESCE`/`NULLIF` by the keyword, anything else `?column?`. One
+`$n` has
+one type in the body and the outer `SELECT` alike: two uses that deduce
+two types are refused at prepare with `42P08`, and each bound value is
+checked against its type when an execution opens (`lang/tests/gql_prepared.rs`).
 Every later construct is refused by name with the milestone that builds it
 (`sekejap_lang::gql_refusals()`), and inside a body only that table is
 consulted: a word the SQL table refuses is an ordinary name there. Its
@@ -199,7 +220,8 @@ Test files are `lang/tests/*.rs` unless another crate is written out.
 | statement | tier | test | atomic / note |
 |---|---|---|---|
 | `SELECT ... FROM <collection> [WHERE] [ORDER BY one expr] [LIMIT]` | T1 | `sql_tier1.rs::select_star_names_every_declared_column`, `::an_indexed_scalar_order_matches_the_direct_request`, `::limit_is_a_total_limit_on_the_prepared_query` | prepare_query: filters AND, one order, pages |
-| `SELECT * FROM GRAPH_TABLE (<graph> MATCH ... RETURN ...)`, the GQL body (patterns per §4.3) | T1 | `sql_tier1.rs::graph_table_compiles_to_one_bounded_traversal`, `lang/tests/gql_patterns.rs` | GQL plan (`Plan::Gql`); an outer select list or clause over the relation is refused until M3-D |
+| `SELECT * FROM GRAPH_TABLE (<graph> MATCH ... RETURN ...)`, the GQL body (patterns per §4.3) | T1 | `sql_tier1.rs::graph_table_compiles_to_one_bounded_traversal`, `lang/tests/gql_patterns.rs` | GQL plan (`Plan::Gql`) |
+| `SELECT [DISTINCT] <items> FROM GRAPH_TABLE (...) [AS] g [WHERE] [GROUP BY] [HAVING] [ORDER BY k1, k2 ...] [LIMIT] [OFFSET]`, the outer SELECT over a GQL relation | T1 | `lang/tests/gql_prepared.rs`, `lang/tests/gql_outer.rs`, `dist/tests/pg_wire_gql.rs::an_outer_select_is_described_with_its_parameter_types_and_orders_and_limits`, `::an_outer_selects_unaliased_columns_are_named_as_postgresql_names_them` | the same GQL plan's last stage: `Filter -> [Aggregate] -> [Filter (HAVING)] -> Project -> [Distinct] -> [Sort] -> [Page]` over the `RETURN` columns; `SELECT DISTINCT ON (...)` and a join are refused by name |
 | `INSERT INTO t (...) VALUES (...)`, `$n` params | T1 | `sql_tier1.rs::insert_update_delete_walk_the_key`, `::a_parameter_takes_its_type_from_its_position` | put by key |
 | `UPDATE t SET ... WHERE _key = $1` | T1 | `sql_dml.rs::the_key_forms_of_update_and_delete_stay_the_single_key_atomics` | put replaces the row; partial update = read-modify-put |
 | `DELETE FROM t WHERE _key = $1` | T1 | `sql_dml.rs::the_key_forms_of_update_and_delete_stay_the_single_key_atomics` | delete by key; RESTRICT/CASCADE per graph contract 6.1 |
@@ -341,7 +363,7 @@ M2-E (owner decision 1) removed the SQL/PGQ `GRAPH_TABLE (g MATCH ... COLUMNS (.
 | inline `WHERE` in element, far node -- ANY pure expression, including `IS NULL`, a text search or a spatial predicate the row must be read for | T1 for the M2/M3-C expression pack; T2 (M6, `host function`) for `ST_*`/`to_tsvector`/`to_tsquery`/`bm25` | `sql_tier1.rs::graph_table_inline_node_where_compiles_to_a_membership_prune`, `::a_text_search_inline_node_predicate_is_refused_naming_its_milestone`, `aggregate_graph_adversarial.rs::n_sql_graph_table_forms`, `lang/tests/gql_explain.rs` (`far filter, per far node: (...)`) | a per-hop predicate is an ordinary pure expression over the bound row (`docs/LAYERS.md`: "lang may evaluate pure expressions over values core has already handed it"), never restricted to what an index posting answers without a row read -- the removed body's stricter rule (graph contract 4.3, "never reads a row for a predicate on a covered field") does not carry over |
 | `RETURN r.<prop> AS name` (the reaching edge's own property) | T1 | `lang/tests/gql_patterns.rs`, `sql_tier1.rs::an_edge_variable_is_matched_without_case`, `aggregate_graph_adversarial.rs::k_reaching_edge_equals_bag_first_admitted_across_types` | the reaching edge, bound by the traversal (graph contract 4.2); a variable is matched WITHOUT case, as every unquoted name in this dialect is (`lang/src/gql/schema.rs`) |
 | `RETURN <expr> AS name` over ANY bound pattern variable, including the pattern's SEED | T1 | `lang/tests/gql_patterns.rs`, `dist/rust/tests/readme_correctness.rs::graph_hops_directions_and_depths` | every bound variable projects (design M2), unlike the removed body, whose match row carried only the far node and the edge and refused a `COLUMNS` entry over the starting node by name |
-| `ORDER BY <edge property>`, over a RETURNed edge column | T2 (GQL profile M3-B: a `RETURN` stage's own `ORDER BY`/`LIMIT`, not built) | `sql_tier1.rs::graph_table_return_projects_the_reaching_edge_and_order_by_it` (`#[ignore = "needs M3-B"]`) | the engine atomic (`QueryOrder::Edge`) is T1 and reachable directly (`aggregate_graph_adversarial.rs::l_edge_order_missing_text_last_paged_refuses_entities_keys`); the GQL surface for it waits on the stage grammar |
+| `ORDER BY <edge property>`, over a RETURNed edge column | T1 (the `RETURN` stage's own `ORDER BY`/`LIMIT`) | `sql_tier1.rs::graph_table_return_projects_the_reaching_edge_and_order_by_it` | the engine atomic (`QueryOrder::Edge`) is T1 and reachable directly (`aggregate_graph_adversarial.rs::l_edge_order_missing_text_last_paged_refuses_entities_keys`); the GQL surface for it waits on the stage grammar |
 | `{n,m}`, `{n,}`, `+`, `?` quantifiers, on an edge or on a parenthesised subpath | T1 | `sql_tier1.rs::graph_table_compiles_to_one_bounded_traversal`, `aggregate_graph_adversarial.rs::j_five_hundred_sampled_traversals_equal_brute_force`, `lang/tests/gql_paths.rs`, `lang/tests/gql_automaton.rs` | min/max depth (a chain), or the `PathAutomaton` M4-A compiles a subpath repeat to |
 | label alternation `type1\|type2`, on a node or an edge | T1 | `lang/tests/gql_patterns.rs` (`label_alternation_*`) | a multi-type hop, unlike the removed body, which refused it by name as not built |
 | pattern (post-pattern) `WHERE` | T1 | `sql_tier1.rs::a_key_post_filter_beside_a_graph_table_keeps_the_traversal_driving`, `lang/tests/gql_patterns.rs` (`inline_and_pattern_where_*`) | post-filter on completed matches |
@@ -463,7 +485,7 @@ M2-E (owner decision 1) removed the SQL/PGQ `GRAPH_TABLE (g MATCH ... COLUMNS (.
 11. A nullish group key (NULL or missing) sorts FIRST under `GROUP BY`, the scalar keyspace's own order; Postgres sorts NULL last and `NULLS FIRST|LAST` is refused. `HAVING` over an all-null accumulator drops the group (SQL three-valued logic); a `HAVING` over `min`/`max` of a non-numeric column is refused at prepare.
 12. `DROP TABLE` is RESTRICT by default, and what restricts it is GRAPH EDGES, not foreign keys: Postgres refuses on a dependent constraint, this refuses while any edge in any context references a row of the table and names those contexts (graph contract 6.1). `CASCADE` removes those edges and nothing else -- it never reaches a second table's rows. A table with no edges on it drops under the default.
 13. `DROP TABLE` is bounded and resumable, so it is not one transaction: the DROPPING mark is committed first and each bounded step after it is committed as it goes. An interrupted `DROP TABLE` leaves a collection that answers nothing and resumes from its committed cursor; it never leaves a half-emptied readable table. `ROLLBACK` does not undo a drop that has begun.
-14. (M2-E) The removed SQL/PGQ body's outer SQL SELECT could read the reaching edge, so an ordinary `_key` post-filter beside such a statement had to keep the TRAVERSAL driving rather than take the mapping-walk driver its own predicate would otherwise choose (graph contract 4.2: no other candidate stream carries the edge). GQL has no outer SELECT over the relation to make that choice for (an outer clause is refused until M3-D, §4.3): a `_key` predicate inside a GQL pattern's own `WHERE` is one more `Filter` operator of the GQL plan, not a driver choice at the `SelectPlan` level. An ordinary (non-`GRAPH_TABLE`) statement's `_key` predicate still drives the mapping walk, which is the cheaper plan and remains the default.
+14. (M2-E) The removed SQL/PGQ body's outer SQL SELECT could read the reaching edge, so an ordinary `_key` post-filter beside such a statement had to keep the TRAVERSAL driving rather than take the mapping-walk driver its own predicate would otherwise choose (graph contract 4.2: no other candidate stream carries the edge). GQL makes no such choice: a `_key` predicate inside a GQL pattern's own `WHERE` is one more `Filter` operator of the GQL plan, and so is an outer `WHERE` over the relation (§1), which is applied after the search and never becomes a driver. An ordinary (non-`GRAPH_TABLE`) statement's `_key` predicate still drives the mapping walk, which is the cheaper plan and remains the default.
 15. The prior engine's `FROM MATCH (a)-[r]->(b)` is not adopted (§1) and never will be. The capability is not lost and is not Tier 3: it is T1 under the standard spelling, `FROM GRAPH_TABLE (g MATCH (a)-[r]->(b) RETURN ...)`. Migration is mechanical -- wrap the pattern in `GRAPH_TABLE (...)`, name the graph, write `SELECT *` as the outer list, and move the SELECT list into `RETURN`. `MATCH SHORTEST` is `ANY SHORTEST` (§4.3), and a multi-FROM `..., collection AS alias` is a `CROSS JOIN LATERAL` (§4.8). This is a refusal with a named reason: the atomic exists, the spelling does not.
 16. `NOT NULL` is enforced here. The prior engine parses it and does not check it, so a corpus it accepted can be refused by sekejap on the row that was always in violation. The check is a descriptor flag tested when the row is assembled; the error names the column.
 17. `FROM ALL` is unordered by contract: it would concatenate the collections in catalog id order and page within each. It is not a UNION (which stays T3), it does not deduplicate, and a ranked `ORDER BY` over it is refused for the reason in its §2 row. It is not built, and is refused by name today.
@@ -1265,6 +1287,30 @@ SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near|far
 ```sql
 -- ANY SHORTEST is a selector, built (M4-A): the fewest hops out of p000
 SELECT * FROM GRAPH_TABLE (base MATCH ANY SHORTEST (a:place WHERE a._key = 'p000')-[:near]->{1,199}(b:place WHERE b._key = 'p005') RETURN b._key AS k)
+```
+
+```sql
+-- the outer SELECT over the relation is the plan's last stage: its WHERE
+-- filters the relation's rows after the search, then several ORDER BY keys
+-- and a LIMIT page them
+SELECT g.k, g.w FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{0,5}(x:place)-[r:near]->(b:place) RETURN b._key AS k, r.weight AS w) AS g WHERE g.w > 0.1 ORDER BY g.w DESC, g.k LIMIT 3
+```
+
+```sql
+-- SELECT DISTINCT over the relation is the same Distinct operator RETURN
+-- DISTINCT uses inside the body
+SELECT DISTINCT g.k FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{0,5}(x:place)-[r:near]->(b:place) RETURN b._key AS k, r.weight AS w) AS g
+```
+
+```sql
+-- HAVING is a Filter right after the outer Aggregate, over the finished
+-- group: here, every b reached by more than one path
+SELECT g.k, count(*) AS n FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{0,5}(x:place)-[r:near]->(b:place) RETURN b._key AS k, r.weight AS w) AS g GROUP BY g.k HAVING count(*) > 1
+```
+
+```sql refused
+-- refused 0A000: SELECT DISTINCT ON over the relation
+SELECT DISTINCT ON (g.k) g.k, g.w FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->{0,5}(x:place)-[r:near]->(b:place) RETURN b._key AS k, r.weight AS w) AS g
 ```
 
 ```sql refused

@@ -27,8 +27,9 @@
 //! variable -- into the engine's path automaton (M4-A). `stage` binds
 //! and plans the stage grammar around the patterns -- `LET`, `FILTER`,
 //! `FOR`, `RETURN` with grouping, `DISTINCT`, `ORDER BY`, `OFFSET`,
-//! `LIMIT` -- and `NEXT` between stages (M3-B), and plans an `OPTIONAL
-//! MATCH` as one `OptionalApply` over its pattern's operators (M3-F).
+//! `LIMIT` -- and `NEXT` between stages (M3-B), plans an `OPTIONAL
+//! MATCH` as one `OptionalApply` over its pattern's operators (M3-F), and
+//! plans the outer SELECT over the relation as one more stage (M3-D).
 //! `elements` holds the path, element and list functions and `horizontal`
 //! the classification and the fold of horizontal aggregates, over a list
 //! per row (M4-D).

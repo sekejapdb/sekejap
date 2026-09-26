@@ -12,23 +12,21 @@
 //! Workload names are invented: `person`, `band`, `song`, `wrote`,
 //! `performed`.
 
-use crate::ast::{Source, Stmt};
+use crate::ast::Stmt;
 use crate::{refusals, SqlError};
 
 /// The normal form of the GQL body a statement's `FROM` names, or an error
 /// when it names none.
 fn normal_form(text: &str) -> crate::Result<String> {
-    if let Stmt::Select(select) | Stmt::Explain(select) = crate::parser::parse(text)? {
-        if let Source::Gql(graph) = select.source {
-            return Ok(graph.to_string());
-        }
+    if let Stmt::Gql(graph) | Stmt::ExplainGql(graph) = crate::parser::parse(text)? {
+        return Ok(graph.to_string());
     }
     Err(SqlError::unsupported("the statement has no GQL body"))
 }
 
 /// The statement around every body below; only the body differs.
 fn statement(body: &str) -> String {
-    format!("SELECT t FROM GRAPH_TABLE (g {body})")
+    format!("SELECT * FROM GRAPH_TABLE (g {body})")
 }
 
 /// The normal form of a body that must parse.
@@ -217,9 +215,37 @@ fn return_items_with_and_without_alias() {
 #[test]
 fn the_relation_alias_follows_the_body() {
     assert_eq!(
-        normal_form("SELECT g.t FROM GRAPH_TABLE (base MATCH (a) RETURN a.t AS t) AS g")
-            .unwrap(),
+        normal_form("SELECT * FROM GRAPH_TABLE (base MATCH (a) RETURN a.t AS t) AS g").unwrap(),
         "GRAPH_TABLE (base MATCH (a) RETURN a.t AS t) AS g"
+    );
+    // Without `AS`, as SQL names a relation in FROM.
+    assert_eq!(
+        normal_form("SELECT * FROM GRAPH_TABLE (base MATCH (a) RETURN a.t AS t) g").unwrap(),
+        "GRAPH_TABLE (base MATCH (a) RETURN a.t AS t) AS g"
+    );
+}
+
+#[test]
+fn the_outer_select_reads_alias_columns_and_its_clauses_in_either_page_order() {
+    // M3-D: `alias.column` is the relation's column; LIMIT and OFFSET in
+    // either order print in one; a key may be a select-list position.
+    let expected = "SELECT t AS x, COUNT(*) FROM GRAPH_TABLE (base MATCH (a) RETURN a.t AS t) AS g \
+                    WHERE (t > 1) GROUP BY t ORDER BY 2 DESC, t OFFSET 2 LIMIT $1";
+    for tail in ["LIMIT $1 OFFSET 2", "OFFSET 2 LIMIT $1"] {
+        assert_eq!(
+            normal_form(&format!(
+                "SELECT g.t AS x, count(*) FROM GRAPH_TABLE (base MATCH (a) RETURN a.t AS t) AS g \
+                 WHERE g.t > 1 GROUP BY g.t ORDER BY 2 DESC, t {tail}"
+            ))
+            .unwrap(),
+            expected,
+            "{tail}"
+        );
+    }
+    // An alias without `AS` in the select list.
+    assert_eq!(
+        normal_form("SELECT g.t x FROM GRAPH_TABLE (base MATCH (a) RETURN a.t AS t) AS g").unwrap(),
+        "SELECT t AS x FROM GRAPH_TABLE (base MATCH (a) RETURN a.t AS t) AS g"
     );
 }
 
