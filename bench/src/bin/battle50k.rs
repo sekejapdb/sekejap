@@ -315,11 +315,10 @@ pub const VEC_BULK_OBJECT: &str = "place_bulk";
 fn default_db_dir() -> PathBuf {
     std::env::temp_dir().join("sekejap-bench50k").join("e4-db")
 }
-/// `--dsn` when the flag is absent: `SEKEJAP_BENCH_PG_DSN`, else a local
-/// default server.
-fn default_dsn() -> String {
-    std::env::var("SEKEJAP_BENCH_PG_DSN")
-        .unwrap_or_else(|_| "host=127.0.0.1 port=5432 user=postgres dbname=postgres".into())
+/// `--dsn` when the flag is absent: `SEKEJAP_BENCH_PG_DSN`. No default
+/// connection is built in; the Postgres arm requires one of the two.
+fn default_dsn() -> Option<String> {
+    std::env::var("SEKEJAP_BENCH_PG_DSN").ok()
 }
 
 // ── the corpus ────────────────────────────────────────────────────────────
@@ -784,6 +783,14 @@ fn agg_line(key: &str, fields: &[(&str, i64)]) -> String {
 /// Is this case a folded answer rather than a row answer?
 fn is_aggregate_case(name: &str) -> bool {
     name.starts_with("agg_")
+}
+
+/// Is this case a `GRAPH_TABLE` GQL relation? It needs `e4sql_graph_run`
+/// rather than `e4sql_run`: `PreparedSql::with_query` is refused for a GQL
+/// plan, and a GQL row carries no owner to translate through the corpus's
+/// key vector (M2-D design Q1).
+fn is_graph_case(name: &str) -> bool {
+    name.starts_with("graph_")
 }
 
 /// Is this case a WRITE rather than a question? A write case builds its own
@@ -3716,27 +3723,30 @@ fn e4sql_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(String,
             format!("SELECT _id FROM place WHERE {kind} ORDER BY emb <=> {vector} LIMIT {K}")
         }
 
-        // ── the graph cases, as SQL/PGQ writes them ──────────────────────
+        // ── the graph cases, as GQL writes them (M2-E: the removed SQL/PGQ
+        // COLUMNS body used to write these) ──────────────────────────────
         //
-        // The inline element WHEREs are the per-hop prunes of
-        // GRAPH_CONTRACT 4.3, not post-filters: the edge one compiles to
-        // `edge_where`, the far node's to `node_where`, and EXPLAIN prints
-        // both. `COLUMNS (r.weight AS w)` projects the reaching edge (4.2),
-        // and `ORDER BY w DESC` ranks by it.
+        // The inline element WHEREs are per-hop, evaluated over the bound
+        // row: the edge one runs per edge, the far node's per far node, and
+        // EXPLAIN prints both (`lang/tests/gql_explain.rs`). `RETURN`
+        // projects `b._key`, not `b._id`: a GQL row carries no owner to
+        // translate through the corpus's key vector (M2-D design Q1), so
+        // `e4sql_graph_page` reads the key straight off this column instead
+        // of `row.id`.
         "graph_2hop" => {
             let seed = v.text(q.seed_key(i)?);
             format!(
-                "SELECT k FROM GRAPH_TABLE (base MATCH \
-                 (a:place WHERE a._key = {seed})-[r:{RELATED}]->{{1,2}}(b:place) \
-                 COLUMNS (b._id AS k))"
+                "SELECT * FROM GRAPH_TABLE (base MATCH \
+                 (a IS place WHERE a._key = {seed})-[r:{RELATED}]->{{1,2}}(b IS place) \
+                 RETURN b._key AS k)"
             )
         }
         "graph_2hop_weight" => {
             let seed = v.text(q.seed_key(i)?);
             format!(
-                "SELECT k FROM GRAPH_TABLE (base MATCH \
-                 (a:place WHERE a._key = {seed})-[r:{RELATED} WHERE r.weight > 0.5]->{{1,2}}\
-                 (b:place) COLUMNS (b._id AS k))"
+                "SELECT * FROM GRAPH_TABLE (base MATCH \
+                 (a IS place WHERE a._key = {seed})-[r:{RELATED} WHERE r.weight > 0.5]->{{1,2}}\
+                 (b IS place) RETURN b._key AS k)"
             )
         }
         "graph_2hop_born" => {
@@ -3744,17 +3754,19 @@ fn e4sql_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(String,
             let lower = v.int(born_lower);
             let upper = v.int(born_upper);
             format!(
-                "SELECT k FROM GRAPH_TABLE (base MATCH \
-                 (a:place WHERE a._key = {seed})-[r:{RELATED}]->{{1,2}}\
-                 (b:place WHERE b.born BETWEEN {lower} AND {upper}) COLUMNS (b._id AS k))"
+                "SELECT * FROM GRAPH_TABLE (base MATCH \
+                 (a IS place WHERE a._key = {seed})-[r:{RELATED}]->{{1,2}}\
+                 (b IS place WHERE b.born >= {lower} AND b.born <= {upper}) RETURN b._key AS k)"
             )
         }
+        // `ORDER BY w DESC LIMIT {K}` ranked by the reaching edge's property:
+        // the GQL RETURN stage's own ORDER BY/LIMIT.
         "graph_1hop_weight_top10" => {
             let seed = v.text(q.seed_key(i)?);
             format!(
-                "SELECT k, w FROM GRAPH_TABLE (base MATCH \
-                 (a:place WHERE a._key = {seed})<-[r:{RELATED}]-(b:place) \
-                 COLUMNS (b._id AS k, r.weight AS w)) ORDER BY w DESC LIMIT {K}"
+                "SELECT * FROM GRAPH_TABLE (base MATCH \
+                 (a IS place WHERE a._key = {seed})<-[r:{RELATED}]-(b IS place) \
+                 RETURN b._key AS k, r.weight AS w ORDER BY w DESC LIMIT {K})"
             )
         }
         other => return Err(format!("battle50k: no e4-sql spelling for case `{other}`").into()),
@@ -3782,16 +3794,21 @@ fn e4sql_project_run(ctx: &E4Ctx, keys: &[String], sql: &str, params: &[Param]) 
     Ok(answer)
 }
 
-/// The paging half of [`e4sql_project_run`], over a statement that is
-/// already compiled. `--prepared` calls this after a REBIND.
-fn e4sql_project_page(ctx: &E4Ctx, keys: &[String], prepared: &PreparedSql) -> R<Answer> {
+/// The shared body of [`e4sql_project_page`] and [`e4sql_graph_page`]: page
+/// `prepared`'s rows, fold every `SqlValue::Text`/`SqlValue::Int` into one
+/// checksum so the optimizer cannot skip the read, cap the first
+/// [`FIRST_KEYS`] under the `dumping()` guard, and count rows. The two
+/// callers differ only in how a row's key is obtained, which `key_of`
+/// supplies.
+fn e4sql_page_rows(
+    ctx: &E4Ctx,
+    prepared: &PreparedSql,
+    mut key_of: impl FnMut(&sekejap_lang::SqlRow) -> Result<String, SqlError>,
+) -> R<Answer> {
     let mut answer = Answer::default();
     let mut sink = 0u64;
     prepared.for_each_row(&ctx.db, PAGE, &mut |row| {
-        let ordinal = (row.id.sequence - 1) as usize;
-        let key = keys.get(ordinal).ok_or_else(|| {
-            SqlError::Engine("entity sequence falls outside the corpus's key vector".to_owned())
-        })?;
+        let key = key_of(row)?;
         for value in &row.values {
             sink = sink.wrapping_add(match value {
                 SqlValue::Text(text) => text.len() as u64,
@@ -3800,13 +3817,50 @@ fn e4sql_project_page(ctx: &E4Ctx, keys: &[String], prepared: &PreparedSql) -> R
             });
         }
         if dumping() || answer.keys.len() < FIRST_KEYS {
-            answer.keys.push(key.clone());
+            answer.keys.push(key);
         }
         answer.rows += 1;
         Ok(())
     })?;
     std::hint::black_box(sink);
     Ok(answer)
+}
+
+/// The paging half of [`e4sql_project_run`], over a statement that is
+/// already compiled. `--prepared` calls this after a REBIND.
+fn e4sql_project_page(ctx: &E4Ctx, keys: &[String], prepared: &PreparedSql) -> R<Answer> {
+    e4sql_page_rows(ctx, prepared, |row| {
+        let ordinal = (row.id.sequence - 1) as usize;
+        keys.get(ordinal).cloned().ok_or_else(|| {
+            SqlError::Engine("entity sequence falls outside the corpus's key vector".to_owned())
+        })
+    })
+}
+
+/// A `GRAPH_TABLE` GQL case: `PreparedSql::with_query` is refused for a GQL
+/// plan ("a GQL plan has no single prepared query"), so this pages through
+/// `for_each_row` like [`e4sql_project_page`] does. Unlike that one, the key
+/// is not translated through the corpus's key vector by entity id -- a GQL
+/// row is `NO_OWNER` (M2-D design Q1) -- it is read straight off the
+/// statement's own FIRST column, which every graph case's `RETURN` writes as
+/// `b._key AS k`.
+fn e4sql_graph_run(ctx: &E4Ctx, sql: &str, params: &[Param]) -> R<Answer> {
+    let t0 = Instant::now();
+    let prepared = prepare_sql(&ctx.db, sql, params)?;
+    let mut answer = e4sql_graph_page(ctx, &prepared)?;
+    answer.prepare_us = t0.elapsed().as_secs_f64() * 1e6;
+    Ok(answer)
+}
+
+/// The paging half of [`e4sql_graph_run`], over a statement that is already
+/// compiled. `--prepared` calls this after a REBIND.
+fn e4sql_graph_page(ctx: &E4Ctx, prepared: &PreparedSql) -> R<Answer> {
+    e4sql_page_rows(ctx, prepared, |row| match row.values.first() {
+        Some(SqlValue::Text(key)) => Ok(key.clone()),
+        other => Err(SqlError::Engine(format!(
+            "a graph case's first RETURN column is not the far node's _key: {other:?}"
+        ))),
+    })
 }
 
 fn e4sql_run(ctx: &E4Ctx, keys: &[String], sql: &str, params: &[Param]) -> R<Answer> {
@@ -3920,6 +3974,9 @@ fn e4sql_answer(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize)
     if name == "fn_project_strings" {
         return e4sql_project_run(ctx, &corpus.keys, &sql, &params);
     }
+    if is_graph_case(name) {
+        return e4sql_graph_run(ctx, &sql, &params);
+    }
     e4sql_run(ctx, &corpus.keys, &sql, &params)
 }
 
@@ -3964,6 +4021,8 @@ fn e4sql_prepared_cost(
             e4sql_agg_page(ctx, prepared, fields)?
         } else if project {
             e4sql_project_page(ctx, &corpus.keys, prepared)?
+        } else if is_graph_case(name) {
+            e4sql_graph_page(ctx, prepared)?
         } else {
             e4sql_page(ctx, &corpus.keys, prepared)?
         };
@@ -6019,16 +6078,16 @@ fn e4sql_deviations() -> Vec<Value> {
     ));
     list.push(deviation(
         "graph_2hop",
-        "THE GRAPH CASES ARE WRITTEN AS SQL/PGQ PATTERNS. `GRAPH_TABLE (base MATCH (a:place \
-         WHERE a._key = $1)-[r:related]->{1,2}(b:place) COLUMNS (b._id AS k))`, with the \
+        "THE GRAPH CASES ARE WRITTEN AS GQL PATTERNS. `GRAPH_TABLE (base MATCH (a IS place \
+         WHERE a._key = $1)-[r:related]->{1,2}(b IS place) RETURN b._key AS k)`, with the \
          per-hop predicates written INLINE in the element they belong to: `[r:related WHERE \
-         r.weight > 0.5]` compiles to the traversal's edge predicates and `(b:place WHERE b.born \
-         BETWEEN ...)` to its node predicates (QL_CONTRACT §4.3, now Tier 1). Neither is a \
-         post-filter: a WHERE written after the pattern would keep a node in the frontier that \
-         GRAPH_CONTRACT 4.3 says must never be expanded, and would answer a different question \
-         at two hops. `COLUMNS (r.weight AS w)` projects the reaching edge and `ORDER BY w DESC` \
-         ranks by it; both read the bag the hop already decoded, not a row. EXPLAIN prints the \
-         edge predicates and the node membership sets.",
+         r.weight > 0.5]` is tested on each edge the path search crosses and `(b IS place WHERE \
+         b.born >= ... AND b.born <= ...)` on each node it reaches. Neither is a post-filter: a \
+         WHERE written after the pattern would keep a node in the frontier that GRAPH_CONTRACT \
+         4.3 says must never be expanded, and would answer a different question at two hops. \
+         `RETURN b._key AS k, r.weight AS w ORDER BY w DESC LIMIT 10` ranks by the reaching \
+         edge; the key comes back as a column, so no id-to-key translation is needed. EXPLAIN \
+         prints the edge and node filters of the path search.",
     ));
     list.push(deviation(
         "graph_2hop",
@@ -6236,7 +6295,7 @@ pub struct Options {
     pub queries: PathBuf,
     pub out: PathBuf,
     pub db_dir: PathBuf,
-    pub dsn: String,
+    pub dsn: Option<String>,
     pub only: Option<String>,
     pub reuse: bool,
     /// Write (or rewrite) the `related` edge set before the battery runs,
@@ -6549,10 +6608,13 @@ pub fn run_arm(options: &Options) -> R<Value> {
             disk_bytes = dir_bytes(&options.db_dir);
         }
         Arm::Postgres => {
+            let dsn = options.dsn.as_deref().ok_or(
+                "the Postgres arm needs a connection: pass --dsn or set SEKEJAP_BENCH_PG_DSN (no default is built in)",
+            )?;
             let (mut client, mut built) = if options.reuse {
-                open_pg(&options.dsn, corpus.rows.len())?
+                open_pg(dsn, corpus.rows.len())?
             } else {
-                load_pg(&options.dsn, &corpus)?
+                load_pg(dsn, &corpus)?
             };
             if options.graph {
                 built.push(load_graph_pg(&mut client, &corpus, &edges)?);
@@ -7265,7 +7327,7 @@ fn parse(args: &[String]) -> R<Options> {
         options.db_dir = dir;
     }
     if let Some(url) = dsn {
-        options.dsn = url;
+        options.dsn = Some(url);
     }
     options.only = only;
     options.reuse = reuse;

@@ -52,8 +52,8 @@ const ROWS: usize = 200;
 /// analyzer produce the identical token set. Any word with punctuation in it
 /// would make the brute force a different question.
 const VOCAB: [&str; 12] = [
-    "kebun", "sekolah", "jembatan", "bengkel", "desa", "kopi", "sawah", "danau", "pasar", "kantor",
-    "hutan", "warung",
+    "garden", "harbour", "mountain", "workshop", "village", "coffee", "field", "lake", "market",
+    "office", "forest", "resort",
 ];
 
 /// Exactly eight, because `load_corpus` refuses a corpus whose distinct
