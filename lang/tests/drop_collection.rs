@@ -246,7 +246,7 @@ fn document(i: usize) -> serde_json::Value {
     let f = i as f32;
     json!({
         "name": format!("name-{i}"),
-        "text": format!("kebun sawah {} pasar", i % 37),
+        "text": format!("garden field {} market", i % 37),
         "born": (1900 + (i % 120)) as i64,
         "emb": [f, f + 1.0, f + 2.0, f + 3.0],
     })

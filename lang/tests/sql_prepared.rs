@@ -279,22 +279,22 @@ fn a_tsquery_rebinds_its_terms_and_its_match_kind() {
     family(
         &f.db,
         sql,
-        &[Param::Text("kopi".into())],
-        &[Param::Text("pasar".into())],
+        &[Param::Text("coffee".into())],
+        &[Param::Text("market".into())],
         true,
         &by(&f, |row| {
-            row.text.split_whitespace().any(|term| term == "pasar")
+            row.text.split_whitespace().any(|term| term == "market")
         }),
     );
     family(
         &f.db,
         sql,
-        &[Param::Text("kopi".into())],
-        &[Param::Text("pasar & kebun".into())],
+        &[Param::Text("coffee".into())],
+        &[Param::Text("market & garden".into())],
         true,
         &by(&f, |row| {
             let terms: Vec<&str> = row.text.split_whitespace().collect();
-            terms.contains(&"pasar") && terms.contains(&"kebun")
+            terms.contains(&"market") && terms.contains(&"garden")
         }),
     );
 }
@@ -512,8 +512,8 @@ fn a_text_rank_rebinds_the_query_it_ranks_by() {
                WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1) \
                ORDER BY ts_rank_cd(to_tsvector('simple', text), to_tsquery('simple', $1)) DESC \
                LIMIT 5";
-    let second = [Param::Text("pasar".into())];
-    let (prepared, got) = rebound(&f.db, sql, &[Param::Text("kopi".into())], &second);
+    let second = [Param::Text("market".into())];
+    let (prepared, got) = rebound(&f.db, sql, &[Param::Text("coffee".into())], &second);
     assert!(prepared.rebindable());
     assert_eq!(
         ordered_keys(&f.db, &got),
@@ -522,7 +522,7 @@ fn a_text_rank_rebinds_the_query_it_ranks_by() {
     // Brute force on the SET, which ranking cannot change: every row whose
     // stored text holds the term.
     let mut want = by(&f, |row| {
-        row.text.split_whitespace().any(|term| term == "pasar")
+        row.text.split_whitespace().any(|term| term == "market")
     });
     want.sort();
     let mut answered = ordered_keys(&f.db, &got);
@@ -539,11 +539,11 @@ fn a_blended_score_rebinds_every_leaf_of_its_tree() {
     let sql = "SELECT _key FROM place \
                WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1) \
                ORDER BY 0.5 * bm25(text, $1) + 0.5 * (1 - (emb <=> $2)) DESC LIMIT 5";
-    let second = [Param::Text("pasar".into()), Param::Vector(f.rows[7].emb.clone())];
+    let second = [Param::Text("market".into()), Param::Vector(f.rows[7].emb.clone())];
     let (prepared, got) = rebound(
         &f.db,
         sql,
-        &[Param::Text("kopi".into()), Param::Vector(f.rows[0].emb.clone())],
+        &[Param::Text("coffee".into()), Param::Vector(f.rows[0].emb.clone())],
         &second,
     );
     assert!(prepared.rebindable());
@@ -558,14 +558,17 @@ fn a_blended_score_rebinds_every_leaf_of_its_tree() {
 #[test]
 fn a_graph_pattern_rebinds_its_seed_key_at_bind_rather_than_at_prepare() {
     let (_dir, f) = open();
-    let sql = "SELECT k FROM GRAPH_TABLE (routes MATCH \
-               (a:place WHERE a._key = $1)-[:near]->{1,3}(b:place) \
-               COLUMNS (b._key AS k))";
+    let sql = "SELECT * FROM GRAPH_TABLE (routes MATCH \
+               (a IS place WHERE a._key = $1)-[:near]->{1,3}(b IS place) \
+               RETURN b._key AS k)";
     let second = [Param::Text("k00007".into())];
     let (prepared, got) = rebound(&f.db, sql, &[Param::Text("k00000".into())], &second);
     assert!(
+        // Every GQL plan is unconditionally rebindable: it folds no
+        // parameter, ever, and every `$n` -- the seed's key equality
+        // included -- is read again at BIND rather than at PREPARE (M2-D).
         prepared.rebindable(),
-        "the seed is a key equality, which is one point-get at BIND"
+        "a GQL plan folds nothing at prepare"
     );
     assert_eq!(
         ordered_keys(&f.db, &got),
@@ -587,9 +590,9 @@ fn a_graph_pattern_rebinds_its_seed_key_at_bind_rather_than_at_prepare() {
 #[test]
 fn a_per_hop_node_predicate_rebinds_inside_the_traversal() {
     let (_dir, f) = open();
-    let sql = "SELECT k FROM GRAPH_TABLE (routes MATCH \
-               (a:place WHERE a._key = $1)-[:near]->{1,3}\
-               (b:place WHERE b.born BETWEEN $2 AND $3) COLUMNS (b._key AS k))";
+    let sql = "SELECT * FROM GRAPH_TABLE (routes MATCH \
+               (a IS place WHERE a._key = $1)-[:near]->{1,3}\
+               (b IS place WHERE b.born >= $2 AND b.born <= $3) RETURN b._key AS k)";
     let second = [
         Param::Text("k00007".into()),
         Param::Int(1900),
@@ -678,8 +681,8 @@ fn a_statement_whose_shape_is_decided_by_a_value_refuses_the_rebind_and_says_whi
     // cannot be a slot.
     let sql =
         "SELECT _key FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1)";
-    let first = [Param::Text("!kopi".into())];
-    let second = [Param::Text("!pasar".into())];
+    let first = [Param::Text("!coffee".into())];
+    let second = [Param::Text("!market".into())];
     let prepared = prepare_sql(&f.db, sql, &first).unwrap();
     assert!(!prepared.rebindable());
     let reason = prepared.rebind_refusal().expect("a refusal names its cause");
@@ -715,7 +718,7 @@ fn a_statement_whose_shape_is_decided_by_a_value_refuses_the_rebind_and_says_whi
     let mut prepared = prepared;
     prepared.bind(&f.db, &second).unwrap();
     let mut want = by(&f, |row| {
-        !row.text.split_whitespace().any(|term| term == "pasar")
+        !row.text.split_whitespace().any(|term| term == "market")
     });
     want.sort();
     assert_eq!(keys(&f.db, &prepared.run(&f.db).unwrap()), want);
@@ -728,7 +731,7 @@ fn a_statement_whose_shape_is_decided_by_a_value_refuses_the_rebind_and_says_whi
     // predicate -- and THAT compiled form is rebindable. Which of the two a
     // prepare produced is a property of the compiled statement, not of the
     // text.
-    let plain = prepare_sql(&f.db, sql, &[Param::Text("kopi".into())]).unwrap();
+    let plain = prepare_sql(&f.db, sql, &[Param::Text("coffee".into())]).unwrap();
     assert!(plain.rebindable());
 }
 

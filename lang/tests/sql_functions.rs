@@ -50,9 +50,9 @@ const KINDS: [&str; 8] = [
 /// Two names start with `Ti`, so `LIKE 'Ti%'` has a non-trivial answer and a
 /// non-trivial complement.
 const NAMES: [&str; 8] = [
-    "Tiga", "Tiara", "Empat", "Tujuh", "Lima", "Enam", "Delapan", "Sembilan",
+    "Tide", "Tiger", "River", "Ocean", "Coral", "Island", "Meadow", "Valley",
 ];
-const WORDS: [&str; 6] = ["kebun", "sekolah", "jembatan", "bengkel", "desa", "kopi"];
+const WORDS: [&str; 6] = ["garden", "harbour", "mountain", "workshop", "village", "coffee"];
 
 struct Rng(u64);
 
@@ -258,7 +258,7 @@ fn build(dir: &TempDir) -> Fixture {
         db.sql(
             &format!(
                 "INSERT INTO evt (k, name, kind, descr, born, note, born_ts, born_day) \
-                 VALUES ('{key}', 'Recent{n}', 'Home', 'baru baru baru', {born}, 'nota{n}', \
+                 VALUES ('{key}', 'Recent{n}', 'Home', 'new new new', {born}, 'nota{n}', \
                  '{literal}', '{year:04}-{month:02}-{day:02}')"
             ),
             &[],
@@ -271,7 +271,7 @@ fn build(dir: &TempDir) -> Fixture {
             key: key.clone(),
             name: format!("Recent{n}"),
             kind: "Home".to_owned(),
-            descr: "baru baru baru".to_owned(),
+            descr: "new new new".to_owned(),
             year,
             month,
             day,
@@ -542,8 +542,8 @@ fn a_prefix_pattern_is_a_text_key_range_and_equals_the_filter() {
         oracle(&f, |row| row.name.starts_with("Ti"))
     );
     assert_eq!(
-        keys(&mut f, "SELECT k FROM evt WHERE name LIKE 'Tiara%'"),
-        oracle(&f, |row| row.name.starts_with("Tiara"))
+        keys(&mut f, "SELECT k FROM evt WHERE name LIKE 'Tiger%'"),
+        oracle(&f, |row| row.name.starts_with("Tiger"))
     );
     assert_eq!(
         keys(&mut f, "SELECT k FROM evt WHERE lower(kind) LIKE 'ho%'"),
@@ -591,7 +591,7 @@ fn a_fold_without_its_expression_index_is_refused_rather_than_scanned() {
     // There is no `lower(name)` index, only `lower(kind)`.
     let error = f
         .db
-        .sql("SELECT k FROM evt WHERE lower(name) = 'tiga0'", &[])
+        .sql("SELECT k FROM evt WHERE lower(name) = 'tide0'", &[])
         .expect_err("a fold with no expression index must be refused");
     let text = error.to_string();
     assert!(

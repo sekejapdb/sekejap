@@ -3199,6 +3199,19 @@ fn m_graph_edges_count_pruned_visited_excludes_refused_max_edges_incoming() {
 
 // ── (n) ───────────────────────────────────────────────────────────────────
 
+/// M2-E: re-expressed over GQL's `RETURN`. Two sub-cases changed meaning,
+/// not just spelling, checked directly against the GQL implementation
+/// (`docs/LAYERS.md`; probed live before converting, since removed):
+///
+/// * the spatial radius form (`ST_DWithin`) is GQL profile M6 (`host
+///   function`, not built) rather than a Tier-1 acceptance, so it is now a
+///   refusal case naming that milestone.
+/// * the "unbound element" and `IS NULL` cases used to be refused by the
+///   legacy per-bracket-ownership and index-postings-only rules. GQL's
+///   binder places an inline conjunct wherever its variables are bound
+///   (M4-A design), and its `IS NULL` is an ordinary pure expression over
+///   the bound row (`lang/src/gql/eval.rs`'s `Ex::IsNull`), so BOTH now
+///   ACCEPT rather than refuse; the assertions below check that instead.
 #[test]
 fn n_sql_graph_table_forms() {
     with_fixture(|f| {
@@ -3222,90 +3235,105 @@ fn n_sql_graph_table_forms() {
 
         for (op, lit) in [(">", "0.0"), ("<", "1.0"), ("=", "'heavy'"), ("<>", "0.5")] {
             let sql = format!(
-                "SELECT k FROM GRAPH_TABLE (base MATCH \
-                    (a:person WHERE a._key = '{seed_key}')-[r:knows WHERE r.weight {op} {lit}]->(b:person) \
-                    COLUMNS (b._key AS k))"
+                "SELECT * FROM GRAPH_TABLE (base MATCH \
+                    (a IS person WHERE a._key = '{seed_key}')-[r:knows WHERE r.weight {op} {lit}]->(b IS person) \
+                    RETURN b._key AS k)"
             );
             match f.db.sql(&sql, &[]) {
                 Ok(SqlResult::Rows { .. }) => {}
+                // GQL's comparison is typed (`lang/src/gql/eval.rs::compare`):
+                // NULL and a MISSING property propagate gracefully (three-
+                // valued), but this fixture deliberately also gives some
+                // `knows` edges a TEXT `weight` ("heavy") among the mostly
+                // numeric ones, and a genuine type clash against the
+                // traversal's own literal is an error, not a silent
+                // non-match. That is a real difference from the removed
+                // legacy engine's untyped per-hop matching (which this exact
+                // adversarial mix is still pinned against directly, via the
+                // Rust API, by `j_five_hundred_sampled_traversals_equal_brute_force`),
+                // not a bug in this conversion.
+                Err(e) if e.to_string().contains("does not compare") => {}
                 Ok(other) => panic!("op {op}: {other:?}"),
                 Err(e) => panic!("inline edge WHERE {op} refused: {e}"),
             }
         }
 
         let range = format!(
-            "SELECT k FROM GRAPH_TABLE (base MATCH \
-                (a:person WHERE a._key = '{seed_key}')-[r:knows]->\
-                (b:person WHERE b.born BETWEEN 1900 AND 2020) \
-                COLUMNS (b._key AS k))"
+            "SELECT * FROM GRAPH_TABLE (base MATCH \
+                (a IS person WHERE a._key = '{seed_key}')-[r:knows]->\
+                (b IS person WHERE b.born >= 1900 AND b.born <= 2020) \
+                RETURN b._key AS k)"
         );
         match f.db.sql(&range, &[]) {
             Ok(SqlResult::Rows { .. }) => {}
             other => panic!("node range: {other:?}"),
         }
         let eq = format!(
-            "SELECT k FROM GRAPH_TABLE (base MATCH \
-                (a:person WHERE a._key = '{seed_key}')-[r:knows]->\
-                (b:person WHERE b.born = 1990) \
-                COLUMNS (b._key AS k))"
+            "SELECT * FROM GRAPH_TABLE (base MATCH \
+                (a IS person WHERE a._key = '{seed_key}')-[r:knows]->\
+                (b IS person WHERE b.born = 1990) \
+                RETURN b._key AS k)"
         );
         match f.db.sql(&eq, &[]) {
             Ok(SqlResult::Rows { .. }) => {}
             other => panic!("node eq: {other:?}"),
         }
+        // The spatial radius form is GQL profile M6 (host functions),
+        // which is not built: it is refused naming that milestone rather
+        // than answering.
         let radius = format!(
-            "SELECT k FROM GRAPH_TABLE (base MATCH \
-                (a:person WHERE a._key = '{seed_key}')-[r:knows]->\
-                (b:person WHERE ST_DWithin(b.loc, ST_SetSRID(ST_MakePoint({lon:?},{lat:?}),4326)::geography, {RADIUS_METRES}, true)) \
-                COLUMNS (b._key AS k))"
+            "SELECT * FROM GRAPH_TABLE (base MATCH \
+                (a IS person WHERE a._key = '{seed_key}')-[r:knows]->\
+                (b IS person WHERE ST_DWithin(b.loc, ST_SetSRID(ST_MakePoint({lon:?},{lat:?}),4326)::geography, {RADIUS_METRES}, true)) \
+                RETURN b._key AS k)"
         );
-        match f.db.sql(&radius, &[]) {
-            Ok(SqlResult::Rows { .. }) => {}
-            Err(e) => panic!("node radius: {e}"),
-            Ok(other) => panic!("node radius: {other:?}"),
-        }
+        let err = f.db.sql(&radius, &[]).unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("refused"), "node radius: {text}");
+        assert!(text.contains("host function"), "node radius: {text}");
+        assert!(text.contains("M6"), "node radius: {text}");
 
+        // An aliased edge property projects fine. The top-K selection the
+        // legacy test used (`ORDER BY t DESC LIMIT 5`) is GQL profile M3-B
+        // (a RETURN stage's ORDER BY / LIMIT), not built yet, so this only
+        // checks the projection itself, not a ranking.
         let cols = format!(
-            "SELECT t FROM GRAPH_TABLE (base MATCH \
-                (a:person WHERE a._key = '{seed_key}')-[r:knows]->(b:person) \
-                COLUMNS (r.tag AS t)) \
-             ORDER BY t DESC LIMIT 5"
+            "SELECT * FROM GRAPH_TABLE (base MATCH \
+                (a IS person WHERE a._key = '{seed_key}')-[r:knows]->(b IS person) \
+                RETURN r.tag AS t)"
         );
         match f.db.sql(&cols, &[]) {
-            Ok(SqlResult::Rows { columns, rows }) => {
+            Ok(SqlResult::Rows { columns, .. }) => {
                 assert_eq!(columns, vec!["t".to_owned()]);
-                assert!(rows.len() <= 5);
             }
-            other => panic!("COLUMNS(r.tag) ORDER BY alias: {other:?}"),
+            other => panic!("RETURN r.tag AS t: {other:?}"),
         }
 
+        // Accepted: an anonymous edge's inline WHERE naming the far node
+        // (bound later in the same pattern) is a filter on that node, not a
+        // refused element mismatch.
         let unbound = format!(
-            "SELECT k FROM GRAPH_TABLE (base MATCH \
-                (a:person WHERE a._key = '{seed_key}')-[:knows WHERE b.born > 1990]->(b:person) \
-                COLUMNS (b._key AS k))"
+            "SELECT * FROM GRAPH_TABLE (base MATCH \
+                (a IS person WHERE a._key = '{seed_key}')-[:knows WHERE b.born > 1990]->(b IS person) \
+                RETURN b._key AS k)"
         );
-        let err = f.db.sql(&unbound, &[]).unwrap_err();
-        let text = format!("{err}");
-        assert!(
-            text.contains("bound no variable")
-                || text.contains("refused")
-                || text.contains("element"),
-            "unbound element: {text}"
-        );
+        match f.db.sql(&unbound, &[]) {
+            Ok(SqlResult::Rows { .. }) => {}
+            other => panic!("forward-referencing inline WHERE: {other:?}"),
+        }
 
+        // Accepted: `IS NULL` inline is an ordinary pure expression over the
+        // bound row, not refused for being unanswerable from an index.
         let is_null = format!(
-            "SELECT k FROM GRAPH_TABLE (base MATCH \
-                (a:person WHERE a._key = '{seed_key}')-[r:knows]->\
-                (b:person WHERE b.born IS NULL) \
-                COLUMNS (b._key AS k))"
+            "SELECT * FROM GRAPH_TABLE (base MATCH \
+                (a IS person WHERE a._key = '{seed_key}')-[r:knows]->\
+                (b IS person WHERE b.born IS NULL) \
+                RETURN b._key AS k)"
         );
-        let err = f.db.sql(&is_null, &[]).unwrap_err();
-        let text = format!("{err}");
-        assert!(text.contains("refused"), "{text}");
-        assert!(
-            text.contains("Tier 3") || text.contains("IS NULL") || text.contains("nullish"),
-            "IS NULL must name the tier: {text}"
-        );
+        match f.db.sql(&is_null, &[]) {
+            Ok(SqlResult::Rows { .. }) => {}
+            other => panic!("inline IS NULL: {other:?}"),
+        }
     });
 }
 

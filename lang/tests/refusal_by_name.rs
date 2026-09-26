@@ -35,10 +35,6 @@ fn open() -> (TempDir, fixture::Fixture) {
     (dir, f)
 }
 
-/// The seed of every `GRAPH_TABLE` statement below, so the pattern under test
-/// is the only thing that differs between them.
-const SEED: &str = "(a:place WHERE a._key = 'k00000')";
-
 /// For each construct whose POSITION is the whole point, the statement a user
 /// would really write. Every key must be a row of `refuse::TABLE`, which
 /// `every_natural_position_names_a_row_the_table_still_holds` asserts, so a
@@ -79,27 +75,15 @@ const NATURAL_POSITION: &[(&str, &str)] = &[
     ),
     // `CREATE SCHEMA` left the table with named schemas
     // (`lang/tests/sql_schema_segment.rs`).
-    // ── §4.3: a pattern MODE word stands between MATCH and the pattern ────
-    (
-        "TRAIL",
-        "SELECT k FROM GRAPH_TABLE (routes MATCH TRAIL (a:place WHERE a._key = 'k00000')-[:near]->(b:place) COLUMNS (b._key AS k))",
-    ),
-    (
-        "WALK",
-        "SELECT k FROM GRAPH_TABLE (routes MATCH WALK (a:place WHERE a._key = 'k00000')-[:near]->(b:place) COLUMNS (b._key AS k))",
-    ),
-    (
-        "SIMPLE",
-        "SELECT k FROM GRAPH_TABLE (routes MATCH SIMPLE (a:place WHERE a._key = 'k00000')-[:near]->(b:place) COLUMNS (b._key AS k))",
-    ),
-    (
-        "ANY SHORTEST",
-        "SELECT k FROM GRAPH_TABLE (routes MATCH ANY SHORTEST (a:place WHERE a._key = 'k00000')-[:near]->(b:place) COLUMNS (b._key AS k))",
-    ),
-    (
-        "ALL SHORTEST",
-        "SELECT k FROM GRAPH_TABLE (routes MATCH ALL SHORTEST (a:place WHERE a._key = 'k00000')-[:near]->(b:place) COLUMNS (b._key AS k))",
-    ),
+    // §4.3's pattern words lost their NATURAL position here in M2-E: a
+    // `GRAPH_TABLE (...)` body is parsed as GQL only now, and inside a GQL
+    // body `TRAIL` / `WALK` / `ANY SHORTEST` are BUILT (M4-A path prefixes
+    // and selectors), so they left `refuse::TABLE`. `SIMPLE` and
+    // `ALL SHORTEST` are still refused there as GQL profile P1 rows
+    // (`refuse::GQL_TABLE`); their rows in `refuse::TABLE` fall through to
+    // the generic bare-predicate position below, which still reaches them
+    // (a plain SQL statement, outside any GRAPH_TABLE body, refuses them by
+    // name).
     // ── §4.7: an aggregate or a window function stands in the select list ─
     ("OVER", "SELECT count(*) OVER () FROM place"),
     ("ARRAY_AGG", "SELECT array_agg(kind) FROM place"),
@@ -173,15 +157,15 @@ const NATURAL_POSITION: &[(&str, &str)] = &[
     ("VECTOR_DIMS", "SELECT vector_dims(emb) FROM place"),
     ("VECTOR_NORM", "SELECT vector_norm(emb) FROM place"),
     ("L2_NORMALIZE", "SELECT l2_normalize(emb) FROM place"),
-    ("TS_HEADLINE", "SELECT ts_headline(text, 'kebun') FROM place"),
-    ("HIGHLIGHT", "SELECT highlight(text, 'kebun') FROM place"),
+    ("TS_HEADLINE", "SELECT ts_headline(text, 'garden') FROM place"),
+    ("HIGHLIGHT", "SELECT highlight(text, 'garden') FROM place"),
     (
         "WEBSEARCH_TO_TSQUERY",
-        "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ websearch_to_tsquery('kebun')",
+        "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ websearch_to_tsquery('garden')",
     ),
     (
         "PLAINTO_TSQUERY",
-        "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ plainto_tsquery('kebun')",
+        "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ plainto_tsquery('garden')",
     ),
     // ── §2: a pg_catalog relation this surface does not have ─────────────
     ("PG_PROC", "SELECT proname FROM pg_proc"),
@@ -352,11 +336,17 @@ fn the_projection_expression_constructs_are_refused_by_name_in_both_positions() 
     }
 }
 
-/// The set operators and the pattern modes, said once more on their own,
-/// because they are the three the owner asked for by name and the three the
-/// contract wrote down as open gaps (§7 item 10).
+/// The set operators, said once more on their own, because they are among
+/// the owner-named gaps of §7 item 10.
+///
+/// This used to also say the pattern modes (`TRAIL`, `WALK`, `SIMPLE`) once
+/// more, in their own `GRAPH_TABLE` position. M2-E removed that position: a
+/// `GRAPH_TABLE (...)` body is parsed as GQL only now, and inside a GQL body
+/// `TRAIL` and `WALK` are BUILT, not refused (M4-A); `SIMPLE` is still
+/// refused, but as a GQL profile P1 row (`refuse::GQL_TABLE`), a different
+/// table from the one under test here.
 #[test]
-fn the_set_operators_and_the_pattern_modes_are_tier_three_not_a_syntax_error() {
+fn the_set_operators_are_tier_three_not_a_syntax_error() {
     let (_dir, mut f) = open();
     for (statement, keyword) in [
         (
@@ -374,24 +364,6 @@ fn the_set_operators_and_the_pattern_modes_are_tier_three_not_a_syntax_error() {
         (
             "SELECT kind, count(*) FROM place GROUP BY kind INTERSECT SELECT kind, count(*) FROM place GROUP BY kind",
             "INTERSECT",
-        ),
-        (
-            &format!(
-                "SELECT k FROM GRAPH_TABLE (routes MATCH TRAIL {SEED}-[:near]->(b:place) COLUMNS (b._key AS k))"
-            ),
-            "TRAIL",
-        ),
-        (
-            &format!(
-                "SELECT k FROM GRAPH_TABLE (routes MATCH WALK {SEED}-[:near]->(b:place) COLUMNS (b._key AS k))"
-            ),
-            "WALK",
-        ),
-        (
-            &format!(
-                "SELECT k FROM GRAPH_TABLE (routes MATCH SIMPLE {SEED}-[:near]->(b:place) COLUMNS (b._key AS k))"
-            ),
-            "SIMPLE",
         ),
     ] {
         let error = f

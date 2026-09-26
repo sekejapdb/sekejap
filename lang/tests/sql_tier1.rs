@@ -319,18 +319,18 @@ fn a_tsquery_compiles_to_any_all_and_phrase() {
     let (_dir, mut f) = open();
     for (sql, query, matching) in [
         (
-            "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'kebun | sawah')",
-            "kebun sawah",
+            "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'garden | field')",
+            "garden field",
             TextMatch::Any,
         ),
         (
-            "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'kebun & sawah')",
-            "kebun sawah",
+            "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'garden & field')",
+            "garden field",
             TextMatch::All,
         ),
         (
-            "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', '\"kebun sawah\"')",
-            "kebun sawah",
+            "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', '\"garden field\"')",
+            "garden field",
             TextMatch::Phrase,
         ),
     ] {
@@ -357,7 +357,7 @@ fn a_one_term_tsquery_is_any_of_one_term() {
         f.place,
         &[QueryFilter::Text {
             index: f.index.text,
-            query: "kebun",
+            query: "garden",
             matching: TextMatch::Any,
         }],
         QueryOrder::Driver,
@@ -366,7 +366,7 @@ fn a_one_term_tsquery_is_any_of_one_term() {
     let got = sql_ids(
         &mut f.db,
         "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1)",
-        &[Param::Text("kebun".into())],
+        &[Param::Text("garden".into())],
     );
     assert_eq!(got, expected);
     assert!(!expected.is_empty());
@@ -641,12 +641,12 @@ fn ts_rank_cd_and_bm25_are_the_same_order() {
         f.place,
         &[QueryFilter::Text {
             index: f.index.text,
-            query: "kebun",
+            query: "garden",
             matching: TextMatch::Any,
         }],
         QueryOrder::Bm25 {
             index: f.index.text,
-            query: "kebun",
+            query: "garden",
             matching: TextMatch::Any,
         },
         Some(10),
@@ -654,8 +654,8 @@ fn ts_rank_cd_and_bm25_are_the_same_order() {
     let by_rank = sql_ids(
         &mut f.db,
         "SELECT _id FROM place \
-         WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'kebun') \
-         ORDER BY ts_rank_cd(to_tsvector('simple', text), to_tsquery('simple', 'kebun')) DESC \
+         WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'garden') \
+         ORDER BY ts_rank_cd(to_tsvector('simple', text), to_tsquery('simple', 'garden')) DESC \
          LIMIT 10",
         &[],
     );
@@ -663,8 +663,8 @@ fn ts_rank_cd_and_bm25_are_the_same_order() {
     let by_bm25 = sql_ids(
         &mut f.db,
         "SELECT _id FROM place \
-         WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'kebun') \
-         ORDER BY bm25(text, 'kebun') DESC LIMIT 10",
+         WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'garden') \
+         ORDER BY bm25(text, 'garden') DESC LIMIT 10",
         &[],
     );
     assert_eq!(by_bm25, expected);
@@ -681,7 +681,7 @@ fn an_arithmetic_order_is_one_score_expression() {
     let one = ScoreExpr::Lit(1.0);
     let bm25 = ScoreExpr::Bm25 {
         index: f.index.text,
-        query: "kebun",
+        query: "garden",
         matching: TextMatch::Any,
     };
     let similarity = ScoreExpr::VectorSimilarity {
@@ -699,7 +699,7 @@ fn an_arithmetic_order_is_one_score_expression() {
         &[
             QueryFilter::Text {
                 index: f.index.text,
-                query: "kebun",
+                query: "garden",
                 matching: TextMatch::Any,
             },
             QueryFilter::Point {
@@ -723,7 +723,7 @@ fn an_arithmetic_order_is_one_score_expression() {
            AND ST_DWithin(loc, ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography, $4) \
          ORDER BY 0.5 * bm25(text, $1) + 0.5 * (1 - (emb <=> $5::vector)) DESC LIMIT 10",
         &[
-            Param::Text("kebun".into()),
+            Param::Text("garden".into()),
             Param::Float(centre.longitude()),
             Param::Float(centre.latitude()),
             Param::Float(20_000.0),
@@ -739,9 +739,9 @@ fn the_ranking_value_can_be_projected_under_an_alias() {
     let (_dir, mut f) = open();
     let (columns, rows) = sql_rows(
         &mut f.db,
-        "SELECT _id, ts_rank_cd(to_tsvector('simple', text), to_tsquery('simple', 'kebun')) AS score \
-         FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'kebun') \
-         ORDER BY ts_rank_cd(to_tsvector('simple', text), to_tsquery('simple', 'kebun')) DESC LIMIT 5",
+        "SELECT _id, ts_rank_cd(to_tsvector('simple', text), to_tsquery('simple', 'garden')) AS score \
+         FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'garden') \
+         ORDER BY ts_rank_cd(to_tsvector('simple', text), to_tsquery('simple', 'garden')) DESC LIMIT 5",
         &[],
     );
     assert_eq!(columns, vec!["_id", "score"]);
@@ -795,7 +795,7 @@ fn a_parameter_takes_its_type_from_its_position() {
     let text = sql_ids(
         &mut f.db,
         "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1)",
-        &[Param::Text("kopi | danau".into())],
+        &[Param::Text("coffee | lake".into())],
     );
     assert!(!text.is_empty());
     // An Int parameter in a Text column is refused rather than coerced.
@@ -821,9 +821,9 @@ fn insert_update_delete_walk_the_key() {
                 ($12, $12, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         &[
             Param::Text("z00001".into()),
-            Param::Text("kebun baru".into()),
-            Param::Text("kopi sawah danau".into()),
-            Param::Text("kebun baru kopi sawah danau".into()),
+            Param::Text("garden new".into()),
+            Param::Text("coffee field lake".into()),
+            Param::Text("garden new coffee field lake".into()),
             Param::Int(19_990_101),
             Param::Text("depot".into()),
             Param::Text(r#"{"type":"Point","coordinates":[106.8,-6.2]}"#.into()),
@@ -865,7 +865,7 @@ fn insert_update_delete_walk_the_key() {
     assert_eq!(after.document["born"], serde_json::json!(20_000_101));
     assert_eq!(after.document["kind"], serde_json::json!("park"));
     // A partial update keeps the fields it did not name.
-    assert_eq!(after.document["name"], serde_json::json!("kebun baru"));
+    assert_eq!(after.document["name"], serde_json::json!("garden new"));
 
     assert_eq!(
         affected(
@@ -946,7 +946,7 @@ fn create_table_and_create_index_build_a_queryable_collection() {
             &[
                 Param::Text(format!("t{i:03}")),
                 Param::Text(format!("town {i}")),
-                Param::Text(format!("kebun {} sawah", fixture::VOCAB[i % 12])),
+                Param::Text(format!("garden {} field", fixture::VOCAB[i % 12])),
                 Param::Int(1900 + i as i64),
                 Param::Float(i as f64 / 2.0),
                 Param::Bool(i % 2 == 0),
@@ -990,7 +990,7 @@ fn create_table_and_create_index_build_a_queryable_collection() {
 
     let SqlResult::Rows { rows, .. } = db
         .sql(
-            "SELECT _key FROM town WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'kebun')",
+            "SELECT _key FROM town WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'garden')",
             &[],
         )
         .unwrap()
@@ -1023,11 +1023,16 @@ fn create_table_and_create_index_build_a_queryable_collection() {
 
 // ── GRAPH_TABLE ───────────────────────────────────────────────────────────
 
+/// M2-E: GQL runs on its own engine (`core/engine/src/query/gql/`), not
+/// `QueryFilter::Graph` / `BfsRequest`, and a GQL row carries `NO_OWNER`
+/// rather than one entity's id (M2-D), so the oracle comparison moves from
+/// `row.id` to the returned KEY column -- the direct BFS oracle is still the
+/// right independent check of which keys a bounded traversal reaches.
 #[test]
 fn graph_table_compiles_to_one_bounded_traversal() {
     let (_dir, mut f) = open();
     let seed = f.db.get(f.place, "k00000").unwrap().unwrap().id;
-    let expected = direct(
+    let expected_ids = direct(
         &f.db,
         f.place,
         &[QueryFilter::Graph(
@@ -1049,13 +1054,26 @@ fn graph_table_compiles_to_one_bounded_traversal() {
         QueryOrder::Driver,
         None,
     );
-    let got = sql_ids(
+    let mut expected: Vec<String> = expected_ids
+        .iter()
+        .map(|id| f.db.get_by_id(*id).unwrap().unwrap().key)
+        .collect();
+    expected.sort_unstable();
+    let (_columns, rows) = sql_rows(
         &mut f.db,
-        "SELECT k FROM GRAPH_TABLE (routes MATCH \
-            (a:place WHERE a._key = $1)-[:near]->{1,3}(b:place) \
-            COLUMNS (b._key AS k))",
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            (a IS place WHERE a._key = $1)-[:near]->{1,3}(b IS place) \
+            RETURN b._key AS k)",
         &[Param::Text("k00000".into())],
     );
+    let mut got: Vec<String> = rows
+        .into_iter()
+        .map(|row| match row.into_iter().next() {
+            Some(SqlValue::Text(text)) => text,
+            other => panic!("k is not one text value: {other:?}"),
+        })
+        .collect();
+    got.sort_unstable();
     assert_eq!(got, expected);
     assert_eq!(got.len(), 3, "one, two and three hops along the chain");
 }
@@ -1596,11 +1614,14 @@ fn graph_table_inline_edge_where_compiles_to_a_per_hop_prune() {
         QueryOrder::Driver,
         None,
     );
+    // Both sides are EMPTY here (weight 0.0 on the first hop is not > 0.2),
+    // so the comparison below does not depend on a GQL row's id (M2-D:
+    // `NO_OWNER`) -- an empty answer either way.
     let got = sql_ids(
         &mut f.db,
-        "SELECT k FROM GRAPH_TABLE (routes MATCH \
-            (a:place WHERE a._key = $1)-[r:weighted WHERE r.weight > 0.2]->{1,4}(b:place) \
-            COLUMNS (b._key AS k))",
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            (a IS place WHERE a._key = $1)-[r:weighted WHERE r.weight > 0.2]->{1,4}(b IS place) \
+            RETURN b._key AS k)",
         &[Param::Text("k00000".into())],
     );
     assert_eq!(got, expected);
@@ -1609,9 +1630,9 @@ fn graph_table_inline_edge_where_compiles_to_a_per_hop_prune() {
     assert!(got.is_empty(), "weight 0.0 on the first hop is not > 0.2");
     let unpruned = sql_ids(
         &mut f.db,
-        "SELECT k FROM GRAPH_TABLE (routes MATCH \
-            (a:place WHERE a._key = $1)-[r:weighted]->{1,4}(b:place) \
-            COLUMNS (b._key AS k))",
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            (a IS place WHERE a._key = $1)-[r:weighted]->{1,4}(b IS place) \
+            RETURN b._key AS k)",
         &[Param::Text("k00000".into())],
     );
     assert_eq!(unpruned.len(), 4, "four hops along the chain");
@@ -1620,9 +1641,9 @@ fn graph_table_inline_edge_where_compiles_to_a_per_hop_prune() {
     // pattern.
     let admitted = sql_ids(
         &mut f.db,
-        "SELECT k FROM GRAPH_TABLE (routes MATCH \
-            (a:place WHERE a._key = $1)-[r:weighted WHERE r.weight > 0.2]->{1,4}(b:place) \
-            COLUMNS (b._key AS k))",
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            (a IS place WHERE a._key = $1)-[r:weighted WHERE r.weight > 0.2]->{1,4}(b IS place) \
+            RETURN b._key AS k)",
         &[Param::Text("k00003".into())],
     );
     assert_eq!(admitted.len(), 4);
@@ -1630,9 +1651,9 @@ fn graph_table_inline_edge_where_compiles_to_a_per_hop_prune() {
     // third hop is weight 0.5, so `< 0.5` returns two rows.
     let cut = sql_ids(
         &mut f.db,
-        "SELECT k FROM GRAPH_TABLE (routes MATCH \
-            (a:place WHERE a._key = $1)-[r:weighted WHERE r.weight < 0.5]->{1,4}(b:place) \
-            COLUMNS (b._key AS k))",
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            (a IS place WHERE a._key = $1)-[r:weighted WHERE r.weight < 0.5]->{1,4}(b IS place) \
+            RETURN b._key AS k)",
         &[Param::Text("k00003".into())],
     );
     assert_eq!(cut.len(), 2, "the chain stops at the first refused edge");
@@ -1676,27 +1697,42 @@ fn graph_table_inline_node_where_compiles_to_a_membership_prune() {
         QueryOrder::Driver,
         None,
     );
-    let got = sql_ids(
+    let mut expected: Vec<String> = expected
+        .iter()
+        .map(|id| f.db.get_by_id(*id).unwrap().unwrap().key)
+        .collect();
+    expected.sort_unstable();
+    let (_columns, rows) = sql_rows(
         &mut f.db,
-        "SELECT k FROM GRAPH_TABLE (routes MATCH \
-            (a:place WHERE a._key = $1)-[r:weighted]->{1,4}\
-            (b:place WHERE b.born BETWEEN 19500101 AND 19600101) \
-            COLUMNS (b._key AS k))",
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            (a IS place WHERE a._key = $1)-[r:weighted]->{1,4}\
+            (b IS place WHERE b.born >= 19500101 AND b.born <= 19600101) \
+            RETURN b._key AS k)",
         &[Param::Text("k00000".into())],
     );
+    let mut got: Vec<String> = rows
+        .into_iter()
+        .map(|row| match row.into_iter().next() {
+            Some(SqlValue::Text(text)) => text,
+            other => panic!("k is not one text value: {other:?}"),
+        })
+        .collect();
+    got.sort_unstable();
     assert_eq!(got, expected);
 }
 
+/// M2-E: re-expressed over GQL's `RETURN`, ranked by the RETURN stage's own
+/// `ORDER BY` / `LIMIT` (M3-B).
 #[test]
-fn graph_table_columns_project_the_reaching_edge_and_order_by_it() {
+fn graph_table_return_projects_the_reaching_edge_and_order_by_it() {
     let (_dir, mut f) = open();
     let _ = weighted_graph(&mut f);
     let (columns, rows) = sql_rows(
         &mut f.db,
-        "SELECT k, w FROM GRAPH_TABLE (routes MATCH \
-            (a:place WHERE a._key = $1)-[r:weighted]->{1,6}(b:place) \
-            COLUMNS (b._key AS k, r.weight AS w)) \
-         ORDER BY w DESC LIMIT 3",
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            (a IS place WHERE a._key = $1)-[:weighted]->{0,5}(x IS place)-[r:weighted]->(b IS place) \
+            RETURN b._key AS k, r.weight AS w \
+            ORDER BY w DESC LIMIT 3)",
         &[Param::Text("k00000".into())],
     );
     assert_eq!(columns, vec!["k".to_owned(), "w".to_owned()]);
@@ -1717,143 +1753,167 @@ fn graph_table_columns_project_the_reaching_edge_and_order_by_it() {
     assert_eq!(weights, vec![0.5, 0.4, 0.3]);
 }
 
+/// M2-E: the legacy engine refused an inline node predicate it could not
+/// answer from index postings without opening a row (`IS NULL`, a text
+/// search), naming GRAPH_CONTRACT 4.3. GQL's inline predicates are an
+/// ordinary pure expression over the bound row (`docs/LAYERS.md`: "lang may
+/// evaluate pure expressions over values core has already handed it"), so
+/// `IS NULL` inline is now ACCEPTED rather than refused -- confirmed against
+/// `lang/src/gql/eval.rs`'s `Ex::IsNull`, which is unconditional. That half
+/// of this test is DELETED, not converted: the property it pinned (an
+/// index-answerable-only inline predicate) does not hold for GQL.
+///
+/// A text search is still refused inline, but for a different reason: the
+/// GQL M2/M3-C expression pack does not have `to_tsvector`/`to_tsquery` yet
+/// (GQL profile M6, "host function"), so the case that remains is converted
+/// to that refusal.
 #[test]
-fn a_row_bound_inline_node_predicate_is_refused_with_its_tier() {
+fn a_text_search_inline_node_predicate_is_refused_naming_its_milestone() {
     let (_dir, mut f) = open();
     let _ = weighted_graph(&mut f);
-    for (sql, needle) in [
-        (
-            "SELECT k FROM GRAPH_TABLE (routes MATCH \
-                (a:place WHERE a._key = 'k00000')-[r:weighted]->(b:place WHERE b.born IS NULL) \
-                COLUMNS (b._key AS k))",
-            "nullish index key",
-        ),
-        (
-            "SELECT k FROM GRAPH_TABLE (routes MATCH \
-                (a:place WHERE a._key = 'k00000')-[r:weighted]->\
-                (b:place WHERE to_tsvector('simple', b.text) @@ to_tsquery('simple', 'harbour')) \
-                COLUMNS (b._key AS k))",
-            "index postings",
-        ),
-    ] {
-        let error = f.db.sql(sql, &[]).unwrap_err();
-        let text = format!("{error}");
-        assert!(text.contains("refused"), "{text}");
-        assert!(text.contains(needle), "{text}");
-    }
+    let error = f
+        .db
+        .sql(
+            "SELECT * FROM GRAPH_TABLE (routes MATCH \
+                (a IS place WHERE a._key = 'k00000')-[r:weighted]->\
+                (b IS place WHERE to_tsvector('simple', b.text) @@ to_tsquery('simple', 'harbour')) \
+                RETURN b._key AS k)",
+            &[],
+        )
+        .unwrap_err();
+    let text = format!("{error}");
+    assert!(text.contains("refused"), "{text}");
+    assert!(text.contains("host function"), "{text}");
+    assert!(text.contains("M6"), "{text}");
 }
 
-/// D1 in the SQL surface: a `_key` predicate beside a `GRAPH_TABLE` that
-/// reads the reaching edge is a POST-FILTER, so the traversal keeps the
-/// driver (`GRAPH_CONTRACT 4.2`: the edge is carried by the walk that crossed
-/// it and by nothing else) and the key range is answered from the external
-/// key the row itself carries. The statement used to compile onto the keys
-/// driver, where every edge column was `Missing` and the ranking a total tie.
+/// D1 in the SQL surface: a `_key` predicate beside a traversal that reads
+/// the reaching edge is a POST-FILTER, so the traversal keeps driving
+/// (`GRAPH_CONTRACT 4.2`: the edge is carried by the walk that crossed it and
+/// by nothing else) and the key range is answered from the external key the
+/// row itself carries, not from `Missing` edge columns.
+///
+/// M2-E: re-expressed with the key range as a GQL pattern `WHERE` (a
+/// post-filter on completed matches, the same role the legacy outer `WHERE`
+/// played) rather than an outer SQL clause, since an outer clause over a GQL
+/// relation is refused until M3-D. The ranking (`ORDER BY w DESC`) is
+/// dropped rather than ignored whole: the four rows are compared as an
+/// unordered (key, weight) set, which still proves the edge column is the
+/// reaching edge's own and not `Missing`.
+///
+/// The pattern splits the hop count into an UNNAMED repeat (`{0,5}`) plus
+/// one more NAMED hop: `r`, quantified directly (`-[r:...]->{1,6}`), is a
+/// GROUP variable everywhere outside its own repeat's inline predicates and
+/// COST (M4-A design), so `RETURN r.weight` on it is refused, naming M4-D.
+/// Splitting off the last hop keeps `r` a singleton -- the reaching edge --
+/// while the walk is still 1 to 6 hops deep.
 #[test]
 fn a_key_post_filter_beside_a_graph_table_keeps_the_traversal_driving() {
     let (_dir, mut f) = open();
     let _ = weighted_graph(&mut f);
     let (columns, rows) = sql_rows(
         &mut f.db,
-        "SELECT k, w FROM GRAPH_TABLE (routes MATCH \
-            (a:place WHERE a._key = $1)-[r:weighted]->{1,6}(b:place) \
-            COLUMNS (b._key AS k, r.weight AS w)) \
-         WHERE _key <= 'k00004' ORDER BY w DESC",
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            (a IS place WHERE a._key = $1)-[:weighted]->{0,5}(x IS place)-[r:weighted]->(b IS place) \
+            WHERE b._key <= 'k00004' \
+            RETURN b._key AS k, r.weight AS w)",
         &[Param::Text("k00000".into())],
     );
     assert_eq!(columns, vec!["k".to_owned(), "w".to_owned()]);
     // The chain leaves k00000 for k00001..k00006 with weights 0.0..0.5; the
-    // key range keeps the first four of them.
-    let keys: Vec<String> = rows
+    // key range keeps the first four of them, each with the edge that
+    // reached it.
+    let mut got: Vec<(String, f64)> = rows
         .iter()
-        .map(|row| match &row[0] {
-            SqlValue::Text(value) => value.clone(),
-            other => panic!("key came back as {other:?}"),
+        .map(|row| {
+            let key = match &row[0] {
+                SqlValue::Text(value) => value.clone(),
+                other => panic!("key came back as {other:?}"),
+            };
+            let weight = match &row[1] {
+                SqlValue::Float(value) => *value,
+                other => panic!("edge weight came back as {other:?}, not the edge's own"),
+            };
+            (key, weight)
         })
         .collect();
-    assert_eq!(keys, vec!["k00004", "k00003", "k00002", "k00001"]);
-    let weights: Vec<f64> = rows
-        .iter()
-        .map(|row| match &row[1] {
-            SqlValue::Float(value) => *value,
-            other => panic!("edge weight came back as {other:?}, not the edge's own"),
-        })
-        .collect();
-    assert_eq!(weights, vec![0.3, 0.2, 0.1, 0.0]);
-}
-
-/// D6: an edge alias in `COLUMNS` is matched the way every other name in this
-/// parser is -- without case. `R.weight` against a pattern that bound `r` is
-/// the EDGE's property, not a row field of the far node that does not exist.
-#[test]
-fn an_edge_alias_in_columns_is_matched_without_case() {
-    let (_dir, mut f) = open();
-    let _ = weighted_graph(&mut f);
-    let lower = sql_rows(
-        &mut f.db,
-        "SELECT w FROM GRAPH_TABLE (routes MATCH \
-            (a:place WHERE a._key = 'k00000')-[r:weighted]->{1,6}(b:place) \
-            COLUMNS (r.weight AS w)) \
-         ORDER BY w DESC LIMIT 3",
-        &[],
-    );
-    let upper = sql_rows(
-        &mut f.db,
-        "SELECT w FROM GRAPH_TABLE (routes MATCH \
-            (a:place WHERE a._key = 'k00000')-[r:weighted]->{1,6}(b:place) \
-            COLUMNS (R.weight AS w)) \
-         ORDER BY w DESC LIMIT 3",
-        &[],
-    );
-    assert_eq!(lower, upper);
+    got.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(
-        lower.1,
+        got,
         vec![
-            vec![SqlValue::Float(0.5)],
-            vec![SqlValue::Float(0.4)],
-            vec![SqlValue::Float(0.3)],
+            ("k00001".to_owned(), 0.0),
+            ("k00002".to_owned(), 0.1),
+            ("k00003".to_owned(), 0.2),
+            ("k00004".to_owned(), 0.3),
         ]
     );
 }
 
-/// D5: an ANONYMOUS edge element bound no variable, so a qualified name in
-/// its inline WHERE names something else. Compiling it as an edge property
-/// would test the bag for a key it does not carry and return no rows at all.
-/// D7: a three-part name inside `GRAPH_TABLE` is a syntax error naming that
-/// construct, not a `CREATE SCHEMA` refusal.
+/// D6: an edge variable referenced in `RETURN` is matched the way every
+/// other name in this dialect is -- without case (`lang/src/gql/schema.rs`:
+/// an unquoted name is folded to lower case). `R.weight` against a pattern
+/// that bound `r` is the EDGE's property, not a row field of the far node
+/// that does not exist.
+///
+/// M2-E: re-expressed over GQL's `RETURN`; the `ORDER BY ... LIMIT` top-3
+/// selection the legacy test used to get a small deterministic answer is
+/// GQL profile M3-B, not built yet, so this compares the FULL six-hop
+/// weight multiset instead of the top three -- the case-insensitivity is
+/// what is at risk here, not the ranking.
+///
+/// As in the test above, the hop count is split into an unnamed `{0,5}`
+/// repeat plus one more named hop, so `r` -- quantified directly, it would
+/// be a GROUP variable -- stays a singleton in `RETURN` (M4-A design).
 #[test]
-fn a_graph_table_refuses_a_name_that_belongs_to_another_element() {
+fn an_edge_variable_is_matched_without_case() {
     let (_dir, mut f) = open();
     let _ = weighted_graph(&mut f);
-    for (sql, needle) in [
-        (
-            "SELECT k FROM GRAPH_TABLE (routes MATCH \
-                (a:place WHERE a._key = 'k00000')-[:weighted WHERE b.born > 1990]->(b:place) \
-                COLUMNS (b._key AS k))",
-            "bound no variable",
-        ),
-        (
-            "SELECT k FROM GRAPH_TABLE (routes MATCH \
-                (a:place WHERE a._key = 'k00000')-[r:weighted WHERE b.born > 1990]->(b:place) \
-                COLUMNS (b._key AS k))",
-            "names its own element",
-        ),
-        (
-            "SELECT k FROM GRAPH_TABLE (routes MATCH \
-                (a:place WHERE a._key = 'k00000')-[r:weighted]->(b:place) \
-                COLUMNS (x.y.z AS k))",
-            "GRAPH_TABLE element name",
-        ),
-    ] {
-        let error = f.db.sql(sql, &[]).unwrap_err();
-        let text = format!("{error}");
-        assert!(text.contains(needle), "want `{needle}`, got: {text}");
-        assert!(
-            !text.contains("CREATE SCHEMA"),
-            "a GRAPH_TABLE name was refused as a schema qualifier: {text}"
-        );
-    }
+    let lower = sql_rows(
+        &mut f.db,
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            (a IS place WHERE a._key = 'k00000')-[:weighted]->{0,5}(x IS place)-[r:weighted]->(b IS place) \
+            RETURN r.weight AS w)",
+        &[],
+    );
+    let upper = sql_rows(
+        &mut f.db,
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            (a IS place WHERE a._key = 'k00000')-[:weighted]->{0,5}(x IS place)-[r:weighted]->(b IS place) \
+            RETURN R.weight AS w)",
+        &[],
+    );
+    assert_eq!(lower, upper);
+    let mut weights: Vec<f64> = lower
+        .1
+        .iter()
+        .map(|row| match &row[0] {
+            SqlValue::Float(value) => *value,
+            other => panic!("edge weight came back as {other:?}"),
+        })
+        .collect();
+    weights.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(weights, vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5]);
 }
+
+// M2-E: `a_graph_table_refuses_a_name_that_belongs_to_another_element`
+// (D5/D7) is DELETED, not converted.
+//
+// D5 pinned that the legacy parser refused a qualified name inside an
+// edge's inline WHERE when it named something other than that edge's own
+// bound variable (an anonymous edge, or the wrong element). Probed directly
+// against GQL (`lang/tests/gql_patterns.rs`, since removed): a forward
+// reference to a LATER pattern variable from an earlier edge's inline WHERE
+// is ACCEPTED and correctly bound there, both for an anonymous edge and for
+// a named one whose WHERE names a different element. M4-A's binder places
+// an inline conjunct "at the FIRST line position where everything it names
+// is bound" (design), which is a strictly more general rule than the legacy
+// per-bracket ownership check, so the refusal this pinned no longer holds.
+//
+// D7 pinned that a three-part name (`x.y.z`) inside `GRAPH_TABLE` is a
+// syntax error naming the construct, not a `CREATE SCHEMA` refusal. GQL's
+// own property-reference grammar is one variable and one property only,
+// pinned already by `lang/tests/gql_parse.rs`'s
+// `a_property_reference_is_one_variable_and_one_property`.
 
 // ── §3 boolean predicates: OR, IN, NOT, `<>`, IS NOT NULL, EXISTS ────────
 //
@@ -2092,12 +2152,12 @@ fn a_disjunction_across_two_families_unions_two_sets() {
         "SELECT _id FROM place \
          WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1) OR born < $2 \
          ORDER BY _id",
-        &[Param::Text("kebun".into()), Param::Int(19_520_101)],
+        &[Param::Text("garden".into()), Param::Int(19_520_101)],
     );
     let want = with_union(
         QueryFilter::Text {
             index: f.index.text,
-            query: "kebun",
+            query: "garden",
             matching: TextMatch::Any,
         },
         QueryFilter::Scalar {
@@ -2296,13 +2356,13 @@ fn a_negated_tsquery_is_the_complement_of_the_text_set() {
         &mut f.db,
         "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1) \
          ORDER BY _id",
-        &[Param::Text("!kebun".into())],
+        &[Param::Text("!garden".into())],
     );
     let with = sql_ids(
         &mut f.db,
         "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1) \
          ORDER BY _id",
-        &[Param::Text("kebun".into())],
+        &[Param::Text("garden".into())],
     );
     assert!(!with.is_empty() && !without.is_empty());
     assert_eq!(with.len() + without.len(), fixture::ROWS);

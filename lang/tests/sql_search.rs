@@ -141,15 +141,15 @@ fn a_typo_tolerant_search_names_the_rows_a_brute_force_walk_of_the_vocabulary_na
     // As written, with one substitution, with one deletion, and truncated so
     // the final token has to complete.
     for query in [
-        "kebun",
-        "kebin",
-        "kebu",
-        "sekolah",
-        "sekolzh",
-        "sekol",
-        "jembatan kopi",
-        "jembztan kopi",
-        "kebun sekol",
+        "garden",
+        "gardem",
+        "garde",
+        "harbour",
+        "harbouz",
+        "harbo",
+        "mountain coffee",
+        "mounzain coffee",
+        "garden harbo",
     ] {
         let statement =
             format!("SELECT _id FROM place WHERE search(text, '{query}') ORDER BY _id");
@@ -167,20 +167,20 @@ fn a_typo_tolerant_search_names_the_rows_a_brute_force_walk_of_the_vocabulary_na
 #[test]
 fn the_last_token_of_a_search_completes_as_a_prefix_and_an_earlier_token_does_not() {
     let (_dir, mut f) = open();
-    // `sekol` is five characters: one edit, which does not reach `sekolah`.
+    // `harbo` is five characters: one edit, which does not reach `harbour`.
     // Written last it completes; written first it must not.
-    let completing = sql_ids(&mut f.db, "SELECT _id FROM place WHERE search(text, 'sekol')");
+    let completing = sql_ids(&mut f.db, "SELECT _id FROM place WHERE search(text, 'harbo')");
     assert!(!completing.is_empty());
-    assert_eq!(keys_of(&f, &completing), oracle_keys(&f, "sekol"));
+    assert_eq!(keys_of(&f, &completing), oracle_keys(&f, "harbo"));
     let earlier = sql_ids(
         &mut f.db,
-        "SELECT _id FROM place WHERE search(text, 'sekol kopi')",
+        "SELECT _id FROM place WHERE search(text, 'harbo coffee')",
     );
     assert!(
         earlier.is_empty(),
         "an earlier token must match a whole term, not a prefix"
     );
-    assert!(oracle_keys(&f, "sekol kopi").is_empty());
+    assert!(oracle_keys(&f, "harbo coffee").is_empty());
 }
 
 #[test]
@@ -188,9 +188,9 @@ fn a_search_composes_with_a_scalar_filter_beside_it_and_inside_an_or() {
     let (_dir, mut f) = open();
     let beside = sql_ids(
         &mut f.db,
-        "SELECT _id FROM place WHERE kind = 'depot' AND search(text, 'kebu')",
+        "SELECT _id FROM place WHERE kind = 'depot' AND search(text, 'garde')",
     );
-    let expected: BTreeSet<String> = oracle_keys(&f, "kebu")
+    let expected: BTreeSet<String> = oracle_keys(&f, "garde")
         .into_iter()
         .filter(|key| {
             f.rows
@@ -207,9 +207,9 @@ fn a_search_composes_with_a_scalar_filter_beside_it_and_inside_an_or() {
     // for `Any` and `All`, so the union is built from postings alone.
     let disjunction = sql_ids(
         &mut f.db,
-        "SELECT _id FROM place WHERE search(text, 'kebu') OR kind = 'depot'",
+        "SELECT _id FROM place WHERE search(text, 'garde') OR kind = 'depot'",
     );
-    let union: BTreeSet<String> = oracle_keys(&f, "kebu")
+    let union: BTreeSet<String> = oracle_keys(&f, "garde")
         .into_iter()
         .chain(
             f.rows
@@ -240,18 +240,18 @@ fn search_score_is_one_for_an_exact_match_and_falls_with_the_edits_and_the_compl
             ref other => panic!("a search score is a float, got {other:?}"),
         }
     };
-    let exact = best(&mut f, "kebun");
+    let exact = best(&mut f, "garden");
     assert!(
         (exact - 1.0).abs() < 1e-12,
         "an exact term match scores 1.0, found {exact}"
     );
-    let edited = best(&mut f, "kebin");
+    let edited = best(&mut f, "gardem");
     assert!(
         edited < exact,
         "one edit ({edited}) scores strictly less than none ({exact})"
     );
-    let long = best(&mut f, "kebu");
-    let short = best(&mut f, "keb");
+    let long = best(&mut f, "garde");
+    let short = best(&mut f, "gard");
     assert!(
         long > short,
         "completing one character ({long}) scores strictly more than completing two ({short})"
@@ -265,7 +265,7 @@ fn a_search_score_order_descends_and_reaches_every_row_the_predicate_admits() {
     let (_, rows) = sql_rows(
         &mut f.db,
         "SELECT _id, search_score() AS score FROM place \
-         WHERE search(text, 'kebu') ORDER BY search_score() DESC",
+         WHERE search(text, 'garde') ORDER BY search_score() DESC",
     );
     let scores: Vec<f64> = rows
         .iter()
@@ -276,7 +276,7 @@ fn a_search_score_order_descends_and_reaches_every_row_the_predicate_admits() {
         .collect();
     assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{scores:?}");
     assert!(scores.iter().all(|score| *score > 0.0 && *score <= 1.0));
-    assert_eq!(scores.len(), oracle_keys(&f, "kebu").len());
+    assert_eq!(scores.len(), oracle_keys(&f, "garde").len());
 }
 
 #[test]
@@ -287,13 +287,13 @@ fn a_search_score_blends_with_bm25_and_a_vector_distance_in_one_order_expression
     let ids = sql_ids(
         &mut f.db,
         &format!(
-            "SELECT _id FROM place WHERE search(text, 'kebun') \
-             ORDER BY 0.5 * search_score() + 0.3 * bm25(text, 'kebun') \
+            "SELECT _id FROM place WHERE search(text, 'garden') \
+             ORDER BY 0.5 * search_score() + 0.3 * bm25(text, 'garden') \
              + 0.2 * (1 - (emb <=> '{literal}')) DESC LIMIT 10"
         ),
     );
     assert_eq!(ids.len(), 10);
-    assert!(keys_of(&f, &ids).is_subset(&oracle_keys(&f, "kebun")));
+    assert!(keys_of(&f, &ids).is_subset(&oracle_keys(&f, "garden")));
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn search_score_without_a_search_in_the_statement_is_refused_by_name() {
     let error = f
         .db
         .sql(
-            "SELECT _id FROM place WHERE search(text, 'kebun') AND search(text, 'kopi') \
+            "SELECT _id FROM place WHERE search(text, 'garden') AND search(text, 'coffee') \
              ORDER BY search_score() DESC",
             &[],
         )
@@ -339,7 +339,7 @@ fn explain_names_the_search_driver_its_expanded_terms_and_the_score_leaf() {
     let text = f
         .db
         .sql_explain(
-            "SELECT _id FROM place WHERE search(text, 'kebu') ORDER BY search_score() DESC LIMIT 5",
+            "SELECT _id FROM place WHERE search(text, 'garde') ORDER BY search_score() DESC LIMIT 5",
             &[],
         )
         .unwrap();
@@ -415,7 +415,7 @@ fn a_truncated_dictionary_walk_reaches_the_client_as_a_notice_that_says_so() {
 
     // A query the dictionary cannot reach prunes instead of truncating, so
     // an ordinary search carries no notice.
-    let quiet = prepare_sql(&db, "SELECT _id FROM docs WHERE search(body, 'kopi')", &[]).unwrap();
+    let quiet = prepare_sql(&db, "SELECT _id FROM docs WHERE search(body, 'coffee')", &[]).unwrap();
     assert!(
         !quiet
             .notices()
@@ -429,7 +429,7 @@ fn a_truncated_dictionary_walk_reaches_the_client_as_a_notice_that_says_so() {
 #[test]
 fn a_search_answers_under_a_query_budget_and_a_refusal_names_its_resource() {
     let (_dir, f) = open();
-    let statement = "SELECT _id FROM place WHERE search(text, 'kebu') ORDER BY search_score() DESC";
+    let statement = "SELECT _id FROM place WHERE search(text, 'garde') ORDER BY search_score() DESC";
     let prepared = prepare_sql(&f.db, statement, &[]).unwrap();
     let mut seen = 0usize;
     prepared

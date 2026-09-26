@@ -110,7 +110,7 @@ fn open() -> (TempDir, Database) {
         &[],
     )
     .unwrap();
-    for (key, name, population) in [("p1", "Bandung", 2_500_000i64), ("p2", "Malang", 880_000)] {
+    for (key, name, population) in [("p1", "Kyoto", 2_500_000i64), ("p2", "Valletta", 880_000)] {
         db.sql(
             "INSERT INTO place (_key, name, population) VALUES ($1, $2, $3)",
             &[
@@ -121,7 +121,7 @@ fn open() -> (TempDir, Database) {
         )
         .unwrap();
     }
-    for (key, body) in [("n1", "kebun kopi"), ("n2", "pasar pagi")] {
+    for (key, body) in [("n1", "garden coffee"), ("n2", "morning market")] {
         db.sql(
             "INSERT INTO note (_key, body, place_key) VALUES ($1, $2, 'p1')",
             &[Param::Text(key.into()), Param::Text(body.into())],
@@ -272,6 +272,31 @@ fn db_columns_reports_the_not_null_a_column_was_declared_with() {
         ],
         "`body TEXT NOT NULL` is the only DECLARED NOT NULL column"
     );
+}
+
+#[test]
+fn a_boolean_catalog_filter_reads_every_postgresql_boolean_spelling() {
+    // PostgreSQL's boolean input: any case, surrounding white space, and a
+    // unique prefix of `true`, `false`, `yes`, `no`, `on`, `off`, or `1`/`0`
+    // -- the one rule a GQL `CAST(... AS BOOLEAN)` also reads.
+    let (_dir, mut db) = open();
+    let names = |db: &mut Database, spelled: &str| -> Vec<String> {
+        let (_, answer) = rows(
+            db,
+            &format!("SELECT name FROM db_columns WHERE table = 'note' AND not_null = '{spelled}'"),
+        );
+        answer.iter().map(|row| text_at(row, 0)).collect()
+    };
+    let yes = names(&mut db, "t");
+    let no = names(&mut db, "f");
+    assert_eq!(yes, ["_key", "body"]);
+    assert_eq!(no, ["place_key"]);
+    for spelled in ["TRUE", " tr ", "y", "Yes", "on", "1"] {
+        assert_eq!(names(&mut db, spelled), yes, "`{spelled}`");
+    }
+    for spelled in ["FALSE", "fa", "n", "NO", "of", "OFF", "0"] {
+        assert_eq!(names(&mut db, spelled), no, "`{spelled}`");
+    }
 }
 
 #[test]
@@ -497,7 +522,7 @@ fn the_relation_directory_is_well_formed_and_its_oids_are_postgresqls() {
 }
 
 #[test]
-fn pg_type_carries_one_row_per_kind_this_engine_has_plus_geometry_and_vector() {
+fn pg_type_carries_one_row_per_kind_this_engine_has_plus_geometry_vector_and_the_list_arrays() {
     let (_dir, mut db) = open();
     let r = relation("pg_catalog.pg_type");
     let (_, answer) = rows(&mut db, "SELECT * FROM pg_catalog.pg_type");
@@ -524,13 +549,63 @@ fn pg_type_carries_one_row_per_kind_this_engine_has_plus_geometry_and_vector() {
             ("int8".to_owned(), 20),
             ("text".to_owned(), 25),
             ("float8".to_owned(), 701),
+            ("_bool".to_owned(), 1000),
+            ("_text".to_owned(), 1009),
+            ("_int8".to_owned(), 1016),
+            ("_float8".to_owned(), 1022),
             ("date".to_owned(), 1082),
+            ("_date".to_owned(), 1182),
             ("timestamptz".to_owned(), 1184),
+            ("_timestamptz".to_owned(), 1185),
             ("jsonb".to_owned(), 3802),
+            ("_jsonb".to_owned(), 3807),
             ("geometry".to_owned(), 18_000),
             ("vector".to_owned(), 18_001),
         ]
     );
+}
+
+#[test]
+fn pg_type_names_each_list_array_by_its_element_and_each_element_by_its_array() {
+    // PostgreSQL's fixed pairs: (array oid, array name, element oid).
+    let pairs = [
+        (1000i64, "_bool", 16i64),
+        (1009, "_text", 25),
+        (1016, "_int8", 20),
+        (1022, "_float8", 701),
+        (1182, "_date", 1082),
+        (1185, "_timestamptz", 1184),
+        (3807, "_jsonb", 3802),
+    ];
+    let (_dir, mut db) = open();
+    let r = relation("pg_catalog.pg_type");
+    let (_, answer) = rows(&mut db, "SELECT * FROM pg_catalog.pg_type");
+    let int = |row: &[SqlValue], column: &str| match cell(r, row, column) {
+        SqlValue::Int(i) => i,
+        other => panic!("{column} is {other:?}"),
+    };
+    let find = |oid: i64| {
+        answer
+            .iter()
+            .find(|row| int(row, "oid") == oid)
+            .unwrap_or_else(|| panic!("no pg_type row {oid}"))
+    };
+    for (array, name, element) in pairs {
+        let row = find(array);
+        assert_eq!(cell(r, row, "typname"), SqlValue::Text(name.to_owned()));
+        assert_eq!(int(row, "typelem"), element, "{name}.typelem");
+        assert_eq!(int(row, "typarray"), 0, "{name}.typarray");
+        assert_eq!(int(row, "typlen"), -1, "{name} is a varlena");
+        assert_eq!(cell(r, row, "typcategory"), SqlValue::Text("A".to_owned()));
+        assert_eq!(cell(r, row, "typbyval"), SqlValue::Bool(false));
+        let scalar = find(element);
+        assert_eq!(int(scalar, "typarray"), array, "element {element}.typarray");
+        assert_eq!(int(scalar, "typelem"), 0);
+    }
+    // A type with no list array names none.
+    for scalar in [17i64, 18_000, 18_001] {
+        assert_eq!(int(find(scalar), "typarray"), 0, "{scalar}.typarray");
+    }
 }
 
 #[test]

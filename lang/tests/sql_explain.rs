@@ -131,19 +131,19 @@ fn battery(f: &fixture::Fixture) -> Vec<(&'static str, String, Vec<Param>, Optio
         (
             "text_one",
             "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1)".to_owned(),
-            vec![Param::Text("kebun".into())],
+            vec![Param::Text("garden".into())],
             None,
         ),
         (
             "text_two",
             "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1)".to_owned(),
-            vec![Param::Text("kebun & sawah".into())],
+            vec![Param::Text("garden & field".into())],
             None,
         ),
         (
             "text_and_kind",
             "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1) AND kind = $2".to_owned(),
-            vec![Param::Text("kebun".into()), Param::Text("park".into())],
+            vec![Param::Text("garden".into()), Param::Text("park".into())],
             None,
         ),
         (
@@ -186,7 +186,7 @@ fn battery(f: &fixture::Fixture) -> Vec<(&'static str, String, Vec<Param>, Optio
             "text_top10",
             "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1) \
              ORDER BY ts_rank_cd(to_tsvector('simple', text), to_tsquery('simple', $1)) DESC LIMIT 10".to_owned(),
-            vec![Param::Text("kebun".into())],
+            vec![Param::Text("garden".into())],
             None,
         ),
         (
@@ -212,7 +212,7 @@ fn battery(f: &fixture::Fixture) -> Vec<(&'static str, String, Vec<Param>, Optio
             ),
             vec![
                 Param::Vector(vector.clone()),
-                Param::Text("kebun".into()),
+                Param::Text("garden".into()),
             ],
             None,
         ),
@@ -225,7 +225,7 @@ fn battery(f: &fixture::Fixture) -> Vec<(&'static str, String, Vec<Param>, Optio
             ),
             vec![
                 Param::Vector(vector.clone()),
-                Param::Text("kebun".into()),
+                Param::Text("garden".into()),
             ],
             None,
         ),
@@ -355,7 +355,7 @@ fn a_filter_says_how_it_is_answered() {
     // built once from postings.
     let text = explain(
         &mut f,
-        "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'kebun') AND born BETWEEN 19500101 AND 19510101",
+        "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'garden') AND born BETWEEN 19500101 AND 19510101",
         &[],
     );
     assert!(text.starts_with("driver: Text"), "{text}");
@@ -418,7 +418,7 @@ fn a_score_order_names_every_leaf() {
         ),
         &[
             Param::Vector(fixture::query_vector()),
-            Param::Text("kebun".into()),
+            Param::Text("garden".into()),
         ],
     );
     assert!(text.contains("order: score"), "{text}");
@@ -509,7 +509,7 @@ fn five_explanations_in_full() {
         (
             "text_and_kind",
             "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1) AND kind = $2".to_owned(),
-            vec![Param::Text("kebun".into()), Param::Text("park".into())],
+            vec![Param::Text("garden".into()), Param::Text("park".into())],
         ),
         (
             "plot_dwithin_1km",
@@ -532,7 +532,7 @@ fn five_explanations_in_full() {
                  AND ST_DWithin(loc, ST_SetSRID(ST_MakePoint({lon:?},{lat:?}),4326)::geography, 20000, true) \
                  ORDER BY 0.5 * bm25(text, $2) + 0.5 * (1 - (emb <=> $1::vector)) DESC LIMIT 10"
             ),
-            vec![Param::Vector(vector), Param::Text("kebun".into())],
+            vec![Param::Vector(vector), Param::Text("garden".into())],
         ),
     ];
     for (name, sql, params) in &samples {
@@ -800,48 +800,46 @@ fn weighted_graph(f: &mut fixture::Fixture) -> sekejap_core::collections::EdgeTy
 }
 
 /// `EXPLAIN` of a pattern says which edges are never followed and which
-/// nodes are never expanded, and names the membership set the node half is
-/// answered from -- `docs/lang/QL_CONTRACT.md` §6's "EXPLAIN prints which".
+/// nodes are never expanded, and prints the per-hop edge and far-node
+/// filters -- `docs/lang/QL_CONTRACT.md` §6's "EXPLAIN prints which".
+///
+/// M2-E re-expresses this over GQL's `RETURN`. The removed legacy body's
+/// ranking by the reaching edge's own property is not re-expressed here: `r`
+/// is quantified directly (`-[r:...]->{1,4}`), which makes it a GROUP
+/// variable everywhere outside its own repeat's inline predicate (M4-A
+/// design), so `RETURN r.weight` on it would be refused, naming M4-D. GQL's
+/// per-hop filter wording (`edge filter, per edge: (...)`, `far filter, per
+/// far node: (...)`) is pinned in `lang/tests/gql_explain.rs`.
 #[test]
 fn explain_prints_the_edge_predicates_and_the_node_membership_sets() {
     let (_dir, mut f) = open();
     let _ = weighted_graph(&mut f);
     let text = explain(
         &mut f,
-        "SELECT k, w FROM GRAPH_TABLE (routes MATCH \
-            (a:place WHERE a._key = $1)-[r:weighted WHERE r.weight > 0.2]->{1,4}\
-            (b:place WHERE b.born BETWEEN 19500101 AND 19600101) \
-            COLUMNS (b._key AS k, r.weight AS w)) \
-         ORDER BY w DESC LIMIT 5",
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            (a IS place WHERE a._key = $1)-[r:weighted WHERE r.weight > 0.2]->{1,4}\
+            (b IS place WHERE b.born >= 19500101 AND b.born <= 19600101) \
+            RETURN b._key AS k)",
         &[Param::Text("k00003".into())],
     );
     println!("===== graph_per_hop\n{text}");
-    assert!(text.starts_with("driver: "));
-    assert!(text.contains("Graph"), "{text}");
-    // The edge half, spelled the way the plan holds it.
-    assert!(text.contains("edge weight > 0.2"), "{text}");
-    // The node half, and the set it is answered from.
-    assert!(text.contains("node place_born.born range"), "{text}");
+    assert!(text.contains("edge filter, per edge: (r.weight > 0.2)"), "{text}");
     assert!(
-        text.contains("membership set") || text.contains("membership bitmap"),
+        text.contains("node filter, per node at position 3: ((b.born >= 19500101) AND (b.born <= 19600101))"),
         "{text}"
     );
-    // The traversal IS the candidate stream here, so its own position is
-    // certified by the walk and no filter position reads a row.
-    assert!(
-        text.contains("the driving walk certifies it"),
-        "{text}"
-    );
-    assert_eq!(counter(&text, "row_decodes"), 0, "{text}");
-    // The ranking is the reaching edge's own property.
-    assert!(
-        text.contains("order: edge -- reaching edge property `weight` Descending"),
-        "{text}"
-    );
-    // The projection names the edge spelling, not a declared field.
-    assert!(text.contains("@edge.weight"), "{text}");
     assert!(counter(&text, "graph_edges") > 0, "{text}");
     assert!(rows_of(&text) > 0, "{text}");
+
+    // A cheapest search prints the COST it minimises.
+    let text = explain(
+        &mut f,
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            ANY CHEAPEST (a IS place WHERE a._key = $1)-[r:weighted COST r.weight]->{1,4}(b IS place) \
+            RETURN b._key AS k)",
+        &[Param::Text("k00003".into())],
+    );
+    assert!(text.contains("cost, per edge: r.weight"), "{text}");
 }
 
 /// The six boolean cases of the battery (`docs/lang/QL_CONTRACT.md` §3), each

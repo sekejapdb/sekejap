@@ -30,8 +30,8 @@ pub const KINDS: [&str; 8] = [
     "depot", "farm", "home", "mill", "park", "port", "school", "shop",
 ];
 pub const VOCAB: [&str; 12] = [
-    "kebun", "sekolah", "jembatan", "bengkel", "desa", "kopi", "sawah", "danau", "pasar", "kantor",
-    "hutan", "warung",
+    "garden", "harbour", "mountain", "workshop", "village", "coffee", "field", "lake", "market",
+    "office", "forest", "resort",
 ];
 /// Cluster centres, in the same part of the world `battle50k`'s corpus uses.
 const CLUSTERS: [(f64, f64); 4] = [

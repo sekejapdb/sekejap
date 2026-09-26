@@ -203,10 +203,6 @@ fn graph_constructs_beyond_the_slice_name_their_tier() {
     let (_dir, mut f) = open();
     for (statement, expect) in [
         (
-            "SELECT k FROM GRAPH_TABLE (routes MATCH (a:place WHERE a._key = 'k00000')-[:near|far]->(b:place) COLUMNS (b._key AS k))",
-            "label alternation",
-        ),
-        (
             "INSERT INTO GRAPH routes EDGE near (source, destination) VALUES ('a','b')",
             "INSERT INTO GRAPH",
         ),
@@ -239,7 +235,7 @@ fn a_tsquery_that_mixes_and_with_or_is_a_boolean_tree() {
     // A bare `!term` IS the complement of the text set and answers; a `!`
     // inside a larger tsquery is still a tree inside one index's postings.
     f.db.sql(
-        "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', '!kebun')",
+        "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', '!garden')",
         &[],
     )
     .unwrap();
@@ -302,10 +298,50 @@ fn a_predicate_on_an_unindexed_column_says_why_it_cannot_compile() {
         .db
         .sql(
             "SELECT _id FROM place WHERE name = $1",
-            &[Param::Text("kebun kopi".into())],
+            &[Param::Text("garden coffee".into())],
         )
         .unwrap_err();
     let shown = format!("{error}");
     assert!(shown.contains("scalar index"), "{shown}");
     assert!(shown.contains("index-side"), "{shown}");
+}
+
+#[test]
+fn no_sql_refusal_names_a_graph_construct_the_gql_profile_builds() {
+    // Graph syntax parses only inside `GRAPH_TABLE (g MATCH ... RETURN ...)`,
+    // where these are built (M4); a row refusing one outside it would give
+    // a reason that is no longer true.
+    for built in [
+        "ANY SHORTEST",
+        "PATH_LENGTH",
+        "PATH_FIRST",
+        "PATH_LAST",
+        "NODES",
+        "EDGES",
+        "TRAIL",
+        "WALK",
+    ] {
+        assert!(
+            refusals().iter().all(|(keyword, _, _)| *keyword != built),
+            "`{built}` is built inside a GQL body"
+        );
+    }
+    // The graph rows that stay say where the construct stands, and what
+    // stands there instead.
+    for (keyword, _, reason) in refusals().iter().filter(|(keyword, _, _)| {
+        [
+            "ALL SHORTEST",
+            "SIMPLE",
+            "PATH_SUM",
+            "PATH_PRODUCT",
+            "PATH_MIN",
+            "PATH_MAX",
+            "PATH_AVG",
+            "VERTEX_ID",
+            "EDGE_ID",
+        ]
+        .contains(keyword)
+    }) {
+        assert!(reason.contains("GRAPH_TABLE"), "`{keyword}`: {reason}");
+    }
 }

@@ -124,8 +124,8 @@ struct Row {
 /// from `_key`, and the two time columns advance one day at a time.
 fn corpus() -> Vec<Row> {
     const LABELS: [&str; 12] = [
-        "sawah", "kebun", "pasar", "danau", "hutan", "kopi", "taman", "desa", "bukit", "pantai",
-        "muara", "jalan",
+        "field", "garden", "market", "lake", "forest", "coffee", "grove", "village", "hill",
+        "beach", "delta", "road",
     ];
     (0..12)
         .map(|n| Row {
@@ -230,8 +230,8 @@ fn a_table_created_with_no_indexes_answers_an_equality_a_range_and_an_order_by_o
         out
     };
     assert_eq!(
-        sorted(&mut db, "SELECT _key FROM thing WHERE label = 'kebun'"),
-        oracle(&|r| r.label == "kebun")
+        sorted(&mut db, "SELECT _key FROM thing WHERE label = 'garden'"),
+        oracle(&|r| r.label == "garden")
     );
     assert_eq!(
         sorted(&mut db, "SELECT _key FROM thing WHERE small = 7"),
@@ -276,8 +276,8 @@ fn a_table_created_with_no_indexes_answers_an_equality_a_range_and_an_order_by_o
         oracle(&|r| r.at.as_str() >= "2026-03-10")
     );
     assert_eq!(
-        sorted(&mut db, "SELECT _key FROM thing WHERE label LIKE 'k%'"),
-        oracle(&|r| r.label.starts_with('k')),
+        sorted(&mut db, "SELECT _key FROM thing WHERE label LIKE 'g%'"),
+        oracle(&|r| r.label.starts_with('g')),
         "a text prefix is a range over the same automatic btree"
     );
 
@@ -398,18 +398,18 @@ fn an_explicit_fulltext_entry_still_wins_under_index_none() {
     );
     run(
         &mut db,
-        "INSERT INTO doc (_key, body, n) VALUES ('d1', 'kebun raya sawah', 1)",
+        "INSERT INTO doc (_key, body, n) VALUES ('d1', 'garden gate field', 1)",
     );
     assert_eq!(
         sorted(
             &mut db,
-            "SELECT _key FROM doc WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'kebun')"
+            "SELECT _key FROM doc WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'garden')"
         ),
         ["d1".to_owned()]
     );
     // The btree that `index: none` refused is genuinely absent: the text
     // index answers a match and cannot answer an equality.
-    let said = refuse(&mut db, "SELECT _key FROM doc WHERE body = 'kebun raya sawah'");
+    let said = refuse(&mut db, "SELECT _key FROM doc WHERE body = 'garden gate field'");
     assert!(
         said.contains("scalar index on `body` does not exist"),
         "a gin is not a btree: {said}"
