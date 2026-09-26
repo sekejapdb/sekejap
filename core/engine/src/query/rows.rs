@@ -469,7 +469,7 @@ impl ProjectionScratch {
 
 /// A projected value, fetching the authoritative vector sidecar when the field
 /// is a historical vector.
-fn project_value_or_sidecar<C: FnMut() -> bool>(
+pub(super) fn project_value_or_sidecar<C: FnMut() -> bool>(
     db: &Database,
     id: EntityId,
     value: dense_v3::FieldValue,

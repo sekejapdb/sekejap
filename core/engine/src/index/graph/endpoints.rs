@@ -94,7 +94,7 @@
 //! `src/collections/rebuild.rs` recomputes it from the authoritative primary
 //! edges rather than copying it.
 use super::{
-    edge_prefix, key_after_prefix, parse_edge_key, Direction, EdgeKey, EdgeTypeId, GraphContextId,
+    edge_prefix, key_after_prefix, parse_edge, Direction, EdgeKey, EdgeTypeId, GraphContextId,
     GRAPH_FEATURE, PRIMARY_EDGE, REVERSE_EDGE,
 };
 use crate::collections::{
@@ -453,7 +453,7 @@ impl Database {
                     if key.first() != Some(&PRIMARY_EDGE) {
                         break;
                     }
-                    let edge = parse_edge_key(&key, PRIMARY_EDGE)?;
+                    let (edge, _) = parse_edge(&key, PRIMARY_EDGE)?;
                     if edge.edge_type.0 == 0
                         || edge.edge_type.0 >= h.next_type
                         || edge.context.0 >= h.next_context

@@ -987,6 +987,7 @@ pub fn verify_indexed_source(
                     | 6
                     | 7
                     | 8
+                    | 9
                     | 0x10
                     | 0x11
                     | 0x12
@@ -1166,6 +1167,7 @@ pub fn verify_indexed_source(
         ih.is_some_and(|h| {
             h.features & crate::index::graph::endpoints::ENDPOINT_FEATURE != 0
         }),
+        ih.is_some_and(|h| h.features & crate::index::graph::EDGE_ID_FEATURE != 0),
     )?;
     if ih.is_some_and(|h| h.features & crate::index::graph::GRAPH_FEATURE != 0) {
         run.report.limitations.push("A primary edge and its reverse deleted together is indistinguishable from a legitimate unlink without an external manifest or operation log.");
@@ -2845,6 +2847,93 @@ fn verify_text_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexI
     Ok(())
 }
 
+/// The edge-id allocator: its three replicas when the file declares
+/// `EDGE_ID_FEATURE`, and no `0x09` key at all when it does not. Returns the
+/// allocator's `next` -- every id-bearing edge must sit below it -- or `None`
+/// when the file carries no id-bearing edge.
+fn verify_edge_id_allocator<F: FnMut(&VerificationIssue)>(
+    run: &mut Run<F>,
+    enabled: bool,
+) -> Result<Option<u64>> {
+    let tag = crate::index::graph::EDGE_ID_ALLOCATOR;
+    if !enabled {
+        let source = run.reader.clone();
+        let mut present = false;
+        visit(&source, &[tag], Some(&tag_end(tag)), |_, _| {
+            present = true;
+            Ok(())
+        })?;
+        if present {
+            run.issue(VerificationIssue {
+                class: IssueClass::Catalog,
+                kind: IssueKind::Mismatch,
+                key: vec![tag],
+                index: None,
+                entity: None,
+                message: "graph edge-id allocator exists without the edge identity feature".into(),
+            })?;
+        }
+        return Ok(None);
+    }
+    let next = crate::index::graph::read_edge_id_allocator(|k| run.read(k))?;
+    for copy in 0..3u8 {
+        let key = crate::index::graph::edge_id_allocator_key(copy);
+        match run.read(&key)? {
+            None => run.issue(VerificationIssue {
+                class: IssueClass::Catalog,
+                kind: IssueKind::Missing,
+                key,
+                index: None,
+                entity: None,
+                message: "graph edge-id allocator replica missing".into(),
+            })?,
+            Some(bytes) => match crate::index::graph::decode_edge_id_allocator(&bytes) {
+                Ok(candidate) if candidate == next => {}
+                Ok(_) => return Err(corrupt("conflicting graph edge-id allocator replicas")),
+                Err(Error::Unsupported(message)) => return Err(Error::Unsupported(message)),
+                Err(_) => run.issue(VerificationIssue {
+                    class: IssueClass::Catalog,
+                    kind: IssueKind::Malformed,
+                    key,
+                    index: None,
+                    entity: None,
+                    message: "graph edge-id allocator replica damaged".into(),
+                })?,
+            },
+        }
+    }
+    Ok(Some(next))
+}
+
+/// Whether one edge key's id segment is allowed: always for the implicit id
+/// 0; for an explicit id only in a file that declares the bit and only below
+/// the allocator. A refused key is reported as malformed and not followed.
+fn edge_id_admitted<F: FnMut(&VerificationIssue)>(
+    run: &mut Run<F>,
+    key: &[u8],
+    id: u64,
+    next: Option<u64>,
+    class: IssueClass,
+) -> Result<bool> {
+    if id == crate::index::graph::IMPLICIT_EDGE_ID {
+        return Ok(true);
+    }
+    let message = match next {
+        None => "graph edge key carries an id segment without the edge identity feature",
+        Some(next) if id >= next => "graph edge id is not below the edge-id allocator",
+        Some(_) => return Ok(true),
+    };
+    run.issue(VerificationIssue {
+        class,
+        kind: IssueKind::Malformed,
+        key: key.to_vec(),
+        index: None,
+        entity: None,
+        message: message.into(),
+    })?;
+    Ok(false)
+}
+
 /// The graph family, and the ENDPOINT SETS derived from it.
 ///
 /// Law 5: the endpoint keyspace is compared against an INDEPENDENT walk of
@@ -2858,7 +2947,11 @@ fn verify_graph<F: FnMut(&VerificationIssue)>(
     run: &mut Run<F>,
     enabled: bool,
     endpoints_enabled: bool,
+    edge_ids_enabled: bool,
 ) -> Result<()> {
+    // The edge-id allocator (`0x09`): absent without the bit; with it, three
+    // agreeing replicas, and every id-bearing edge key below it.
+    let edge_id_next = verify_edge_id_allocator(run, edge_ids_enabled)?;
     if !endpoints_enabled {
         let source = run.reader.clone();
         let tag = crate::index::graph::endpoints::ENDPOINT_ENTRY;
@@ -3068,7 +3161,7 @@ fn verify_graph<F: FnMut(&VerificationIssue)>(
     let source = run.reader.clone();
     visit(&source, &p, Some(&tag_end(p[0])), |key, value| {
         run.row(false)?;
-        let edge = match crate::index::graph::parse_edge_key(key, p[0]) {
+        let (edge, id) = match crate::index::graph::parse_edge(key, p[0]) {
             Ok(edge) => edge,
             Err(_) => {
                 run.issue(VerificationIssue {
@@ -3088,6 +3181,9 @@ fn verify_graph<F: FnMut(&VerificationIssue)>(
             {
                 return Err(corrupt("graph edge identity exceeds name allocator"));
             }
+        }
+        if !edge_id_admitted(run, key, id, edge_id_next, IssueClass::Primary)? {
+            return Ok(());
         }
         match crate::index::graph::decode_properties(value) {
             Ok(_) => {}
@@ -3114,7 +3210,8 @@ fn verify_graph<F: FnMut(&VerificationIssue)>(
                 })?;
             }
         }
-        let reverse = crate::index::graph::edge_key(crate::index::graph::REVERSE_EDGE, edge);
+        let reverse =
+            crate::index::graph::edge_key_id(crate::index::graph::REVERSE_EDGE, edge, id);
         let actual = run.read(&reverse)?;
         run.mismatch(
             IssueClass::Derived,
@@ -3141,7 +3238,7 @@ fn verify_graph<F: FnMut(&VerificationIssue)>(
     let source = run.reader.clone();
     visit(&source, &p, Some(&tag_end(p[0])), |key, value| {
         run.row(true)?;
-        let edge = match crate::index::graph::parse_edge_key(key, p[0]) {
+        let (edge, id) = match crate::index::graph::parse_edge(key, p[0]) {
             Ok(edge) => edge,
             Err(_) => {
                 run.issue(VerificationIssue {
@@ -3162,6 +3259,9 @@ fn verify_graph<F: FnMut(&VerificationIssue)>(
                 return Err(corrupt("graph reverse identity exceeds name allocator"));
             }
         }
+        if !edge_id_admitted(run, key, id, edge_id_next, IssueClass::Derived)? {
+            return Ok(());
+        }
         if !value.is_empty() {
             run.issue(VerificationIssue {
                 class: IssueClass::Derived,
@@ -3172,7 +3272,8 @@ fn verify_graph<F: FnMut(&VerificationIssue)>(
                 message: "graph reverse marker is nonempty".into(),
             })?;
         }
-        let primary = crate::index::graph::edge_key(crate::index::graph::PRIMARY_EDGE, edge);
+        let primary =
+            crate::index::graph::edge_key_id(crate::index::graph::PRIMARY_EDGE, edge, id);
         if run.read(&primary)?.is_none() {
             run.issue(VerificationIssue {
                 class: IssueClass::Primary,

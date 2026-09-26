@@ -1153,6 +1153,14 @@ fn work_of(w: &QueryWork, r: WorkResource) -> u64 {
         // Wall clock, not work: it has no `QueryWork` counter and is not in
         // `RESOURCES`, so this arm is never reached.
         WorkResource::Deadline => 0,
+        // The GQL profile's resources (`tests/gql_budget.rs`): no plain
+        // query charges them.
+        WorkResource::BindingRows
+        | WorkResource::PathStates
+        | WorkResource::QueueEntries
+        | WorkResource::PredecessorArcs
+        | WorkResource::SortBytes
+        | WorkResource::ListBytes => 0,
     }
 }
 
@@ -1181,6 +1189,14 @@ fn set_budget(mut b: QueryBudget, r: WorkResource, n: u64) -> QueryBudget {
         // is how it is set and no combo in this matrix asks for one.
         WorkResource::Deadline => {}
         WorkResource::OutputBytes => b.output_bytes = n,
+        // Their ceilings are `GqlBudget` fields, not `QueryBudget` ones, and
+        // none is in `RESOURCES`, so these arms are never reached.
+        WorkResource::BindingRows
+        | WorkResource::PathStates
+        | WorkResource::QueueEntries
+        | WorkResource::PredecessorArcs
+        | WorkResource::SortBytes
+        | WorkResource::ListBytes => {}
     }
     b
 }

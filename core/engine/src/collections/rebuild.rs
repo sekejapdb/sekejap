@@ -426,6 +426,11 @@ struct Metadata {
     indexes: Vec<IndexInfo>,
     graph_header: Option<(crate::index::graph::GraphHeader, Vec<u8>)>,
     graph_names: Vec<(u8, crate::index::graph::GraphName, Vec<u8>)>,
+    /// The edge-id allocator (`next`, canonical replica bytes) when the source
+    /// declares `EDGE_ID_FEATURE`. Copied, not recomputed: it is the promise
+    /// that no id below it is ever handed out again, and deleted edges leave
+    /// no trace from which a rebuild could recompute it.
+    edge_id_allocator: Option<(u64, Vec<u8>)>,
     /// The collections the SOURCE carries a live row-count record for. The
     /// destination gets one for exactly those, with the number recomputed
     /// from the rows it copied. A source with none gets none: a rebuild
@@ -556,6 +561,21 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
         }
         graph_header = Some((decoded, bytes));
     }
+    let edge_id_allocator = if header
+        .indexes
+        .is_some_and(|value| value.features & crate::index::graph::EDGE_ID_FEATURE != 0)
+    {
+        if !graph_enabled {
+            return Err(corrupt("edge identity feature declared without the graph feature"));
+        }
+        Some(replicated_raw(
+            source,
+            crate::index::graph::edge_id_allocator_key,
+            crate::index::graph::decode_edge_id_allocator,
+        )?)
+    } else {
+        None
+    };
     // Which collections the source keeps a live row count for. Probed once
     // per collection, and only when the file declares the bit, so a database
     // written before the feature pays nothing.
@@ -605,6 +625,7 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
         indexes: decoded_indexes,
         graph_header,
         graph_names,
+        edge_id_allocator,
         row_counted,
         schemas,
     })
@@ -687,6 +708,9 @@ fn seed_metadata(destination: &mut Destination, metadata: &Metadata) -> Result<(
             destination.put(&lookup, &ordered(name.id))?;
         }
     }
+    if let Some((_, bytes)) = &metadata.edge_id_allocator {
+        put_replicas(destination, crate::index::graph::edge_id_allocator_key, bytes)?;
+    }
     Ok(())
 }
 
@@ -717,6 +741,7 @@ fn validate_namespaces(source: &SourceView, metadata: &Metadata) -> Result<()> {
                 | 6
                 | 7
                 | row_count::ROW_COUNT
+                | crate::index::graph::EDGE_ID_ALLOCATOR
                 | 0x10
                 | 0x11
                 | 0x12
@@ -795,6 +820,16 @@ fn validate_namespaces(source: &SourceView, metadata: &Metadata) -> Result<()> {
                 let id = IndexId(read_ordered(key, &mut at)?);
                 if at != key.len() || !metadata.indexes.iter().any(|index| index.id == id) {
                     return Err(corrupt("index descriptor outside the preserved catalog"));
+                }
+            }
+            crate::index::graph::EDGE_ID_ALLOCATOR => {
+                if metadata.edge_id_allocator.is_none() {
+                    return Err(corrupt(
+                        "graph edge-id allocator exists without the edge identity feature",
+                    ));
+                }
+                if key.len() != 2 || key[1] > 2 {
+                    return Err(corrupt("graph edge-id allocator replica key"));
                 }
             }
             6 | 7 | 0x12 | 0x71 | 0x72 if metadata.graph_header.is_none() => {
@@ -964,17 +999,34 @@ fn copy_graph(
         .indexes
         .is_some_and(|h| h.features & crate::index::graph::endpoints::ENDPOINT_FEATURE != 0);
     let mut endpoint_keys: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    // An explicit edge id is allowed only in a file that declares the bit,
+    // and only below the allocator the source promised.
+    let edge_id_next = metadata.edge_id_allocator.as_ref().map(|(next, _)| *next);
+    let edge_id_allowed = |id: u64| -> Result<()> {
+        if id == crate::index::graph::IMPLICIT_EDGE_ID {
+            return Ok(());
+        }
+        match edge_id_next {
+            None => Err(corrupt(
+                "graph edge key carries an id segment without the edge identity feature",
+            )),
+            Some(next) if id >= next => Err(corrupt("graph edge id is not below the edge-id allocator")),
+            Some(_) => Ok(()),
+        }
+    };
     source.visit(
         &[crate::index::graph::PRIMARY_EDGE],
         Some(&tag_end(crate::index::graph::PRIMARY_EDGE)),
         |key, value| {
-            let edge = crate::index::graph::parse_edge_key(key, crate::index::graph::PRIMARY_EDGE)?;
+            let (edge, id) =
+                crate::index::graph::parse_edge(key, crate::index::graph::PRIMARY_EDGE)?;
             if edge.edge_type.0 == 0
                 || edge.edge_type.0 >= header.next_type
                 || edge.context.0 >= header.next_context
             {
                 return Err(corrupt("graph edge name identity exceeds allocator"));
             }
+            edge_id_allowed(id)?;
             crate::index::graph::decode_properties(value)?;
             for entity in [edge.source, edge.destination] {
                 if source.get(&row_key(entity))?.is_none() {
@@ -982,8 +1034,10 @@ fn copy_graph(
                 }
             }
             destination.put(key, value)?;
+            // The mirror carries the same id, so a parallel edge keeps its
+            // identity through the rebuild.
             destination.put(
-                &crate::index::graph::edge_key(crate::index::graph::REVERSE_EDGE, edge),
+                &crate::index::graph::edge_key_id(crate::index::graph::REVERSE_EDGE, edge, id),
                 &[],
             )?;
             if endpoints {
@@ -1010,15 +1064,19 @@ fn copy_graph(
         &[crate::index::graph::REVERSE_EDGE],
         Some(&tag_end(crate::index::graph::REVERSE_EDGE)),
         |key, _| {
-            let edge = match crate::index::graph::parse_edge_key(key, crate::index::graph::REVERSE_EDGE)
-            {
-                Ok(edge) => edge,
-                Err(_) => return Ok(()), // malformed derived garbage is discarded
-            };
+            let (edge, id) =
+                match crate::index::graph::parse_edge(key, crate::index::graph::REVERSE_EDGE) {
+                    Ok(edge) => edge,
+                    Err(_) => return Ok(()), // malformed derived garbage is discarded
+                };
+            if edge_id_allowed(id).is_err() {
+                return Ok(()); // an id the file cannot hold is derived garbage too
+            }
             if source
-                .get(&crate::index::graph::edge_key(
+                .get(&crate::index::graph::edge_key_id(
                     crate::index::graph::PRIMARY_EDGE,
                     edge,
+                    id,
                 ))?
                 .is_none()
             {

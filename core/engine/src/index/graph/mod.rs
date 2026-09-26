@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+pub(crate) mod adjacency;
 pub mod endpoints;
 
 pub(crate) const GRAPH_FEATURE: u64 = 2;
@@ -20,6 +21,37 @@ pub(crate) const NAME_DESCRIPTOR: u8 = 0x07;
 pub(crate) const NAME_LOOKUP: u8 = 0x12;
 pub(crate) const PRIMARY_EDGE: u8 = 0x71;
 pub(crate) const REVERSE_EDGE: u8 = 0x72;
+/// The EDGE-ID ALLOCATOR: three replicas `0x09 | copy`, each
+/// `packet(E4GEI01, next: u64 BE)`. Present exactly when the file declares
+/// [`EDGE_ID_FEATURE`]; `next` is the smallest id never handed out.
+///
+/// THE TAG. `0x09` is the first free byte after the live row count (`0x08`)
+/// in the registry audited in `docs/core/FORMAT_V2.md` "Extension boundary":
+/// `0x00`-`0x05` header, layout, catalog and index registry replicas, `0x06`
+/// `0x07` graph header and name descriptors, `0x08` row counts, `0x10`-`0x12`
+/// names, `0x20` external keys, `0x40` rows, `0x60` vector sidecars and the
+/// full `0x70`-`0x7F` index run.
+pub(crate) const EDGE_ID_ALLOCATOR: u8 = 0x09;
+/// The additive logical feature bit that says this file carries
+/// id-bearing edge keys (`docs/core/GRAPH_CONTRACT.md` §2.3).
+///
+/// Set in the same transaction as the FIRST id-bearing key, never cleared.
+/// A file that never calls [`Database::create_edge`] never declares it, and
+/// is byte for byte what an older binary wrote. A binary whose mask predates
+/// it refuses a file that declares it whole, at admission, as `Unsupported`
+/// (Law 8) -- it never gets as far as meeting an id segment it would call a
+/// malformed key.
+pub const EDGE_ID_FEATURE: u64 = 0x40000;
+/// The id every edge written through the TUPLE-keyed calls (`put_edge`,
+/// `link`, `link_many`) carries, and every edge of a file without
+/// [`EDGE_ID_FEATURE`]: the implicit identity, which is the tuple itself. Its
+/// keys carry no id segment at all.
+pub(crate) const IMPLICIT_EDGE_ID: u64 = 0;
+const EDGE_ID_MAGIC: &[u8; 8] = b"E4GEI01\0";
+/// How many edges of ONE tuple a tuple-keyed delete removes in one call. A
+/// tuple's edges are one contiguous range and are collected before any of
+/// them is deleted, so this bounds that list (Law 1).
+const MAX_TUPLE_EDGES: usize = 65_536;
 const GRAPH_MAGIC: &[u8; 8] = b"E4GRF01\0";
 const NAME_MAGIC: &[u8; 8] = b"E4GNM01\0";
 const GRAPH_ENCODING: u16 = 1;
@@ -29,10 +61,10 @@ const MAX_NAME_BYTES: usize = 128;
 const MAX_EDGE_PROPERTY_BYTES: usize = 64 * 1024;
 const MAX_NEIGHBORS: usize = 256;
 const MAX_NEIGHBOR_PROPERTY_BYTES: usize = 1024 * 1024;
-const MAX_BFS_DEPTH: usize = 64;
-const MAX_BFS_VISITED: usize = 65_536;
-const MAX_BFS_EDGES: usize = 1_000_000;
-const MAX_BFS_RESULTS: usize = 65_536;
+pub(crate) const MAX_BFS_DEPTH: usize = 64;
+pub(crate) const MAX_BFS_VISITED: usize = 65_536;
+pub(crate) const MAX_BFS_EDGES: usize = 1_000_000;
+pub(crate) const MAX_BFS_RESULTS: usize = 65_536;
 const MAX_CASCADE: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -44,12 +76,15 @@ impl GraphContextId {
     pub const BASE: Self = Self(0);
 }
 
-/// The structural identity of an edge TODAY: source, context, type,
-/// destination, so a second `put_edge` of the same quadruple overwrites the
-/// first (set semantics). docs/core/GRAPH_CONTRACT.md §2.3 decides element
-/// identity -- an edge id segment under an additive feature bit, so parallel
-/// edges coexist -- and that is PENDING (contract §9 item 4). Until it lands,
-/// this key is the identity and the contract's rule is not yet the code's.
+/// The TUPLE of an edge: source, context, type, destination.
+///
+/// For the tuple-keyed calls (`put_edge`, `link`, `link_many`) the tuple IS
+/// the identity: a second `put_edge` of the same quadruple overwrites the
+/// first (set semantics), and every edge of a file written before
+/// `docs/core/GRAPH_CONTRACT.md` §2.3 has this implicit identity (id 0).
+/// [`Database::create_edge`] adds an id segment under
+/// [`EDGE_ID_FEATURE`], so PARALLEL edges of one tuple coexist; [`EdgeId`]
+/// is that tuple plus the id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EdgeKey {
     pub source: EntityId,
@@ -58,9 +93,29 @@ pub struct EdgeKey {
     pub destination: EntityId,
 }
 
+/// One edge's STABLE identity (`docs/core/GRAPH_CONTRACT.md` §2.3): its tuple
+/// and its id.
+///
+/// `id` is allocated by [`Database::create_edge`] from one database-wide
+/// counter that only moves forward, so it is unique across the whole file
+/// and is never handed out twice, deleted edges included. The tuple rides
+/// along because the id is the LAST segment of the edge key: with the tuple
+/// in hand, reading, updating or deleting one edge is one point read, and
+/// no id-to-tuple index is kept (identity costs the id segment and nothing
+/// else). An edge written by a tuple-keyed call has
+/// `id == 0`, which addresses the tuple's own edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EdgeId {
+    pub key: EdgeKey,
+    pub id: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Edge {
     pub key: EdgeKey,
+    /// 0 (the implicit identity) for a tuple-keyed edge, otherwise the id
+    /// [`Database::create_edge`] handed out.
+    pub id: u64,
     pub properties: Value,
 }
 
@@ -93,6 +148,8 @@ pub struct NewEdge {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EdgeRef {
     pub key: EdgeKey,
+    /// The edge's id: 0 (the implicit identity) for a tuple-keyed edge.
+    pub id: u64,
     pub properties: Value,
 }
 
@@ -340,6 +397,39 @@ pub(crate) fn read_graph_header(
     replicas(get, graph_header_key, decode_graph_header)
 }
 
+pub(crate) fn edge_id_allocator_key(copy: u8) -> Vec<u8> {
+    vec![EDGE_ID_ALLOCATOR, copy]
+}
+
+pub(crate) fn encode_edge_id_allocator(next: u64) -> Result<Vec<u8>> {
+    packet(EDGE_ID_MAGIC, &next.to_be_bytes())
+}
+
+/// One allocator replica. An intact packet of a NEWER encoding is
+/// `Unsupported`, exactly as the graph header's is; `next` is at least 1,
+/// because id 0 is the implicit identity and is never allocated.
+pub(crate) fn decode_edge_id_allocator(bytes: &[u8]) -> Result<u64> {
+    if bytes.len() == PAD && bytes.starts_with(b"E4GEI") && &bytes[..8] != EDGE_ID_MAGIC {
+        unpack(bytes, bytes[..8].try_into().unwrap())?;
+        return Err(Error::Unsupported("graph edge-id allocator encoding".into()));
+    }
+    let body = unpack(bytes, EDGE_ID_MAGIC)?;
+    if body.len() != 8 {
+        return Err(corrupt("graph edge-id allocator length"));
+    }
+    let next = u64::from_be_bytes(body[..8].try_into().unwrap());
+    if next == 0 {
+        return Err(corrupt("graph edge-id allocator is zero"));
+    }
+    Ok(next)
+}
+
+pub(crate) fn read_edge_id_allocator(
+    get: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>>,
+) -> Result<u64> {
+    replicas(get, edge_id_allocator_key, decode_edge_id_allocator)
+}
+
 fn encode_name(n: &GraphName) -> Result<Vec<u8>> {
     let mut body = vec![n.kind];
     body.extend(n.id.to_be_bytes());
@@ -392,10 +482,11 @@ fn append_entity(key: &mut Vec<u8>, id: EntityId) {
     ordered_into(key, id.sequence);
 }
 
-/// Room for the widest edge key: a tag, two identities at their widest, and
-/// the context and type identities. Sized once so building a key is one
-/// allocation rather than one per integer in it plus a regrow per component.
-const EDGE_KEY_BYTES: usize = 1 + 2 * (2 + 9) + 9 + 9;
+/// Room for the widest edge key: a tag, two identities at their widest, the
+/// context and type identities, and the optional edge id segment. Sized once
+/// so building a key is one allocation rather than one per integer in it
+/// plus a regrow per component.
+const EDGE_KEY_BYTES: usize = 1 + 2 * (2 + 9) + 9 + 9 + 9;
 
 /// The smallest key that sorts ABOVE every key carrying `prefix`: the byte
 /// successor of the prefix. `None` when every byte is `0xFF` and there is no
@@ -484,14 +575,36 @@ impl EdgeBudget {
     }
 }
 
+/// The key of a TUPLE-keyed edge (id [`IMPLICIT_EDGE_ID`]).
 pub(crate) fn edge_key(tag: u8, edge: EdgeKey) -> Vec<u8> {
+    edge_key_id(tag, edge, IMPLICIT_EDGE_ID)
+}
+
+/// The key of one edge of either kind.
+///
+/// ```text
+/// 0x71 | source | context | type | destination [| ordered(id)]
+/// 0x72 | destination | context | type | source [| ordered(id)]
+/// ```
+///
+/// The id segment is ABSENT for [`IMPLICIT_EDGE_ID`], so a tuple-keyed edge
+/// keeps the frozen encoding byte for byte, and PRESENT (2..=9 bytes) for an
+/// id-bearing edge. Every field before it is self-delimiting (the ordered
+/// integer encoding is width-tagged), so the tuple key is a byte prefix of
+/// exactly its own parallel edges and of nothing else, and one adjacency
+/// prefix still covers every parallel edge in one contiguous range.
+pub(crate) fn edge_key_id(tag: u8, edge: EdgeKey, id: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(EDGE_KEY_BYTES);
-    edge_key_into(&mut key, tag, edge);
+    edge_key_into_id(&mut key, tag, edge, id);
     key
 }
 
 /// The same frozen encoding, appended to a buffer the caller owns.
 pub(super) fn edge_key_into(key: &mut Vec<u8>, tag: u8, edge: EdgeKey) {
+    edge_key_into_id(key, tag, edge, IMPLICIT_EDGE_ID)
+}
+
+fn edge_key_into_id(key: &mut Vec<u8>, tag: u8, edge: EdgeKey, id: u64) {
     key.push(tag);
     let (first, last) = if tag == PRIMARY_EDGE {
         (edge.source, edge.destination)
@@ -502,6 +615,24 @@ pub(super) fn edge_key_into(key: &mut Vec<u8>, tag: u8, edge: EdgeKey) {
     ordered_into(key, edge.context.0);
     ordered_into(key, edge.edge_type.0);
     append_entity(key, last);
+    if id != IMPLICIT_EDGE_ID {
+        ordered_into(key, id);
+    }
+}
+
+/// The optional id segment at `key[*at..]`: [`IMPLICIT_EDGE_ID`] when the
+/// key ends here, otherwise one ordered integer that must be nonzero and end
+/// the key. Anything else is a malformed key.
+#[inline]
+fn read_edge_id(key: &[u8], at: &mut usize) -> Result<u64> {
+    if *at == key.len() {
+        return Ok(IMPLICIT_EDGE_ID);
+    }
+    let id = read_ordered(key, at)?;
+    if id == IMPLICIT_EDGE_ID || *at != key.len() {
+        return Err(corrupt("graph edge id segment"));
+    }
+    Ok(id)
 }
 
 pub(super) fn edge_prefix(
@@ -566,7 +697,14 @@ pub(crate) fn edge_prefix_into(
     at
 }
 
-pub(crate) fn parse_edge_key(key: &[u8], tag: u8) -> Result<EdgeKey> {
+/// Both halves of a stored edge key: the tuple and the id
+/// ([`IMPLICIT_EDGE_ID`] when the key carries no id segment).
+///
+/// Whether an id segment is ALLOWED is the file's business, not the key's:
+/// the verifier and the rebuild refuse one in a file that does not declare
+/// [`EDGE_ID_FEATURE`], and a binary that predates the bit never opens such
+/// a file at all.
+pub(crate) fn parse_edge(key: &[u8], tag: u8) -> Result<(EdgeKey, u64)> {
     if key.first() != Some(&tag) {
         return Err(corrupt("graph edge key tag"));
     }
@@ -575,10 +713,11 @@ pub(crate) fn parse_edge_key(key: &[u8], tag: u8) -> Result<EdgeKey> {
     let context = GraphContextId(read_ordered(key, &mut at)?);
     let edge_type = EdgeTypeId(read_ordered(key, &mut at)?);
     let last = read_entity(key, &mut at)?;
-    if at != key.len() || edge_type.0 == 0 {
+    if edge_type.0 == 0 {
         return Err(corrupt("graph edge key fields"));
     }
-    Ok(if tag == PRIMARY_EDGE {
+    let id = read_edge_id(key, &mut at).map_err(|_| corrupt("graph edge key fields"))?;
+    let edge = if tag == PRIMARY_EDGE {
         EdgeKey {
             source: first,
             context,
@@ -592,42 +731,44 @@ pub(crate) fn parse_edge_key(key: &[u8], tag: u8) -> Result<EdgeKey> {
             edge_type,
             destination: first,
         }
-    })
+    };
+    Ok((edge, id))
 }
 
 /// The far endpoint of an edge key that a prefix scan just handed us.
 ///
-/// `parse_edge_key` reads all four fields back out of the key. A prefix scan
+/// `parse_edge` reads all four fields back out of the key. A prefix scan
 /// has already fixed three of them -- the near entity, the context, and, when
 /// the caller named one, the edge type -- byte for byte: the `starts_with`
 /// test proved the row carries exactly the bytes the scan built. Only the far
 /// entity is news, and for a traversal it is the whole answer.
 ///
 /// Measured on the 500-edge organization fan-in of the 50K multimodel
-/// database: 32.7 ns per edge for `parse_edge_key`, 12.0 ns for this.
+/// database: 32.7 ns per edge for `parse_edge`, 12.0 ns for this.
 pub(crate) fn adjacent_from_tail(
     key: &[u8],
     at0: usize,
     pinned_type: Option<EdgeTypeId>,
     context: GraphContextId,
     h: GraphHeader,
-) -> Result<(EdgeTypeId, EntityId)> {
+) -> Result<(EdgeTypeId, EntityId, u64)> {
     let mut at = at0;
     let edge_type = match pinned_type {
         Some(id) => id,
         None => EdgeTypeId(read_ordered(key, &mut at)?),
     };
     let adjacent = read_entity(key, &mut at)?;
-    if at != key.len() {
-        return Err(corrupt("graph edge key fields"));
-    }
+    // The id segment of a parallel edge, or nothing: one length comparison
+    // per hop for a tuple-keyed edge, one integer read for an id-bearing one,
+    // and no allocation either way (contract §2.3: nothing per hop).
+    let id = read_edge_id(key, &mut at).map_err(|_| corrupt("graph edge key fields"))?;
     // The guard `validate_stored_edge_ids` applied, on the same two fields.
     // The context reached us through the prefix the caller already validated;
     // the type came either from there or from the key we just read.
     if edge_type.0 == 0 || edge_type.0 >= h.next_type || context.0 >= h.next_context {
         return Err(corrupt("stored edge has unknown type/context identity"));
     }
-    Ok((edge_type, adjacent))
+    Ok((edge_type, adjacent, id))
 }
 
 /// The encoded form of `{}`. Nearly every edge in a graph carries no
@@ -768,34 +909,254 @@ impl Frontier {
     }
 }
 
-/// The node gate, asked at most once per distinct entity for a whole walk.
+/// One hop of the node-deduplicating BFS -- `traverse_bfs` and the query
+/// engine's `QueryFilter::Graph` walk run the same one -- over the edges of
+/// one context and (optionally) one type, under the per-hop predicates of
+/// `docs/core/GRAPH_CONTRACT.md` §4.3, applied HERE, as the frontier
+/// expands, and not afterwards:
 ///
-/// `docs/core/GRAPH_CONTRACT.md` §4.3 promises one index point read per visited
-/// NODE. The gate itself is per-node -- the same entity gets the same answer
-/// over every edge that reaches it -- so memoising the refusals changes no
-/// answer and no offer order: an admitted node joins `seen` with its level
-/// and is never offered again, and a refused one joins `refused` here.
+///   * `edge_where` reads the edge's own inline property bag. An OUTGOING
+///     posting carries that bag as its value, so the predicate costs the
+///     decode and nothing else. An INCOMING posting is a marker whose value
+///     is empty by construction, so the authoritative primary posting of the
+///     same edge is read back -- one edge-keyspace point read per candidate
+///     edge, never a row. Those reads are made AFTER the range walk, from a
+///     list the walk collected, because the walk holds a pinned leaf while
+///     it runs.
+///   * the node gate (the `node_where` conjunction) is tested on the far
+///     endpoint ([`HopWork::admits`]). A node it refuses is neither offered
+///     to the level nor expanded, and nothing about it is read from the
+///     primary tree.
 ///
-/// Bound (Law 1): a refused entity was reached by at least one edge the walk
-/// charged against `max_edges`, so `refused` holds at most `max_edges`
-/// entries -- 12 bytes each, beside the visited set's own bound.
-fn gate_admits(
-    db: &Database,
-    gate: &crate::query::StandaloneNodeGate,
-    refused: &mut BTreeSet<EntityId>,
-    id: EntityId,
-) -> Result<bool> {
-    if gate.is_empty() {
-        return Ok(true);
+/// `wants_via` asks for the reaching edge to be bound to the node (§4.2).
+/// It costs the same decode `edge_where` already pays, and for an incoming
+/// hop the same primary-posting read.
+pub(crate) struct Hop<'a> {
+    pub(crate) header: GraphHeader,
+    pub(crate) context: GraphContextId,
+    pub(crate) edge_type: Option<EdgeTypeId>,
+    pub(crate) edge_where: &'a [EdgePredicate<'a>],
+    pub(crate) wants_via: bool,
+    /// Edge-keyspace reads one walk may make, postings and primary-posting
+    /// reads together.
+    pub(crate) max_edges: usize,
+}
+
+/// What a [`Hop`]'s caller decides: when it polls for cancellation, what it
+/// charges, and its node gate. Everything else about the hop is one code.
+pub(crate) trait HopWork {
+    type Error: From<Error>;
+    /// One turn of the adjacency walk, which `found` a posting or the
+    /// range's end.
+    fn turn(&mut self, found: bool) -> std::result::Result<(), Self::Error>;
+    /// Before one deferred incoming edge is considered.
+    fn poll(&mut self) -> std::result::Result<(), Self::Error>;
+    /// One primary-posting read, for a deferred incoming edge's bag.
+    fn primary_read(&mut self) -> std::result::Result<(), Self::Error>;
+    /// Whether the walk has a node gate at all.
+    fn gated(&self) -> bool;
+    /// The gate's own answer for `id`: its index point reads.
+    fn probe(&mut self, id: EntityId) -> std::result::Result<bool, Self::Error>;
+    /// Every entity the gate has turned away in this walk.
+    fn refused(&mut self) -> &mut BTreeSet<EntityId>;
+
+    /// The node gate, asked at most once per distinct entity for a whole
+    /// walk.
+    ///
+    /// `docs/core/GRAPH_CONTRACT.md` §4.3 promises one index point read per
+    /// visited NODE. The gate itself is per-node -- the same entity gets the
+    /// same answer over every edge that reaches it -- so memoising the
+    /// refusals changes no answer and no offer order: an admitted node joins
+    /// `seen` with its level and is never offered again, and a refused one
+    /// joins `refused` here instead of being re-probed by every incident
+    /// edge at every later depth.
+    ///
+    /// Bound (Law 1): a refused entity was reached by at least one edge the
+    /// walk charged against `max_edges`, so `refused` holds at most
+    /// `max_edges` entries -- 12 bytes each, beside the visited set's own
+    /// bound.
+    fn admits(&mut self, id: EntityId) -> std::result::Result<bool, Self::Error> {
+        if !self.gated() {
+            return Ok(true);
+        }
+        if self.refused().contains(&id) {
+            return Ok(false);
+        }
+        if self.probe(id)? {
+            return Ok(true);
+        }
+        self.refused().insert(id);
+        Ok(false)
     }
-    if refused.contains(&id) {
-        return Ok(false);
+}
+
+impl Hop<'_> {
+    /// The hop from `entity` in `direction` (`Outgoing` or `Incoming`):
+    /// every far node not in `seen` (sorted) that the predicates admit is
+    /// offered to `next`, with its reaching edge when `wants_via`. Counts
+    /// every edge-keyspace read into `scanned` against `max_edges`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn walk<W: HopWork>(
+        &self,
+        db: &Database,
+        entity: EntityId,
+        direction: Direction,
+        seen: &[EntityId],
+        next: &mut Frontier,
+        scanned: &mut usize,
+        work: &mut W,
+    ) -> std::result::Result<(), W::Error> {
+        // Whether this hop has to look at an edge's properties at all.
+        let reads_properties = self.wants_via || !self.edge_where.is_empty();
+        // Incoming edges whose properties this hop still needs. Bounded by
+        // the edge budget the walk below trips on, so it is not a new bound.
+        let mut deferred: Vec<(EdgeKey, u64, EntityId)> = Vec::new();
+        // The shared adjacency walk (`adjacency.rs`) hands out borrows into
+        // the pinned leaf: a traversal is a scan, and it costs the pages.
+        let mut cursor = adjacency::AdjacencyCursor::at(
+            db,
+            self.header,
+            entity,
+            direction,
+            self.context,
+            self.edge_type,
+        )?;
+        loop {
+            let posting = cursor.next_posting()?;
+            work.turn(posting.is_some())?;
+            let Some(posting) = posting else {
+                break;
+            };
+            self.count(scanned)?;
+            let adjacent = posting.edge()?;
+            // The visited set is a SORTED VECTOR and the level being built
+            // is a `Frontier`: a binary search, not a tree insert, per edge.
+            if seen.binary_search(&adjacent.far).is_ok() {
+                continue;
+            }
+            if !reads_properties {
+                if work.admits(adjacent.far)? {
+                    next.offer(adjacent.far, None)?;
+                }
+                continue;
+            }
+            // An incoming posting is a marker: its bag is read below.
+            let Some(properties) = adjacent.bag()? else {
+                deferred.push((adjacent.key, adjacent.id, adjacent.far));
+                continue;
+            };
+            self.follow(properties, adjacent.key, adjacent.id, adjacent.far, next, work)?;
+        }
+        // The walk holds a pinned leaf; the reads below do not share it.
+        drop(cursor);
+        // The incoming hop's second pass: the reverse posting is a marker, so
+        // the properties come from the primary posting of the same edge.
+        for (edge, id, far) in deferred {
+            work.poll()?;
+            if seen.binary_search(&far).is_ok() {
+                continue;
+            }
+            // The primary-posting read is an edge-keyspace read like the
+            // range walk's own, so `max_edges` bounds it and `scanned`
+            // reports it. It is counted HERE rather than at the top of the
+            // loop because the `seen` test above skips the read entirely,
+            // and counting a read that does not happen would report work
+            // nobody did.
+            self.count(scanned)?;
+            work.primary_read()?;
+            let properties = decode_properties(&adjacency::primary_posting(db, edge, id)?)?;
+            self.follow(properties, edge, id, far, next, work)?;
+        }
+        Ok(())
     }
-    if gate.admits(db, id)? {
-        return Ok(true);
+
+    /// Cross an edge whose bag is in hand: offer its far node when the
+    /// edge's predicates and the node gate admit it.
+    fn follow<W: HopWork>(
+        &self,
+        properties: Value,
+        key: EdgeKey,
+        id: u64,
+        far: EntityId,
+        next: &mut Frontier,
+        work: &mut W,
+    ) -> std::result::Result<(), W::Error> {
+        if !edge_properties_match(&properties, self.edge_where) || !work.admits(far)? {
+            return Ok(());
+        }
+        let via = self
+            .wants_via
+            .then(|| Arc::new(EdgeRef { key, id, properties }));
+        next.offer(far, via)?;
+        Ok(())
     }
-    refused.insert(id);
-    Ok(false)
+
+    /// One more edge-keyspace read, within `max_edges`.
+    fn count(&self, scanned: &mut usize) -> Result<()> {
+        *scanned = scanned
+            .checked_add(1)
+            .ok_or_else(|| invalid("BFS edge work overflow"))?;
+        if *scanned > self.max_edges {
+            return Err(invalid("BFS edge work limit exceeded"));
+        }
+        Ok(())
+    }
+}
+
+/// `traverse_bfs`'s side of a [`Hop`]: its cancel callback, polled once per
+/// posting and per deferred edge, and its standalone node gate.
+struct BfsWork<'a, C> {
+    db: &'a Database,
+    gate: &'a crate::query::StandaloneNodeGate,
+    refused: BTreeSet<EntityId>,
+    cancel: C,
+}
+
+impl<C: FnMut() -> bool> HopWork for BfsWork<'_, C> {
+    type Error = Error;
+
+    fn turn(&mut self, found: bool) -> Result<()> {
+        if found {
+            self.poll()?;
+        }
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Result<()> {
+        poll(&mut self.cancel)
+    }
+
+    fn primary_read(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn gated(&self) -> bool {
+        !self.gate.is_empty()
+    }
+
+    fn probe(&mut self, id: EntityId) -> Result<bool> {
+        self.gate.admits(self.db, id)
+    }
+
+    fn refused(&mut self) -> &mut BTreeSet<EntityId> {
+        &mut self.refused
+    }
+}
+
+/// A graph read's cancel poll.
+fn poll(cancel: &mut impl FnMut() -> bool) -> Result<()> {
+    if cancel() {
+        return Err(invalid("graph query cancelled"));
+    }
+    Ok(())
+}
+
+/// The poll for the row a finished walk read past its range, if it read one.
+fn poll_past(cursor: &adjacency::AdjacencyCursor<'_>, cancel: &mut impl FnMut() -> bool) -> Result<()> {
+    if cursor.read_past_range() {
+        poll(cancel)?;
+    }
+    Ok(())
 }
 
 /// Union of two sorted sets with no element in common, in one pass, reusing
@@ -826,6 +1187,41 @@ pub(crate) fn merge_sorted_disjoint(
     std::mem::swap(seen, scratch);
 }
 
+/// The open-time admission of the edge-id allocator: bounded, three keys at
+/// most. Without the bit no `0x09` key may exist; with it the graph must be
+/// on and an intact replica must be readable, and an intact replica of a
+/// newer encoding is refused as `Unsupported` rather than outvoted.
+fn validate_edge_id_allocator(s: &PageWalStore, graph: bool, enabled: bool) -> Result<()> {
+    if !enabled {
+        if let Some(row) = s.range(&[EDGE_ID_ALLOCATOR])?.next() {
+            let (key, _) = row?;
+            if key.first() == Some(&EDGE_ID_ALLOCATOR) {
+                return Err(corrupt(
+                    "graph edge-id allocator exists without the edge identity feature",
+                ));
+            }
+        }
+        return Ok(());
+    }
+    if !graph {
+        return Err(corrupt("edge identity feature declared without the graph feature"));
+    }
+    for row in s.range(&[EDGE_ID_ALLOCATOR])? {
+        let (key, value) = row?;
+        if key.first() != Some(&EDGE_ID_ALLOCATOR) {
+            break;
+        }
+        if key.len() != 2 || key[1] > 2 {
+            return Err(corrupt("graph edge-id allocator replica key"));
+        }
+        if let Err(e @ Error::Unsupported(_)) = decode_edge_id_allocator(&value) {
+            return Err(e);
+        }
+    }
+    read_edge_id_allocator(|key| s.get(key).map_err(Error::from))?;
+    Ok(())
+}
+
 fn validate_name_input(name: &str, what: &str) -> Result<()> {
     if name.is_empty() || name.len() > MAX_NAME_BYTES {
         return Err(invalid(format!("{what} requires 1..128 UTF-8 bytes")));
@@ -835,8 +1231,14 @@ fn validate_name_input(name: &str, what: &str) -> Result<()> {
 
 /// Bounded admission of graph metadata. Relationship rows deliberately are
 /// not scanned here; their exact key/value and mirror are checked when read.
-pub(crate) fn validate_graph(s: &PageWalStore, enabled: bool, endpoints_enabled: bool) -> Result<()> {
+pub(crate) fn validate_graph(
+    s: &PageWalStore,
+    enabled: bool,
+    endpoints_enabled: bool,
+    edge_ids_enabled: bool,
+) -> Result<()> {
     endpoints::validate_endpoint_sets(s, endpoints_enabled)?;
+    validate_edge_id_allocator(s, enabled, edge_ids_enabled)?;
     if !enabled {
         // A single prefix probe per family is bounded. Edge rows are
         // authoritative data and must never become invisible merely because
@@ -1143,7 +1545,7 @@ impl Database {
             if key.first() != Some(&PRIMARY_EDGE) {
                 break;
             }
-            let edge = parse_edge_key(&key, PRIMARY_EDGE)?;
+            let (edge, _) = parse_edge(&key, PRIMARY_EDGE)?;
             self.validate_stored_edge_ids(h, edge)?;
             found.insert(EdgeShape {
                 edge_type: edge.edge_type,
@@ -1882,14 +2284,91 @@ impl Database {
         }
         Ok(seen)
     }
+    /// Delete by TUPLE: every edge of `(source, context, type, destination)`
+    /// -- the tuple's own implicit edge and every parallel edge
+    /// [`Database::create_edge`] put beside it. On a file without parallel
+    /// edges that is the one edge it always was. Returns whether anything was
+    /// removed. To remove ONE parallel edge, use
+    /// [`Database::delete_edge_by_id`].
+    ///
+    /// The tuple's edges are one contiguous range (the implicit key is a byte
+    /// prefix of exactly its own parallel keys), collected before any is
+    /// deleted, and more than 65,536 of them is refused rather than walked.
     pub fn delete_edge(&mut self, key: EdgeKey) -> Result<bool> {
         self.user_write()?;
         let h = self.graph_header()?;
         self.validate_edge_ids(h, key)?;
-        let primary_key = edge_key(PRIMARY_EDGE, key);
-        let reverse_key = edge_key(REVERSE_EDGE, key);
-        let primary = self.store()?.get(&primary_key)?;
-        let reverse = self.store()?.get(&reverse_key)?;
+        let ids = self.tuple_edge_ids(key)?;
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        for id in &ids {
+            self.preflight_edge_id(key, *id)?;
+        }
+        let maintain = self.endpoint_sets_present();
+        let result = (|| {
+            for id in &ids {
+                if !self.writer()?.delete(&edge_key_id(PRIMARY_EDGE, key, *id))?
+                    || !self.writer()?.delete(&edge_key_id(REVERSE_EDGE, key, *id))?
+                {
+                    return Err(corrupt("edge disappeared during delete"));
+                }
+            }
+            // AFTER the delete, so the probe cannot find the edge it is
+            // retiring. One bounded range probe per end; see `endpoints.rs`.
+            if maintain {
+                self.remove_endpoint_keys_if_last(key)?;
+            }
+            Ok(true)
+        })();
+        self.finish(result)
+    }
+
+    /// The ids of every edge of one tuple, ascending, with a reverse-only
+    /// id (a mirror whose authoritative primary is gone) reported as the
+    /// corruption it is.
+    fn tuple_edge_ids(&self, key: EdgeKey) -> Result<Vec<u64>> {
+        let mut ids = Vec::new();
+        let primary = edge_key(PRIMARY_EDGE, key);
+        for row in self.store()?.range(&primary)? {
+            let (k, _) = row?;
+            if !k.starts_with(&primary) {
+                break;
+            }
+            let mut at = primary.len();
+            ids.push(read_edge_id(&k, &mut at)?);
+            if ids.len() > MAX_TUPLE_EDGES {
+                return Err(invalid(
+                    "more than 65536 parallel edges share this tuple; delete them by id",
+                ));
+            }
+        }
+        let reverse = edge_key(REVERSE_EDGE, key);
+        let mut mirrors = 0usize;
+        for row in self.store()?.range(&reverse)? {
+            let (k, _) = row?;
+            if !k.starts_with(&reverse) {
+                break;
+            }
+            let mut at = reverse.len();
+            let id = read_edge_id(&k, &mut at)?;
+            if ids.binary_search(&id).is_err() {
+                return Err(corrupt("reverse edge without authoritative primary"));
+            }
+            mirrors += 1;
+        }
+        if mirrors != ids.len() {
+            return Err(corrupt("missing/nonempty reverse edge marker"));
+        }
+        Ok(ids)
+    }
+
+    /// Both halves of ONE edge, checked: `Ok(true)` when the pair is intact,
+    /// `Ok(false)` when neither half exists, and `Corrupt` for half a pair or
+    /// a damaged bag.
+    fn preflight_edge_id(&self, key: EdgeKey, id: u64) -> Result<bool> {
+        let primary = self.store()?.get(&edge_key_id(PRIMARY_EDGE, key, id))?;
+        let reverse = self.store()?.get(&edge_key_id(REVERSE_EDGE, key, id))?;
         let Some(value) = primary else {
             if reverse.is_some() {
                 return Err(corrupt("reverse edge without authoritative primary"));
@@ -1900,15 +2379,167 @@ impl Database {
         if reverse.as_deref() != Some(&[]) {
             return Err(corrupt("missing/nonempty reverse edge marker"));
         }
+        Ok(true)
+    }
+
+    /// Whether this file carries id-bearing edges
+    /// ([`EDGE_ID_FEATURE`], `docs/core/GRAPH_CONTRACT.md` §2.3).
+    fn edge_identity_present(&self) -> bool {
+        self.index_header
+            .is_some_and(|h| h.features & EDGE_ID_FEATURE != 0)
+    }
+
+    /// The next edge id, advanced in memory; `commit` writes the allocator.
+    fn allocate_edge_id(&mut self) -> Result<u64> {
+        let next = match self.edge_id_next {
+            Some(next) => next,
+            None if self.edge_identity_present() => {
+                read_edge_id_allocator(|key| self.store()?.get(key).map_err(Error::from))?
+            }
+            // No id has ever been handed out in this file.
+            None => 1,
+        };
+        let following = next
+            .checked_add(1)
+            .ok_or_else(|| invalid("graph edge identities exhausted"))?;
+        self.edge_id_next = Some(following);
+        self.edge_id_dirty = true;
+        Ok(next)
+    }
+
+    /// Called by `commit`: the allocator's three replicas, once per commit
+    /// that created an edge, in the same transaction as the edges.
+    pub(crate) fn flush_edge_id_allocator(&mut self) -> Result<()> {
+        if self.edge_id_dirty {
+            let next = self
+                .edge_id_next
+                .ok_or_else(|| corrupt("edge-id allocator marked dirty without a value"))?;
+            let bytes = encode_edge_id_allocator(next)?;
+            for copy in 0..3 {
+                self.writer()?.put(&edge_id_allocator_key(copy), &bytes)?;
+            }
+            self.edge_id_dirty = false;
+        }
+        // Re-read at the next transaction's first create, as the entity
+        // sequence is: the durable file is the authority between commits.
+        self.edge_id_next = None;
+        Ok(())
+    }
+
+    /// Create a NEW edge (`docs/core/GRAPH_CONTRACT.md` §2.3): always a new
+    /// edge with a new id, even when an edge of the same
+    /// `(source, context, type, destination)` already exists -- the two are
+    /// PARALLEL edges and both are kept, each with its own properties.
+    ///
+    /// The id is allocated from one database-wide counter that only moves
+    /// forward, so it is never handed out twice. The FIRST call on a file
+    /// sets [`EDGE_ID_FEATURE`] in the same transaction as the first
+    /// id-bearing key; the caller publishes both with `commit`.
+    ///
+    /// Cost (contract L4): the id segment on each of the two keys (2..=9
+    /// bytes each), one allocator write per COMMIT rather than per edge, and
+    /// one point probe of the new primary key so that a damaged allocator
+    /// can never make this call overwrite an existing edge.
+    pub fn create_edge(
+        &mut self,
+        context: GraphContextId,
+        source: EntityId,
+        edge_type: EdgeTypeId,
+        destination: EntityId,
+        properties: &Value,
+    ) -> Result<EdgeId> {
+        self.user_write()?;
+        let h = self.graph_header()?;
+        let key = EdgeKey {
+            source,
+            context,
+            edge_type,
+            destination,
+        };
+        self.validate_edge_ids(h, key)?;
+        self.validate_endpoints(source, destination)?;
+        let bytes = encode_properties(properties)?;
+        if self
+            .limits
+            .is_some_and(|l| bytes.len() + 64 > l.record_bytes as usize)
+        {
+            return Err(invalid("encoded edge exceeds configured record limit"));
+        }
+        let result = (|| {
+            let id = self.allocate_edge_id()?;
+            let primary = edge_key_id(PRIMARY_EDGE, key, id);
+            if self.store()?.get(&primary)?.is_some() {
+                return Err(corrupt(
+                    "graph edge-id allocator is behind an existing edge id",
+                ));
+            }
+            // Before the first key, like every additive bit here: the header
+            // write and the keys are one transaction.
+            self.enable_logical_feature(EDGE_ID_FEATURE)?;
+            let maintain = self.endpoint_maintenance()?;
+            self.writer()?.put(&primary, &bytes)?;
+            self.writer()?
+                .put(&edge_key_id(REVERSE_EDGE, key, id), &[])?;
+            if maintain {
+                // A new edge files both its ends; a put of a key that a
+                // sibling edge already filed changes nothing.
+                self.insert_endpoint_keys(key)?;
+            }
+            Ok(EdgeId { key, id })
+        })();
+        self.finish(result)
+    }
+
+    /// Replace ONE edge's property bag in place (contract §2.6): a rewrite of
+    /// its primary posting, nothing else. Its parallel siblings, its mirror
+    /// and the endpoint sets are untouched. Returns `false` when no such edge
+    /// exists.
+    pub fn update_edge_properties(&mut self, edge: EdgeId, properties: &Value) -> Result<bool> {
+        self.user_write()?;
+        let h = self.graph_header()?;
+        self.validate_edge_ids(h, edge.key)?;
+        let bytes = encode_properties(properties)?;
+        if self
+            .limits
+            .is_some_and(|l| bytes.len() + 64 > l.record_bytes as usize)
+        {
+            return Err(invalid("encoded edge exceeds configured record limit"));
+        }
+        if !self.preflight_edge_id(edge.key, edge.id)? {
+            return Ok(false);
+        }
+        let result = (|| {
+            self.writer()?
+                .put(&edge_key_id(PRIMARY_EDGE, edge.key, edge.id), &bytes)?;
+            Ok(true)
+        })();
+        self.finish(result)
+    }
+
+    /// Delete ONE edge by its identity. Its parallel siblings stay, and so
+    /// do the endpoint-set keys (§2.7) of any end that still has an edge of
+    /// the same (context, type, direction): an end leaves its set only with
+    /// its LAST such edge. Returns `false` when no such edge exists.
+    pub fn delete_edge_by_id(&mut self, edge: EdgeId) -> Result<bool> {
+        self.user_write()?;
+        let h = self.graph_header()?;
+        self.validate_edge_ids(h, edge.key)?;
+        if !self.preflight_edge_id(edge.key, edge.id)? {
+            return Ok(false);
+        }
         let maintain = self.endpoint_sets_present();
         let result = (|| {
-            if !self.writer()?.delete(&primary_key)? || !self.writer()?.delete(&reverse_key)? {
+            if !self
+                .writer()?
+                .delete(&edge_key_id(PRIMARY_EDGE, edge.key, edge.id))?
+                || !self
+                    .writer()?
+                    .delete(&edge_key_id(REVERSE_EDGE, edge.key, edge.id))?
+            {
                 return Err(corrupt("edge disappeared during delete"));
             }
-            // AFTER the delete, so the probe cannot find the edge it is
-            // retiring. One bounded range probe per end; see `endpoints.rs`.
             if maintain {
-                self.remove_endpoint_keys_if_last(key)?;
+                self.remove_endpoint_keys_if_last(edge.key)?;
             }
             Ok(true)
         })();
@@ -1962,6 +2593,11 @@ impl Database {
         Ok(())
     }
 
+    /// One direction of a neighbour read: every edge of `entity` in
+    /// `direction` into `out`, keyed by its whole identity, with the bag an
+    /// outgoing posting carries (its bytes counted against the call's
+    /// bound). Stops once `out` holds more than `stop_after`.
+    #[allow(clippy::too_many_arguments)]
     fn collect_direction(
         &self,
         h: GraphHeader,
@@ -1969,72 +2605,42 @@ impl Database {
         direction: Direction,
         context: GraphContextId,
         edge_type_id: Option<EdgeTypeId>,
-        out: &mut BTreeMap<EdgeKey, Option<Vec<u8>>>,
+        out: &mut BTreeMap<(EdgeKey, u64), Option<Vec<u8>>>,
         property_bytes: &mut usize,
         stop_after: usize,
         cancel: &mut impl FnMut() -> bool,
     ) -> Result<()> {
-        let outgoing = direction == Direction::Outgoing;
-        let tag = match direction {
-            Direction::Outgoing => PRIMARY_EDGE,
-            Direction::Incoming => REVERSE_EDGE,
-            Direction::Both => unreachable!(),
-        };
-        let mut prefix = [0u8; MAX_EDGE_PREFIX];
-        let at0 = edge_prefix_into(&mut prefix, tag, entity, Some(context), edge_type_id);
-        let p = &prefix[..at0];
-        // `for_each_ref` hands the callback borrows into the pinned leaf. The
-        // allocating iterator built a key `Vec` per edge for a parser that
-        // only reads it, and a value `Vec` per edge that an incoming read
-        // discards unread. The cancel poll keeps its old schedule exactly:
-        // one per row the cursor produces, before the prefix test.
-        let mut failure: Option<Error> = None;
-        {
-            let mut step = |key: &[u8], value: &[u8]| -> Result<bool> {
-                if cancel() {
-                    return Err(invalid("graph query cancelled"));
-                }
-                if !key.starts_with(p) {
-                    return Ok(false);
-                }
-                let (edge_type, adjacent) = adjacent_from_tail(key, at0, edge_type_id, context, h)?;
-                let edge = if outgoing {
-                    EdgeKey { source: entity, context, edge_type, destination: adjacent }
-                } else {
-                    EdgeKey { source: adjacent, context, edge_type, destination: entity }
-                };
-                if outgoing {
-                    // The scan already handed us the authoritative row, so the
-                    // properties are in hand: keep them and spend no lookup.
+        // The shared adjacency walk (`adjacency.rs`) hands out borrows into
+        // the pinned leaf. The cancel poll keeps its old schedule exactly:
+        // one per row the walk reads, the first row past the range included.
+        let mut cursor =
+            adjacency::AdjacencyCursor::at(self, h, entity, direction, context, edge_type_id)?;
+        loop {
+            let Some(posting) = cursor.next_posting()? else {
+                return poll_past(&cursor, cancel);
+            };
+            poll(cancel)?;
+            let adjacent = posting.edge()?;
+            match adjacent.bag {
+                // The scan already handed us the authoritative row, so the
+                // properties are in hand: keep them and spend no lookup.
+                Some(value) => {
                     *property_bytes = property_bytes
                         .checked_add(value.len())
                         .ok_or_else(|| invalid("neighbor property-byte bound overflow"))?;
                     if *property_bytes > MAX_NEIGHBOR_PROPERTY_BYTES {
                         return Err(invalid("neighbor properties exceed 1 MiB call bound"));
                     }
-                    out.insert(edge, Some(value.to_vec()));
-                } else {
-                    if !value.is_empty() {
-                        return Err(corrupt("nonempty reverse edge marker"));
-                    }
-                    out.entry(edge).or_insert(None);
+                    out.insert((adjacent.key, adjacent.id), Some(value.to_vec()));
                 }
-                Ok(out.len() <= stop_after)
-            };
-            self.store()?
-                .range(p)?
-                .for_each_ref(|key, value| match step(key, value) {
-                    Ok(keep_going) => keep_going,
-                    Err(error) => {
-                        failure = Some(error);
-                        false
-                    }
-                })?;
+                None => {
+                    out.entry((adjacent.key, adjacent.id)).or_insert(None);
+                }
+            }
+            if out.len() > stop_after {
+                return Ok(());
+            }
         }
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        Ok(())
     }
 
     /// One direction of a keys-only neighbour walk: the far endpoint of every
@@ -2049,56 +2655,35 @@ impl Database {
         scanned: &mut usize,
         cancel: &mut impl FnMut() -> bool,
     ) -> Result<()> {
-        let incoming = direction == Direction::Incoming;
-        let tag = if incoming { REVERSE_EDGE } else { PRIMARY_EDGE };
-        let mut prefix = [0u8; MAX_EDGE_PREFIX];
-        let at0 =
-            edge_prefix_into(&mut prefix, tag, request.entity, Some(request.context), request.edge_type);
-        let p = &prefix[..at0];
-        let (pinned, context, limit) = (request.edge_type, request.context, request.limit);
-        let mut failure: Option<Error> = None;
-        {
-            let mut step = |key: &[u8], value: &[u8]| -> Result<bool> {
-                if cancel() {
-                    return Err(invalid("graph query cancelled"));
-                }
-                if !key.starts_with(p) {
-                    return Ok(false);
-                }
-                *scanned = scanned
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("neighbor edge work overflow"))?;
-                if incoming && !value.is_empty() {
-                    return Err(corrupt("nonempty reverse edge marker"));
-                }
-                let (_, adjacent) = adjacent_from_tail(key, at0, pinned, context, h)?;
-                found.push(adjacent);
-                if found.len() > limit {
-                    // Only a self-loop can repeat inside one call, so this
-                    // normalise runs at most once per direction, and the walk
-                    // stops the moment the DISTINCT count is genuinely over.
-                    found.sort_unstable();
-                    found.dedup();
-                    if found.len() > limit {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+        let mut cursor = adjacency::AdjacencyCursor::at(
+            self,
+            h,
+            request.entity,
+            direction,
+            request.context,
+            request.edge_type,
+        )?;
+        loop {
+            let Some(posting) = cursor.next_posting()? else {
+                return poll_past(&cursor, cancel);
             };
-            self.store()?
-                .range(p)?
-                .for_each_ref(|key, value| match step(key, value) {
-                    Ok(keep_going) => keep_going,
-                    Err(error) => {
-                        failure = Some(error);
-                        false
-                    }
-                })?;
+            poll(cancel)?;
+            *scanned = scanned
+                .checked_add(1)
+                .ok_or_else(|| invalid("neighbor edge work overflow"))?;
+            found.push(posting.edge()?.far);
+            if found.len() > request.limit {
+                // A self-loop or a run of PARALLEL edges repeats an entity
+                // inside one call. The normalise brings the list back to its
+                // distinct entries, and the walk stops the moment the
+                // DISTINCT count is genuinely over.
+                found.sort_unstable();
+                found.dedup();
+                if found.len() > request.limit {
+                    return Ok(());
+                }
+            }
         }
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        Ok(())
     }
 
     pub fn neighbors(&self, request: NeighborRequest) -> Result<Vec<Edge>> {
@@ -2119,7 +2704,9 @@ impl Database {
         }
         let h = self.graph_header()?;
         self.validate_query_ids(h, request.context, request.edge_type)?;
-        let mut keys: BTreeMap<EdgeKey, Option<Vec<u8>>> = BTreeMap::new();
+        // Keyed by the edge's whole identity, so parallel edges are each an
+        // entry and a self-loop walked in both directions is still one.
+        let mut keys: BTreeMap<(EdgeKey, u64), Option<Vec<u8>>> = BTreeMap::new();
         let mut property_bytes = 0usize;
         if matches!(request.direction, Direction::Outgoing | Direction::Both) {
             self.collect_direction(
@@ -2165,7 +2752,7 @@ impl Database {
             ));
         }
         let mut out = Vec::with_capacity(keys.len());
-        for (key, collected) in keys {
+        for ((key, id), collected) in keys {
             if cancel() {
                 return Err(invalid("graph query cancelled"));
             }
@@ -2174,10 +2761,7 @@ impl Database {
             let value = match collected {
                 Some(value) => value,
                 None => {
-                    let value = self
-                        .store()?
-                        .get(&edge_key(PRIMARY_EDGE, key))?
-                        .ok_or_else(|| corrupt("edge disappeared during neighbor read"))?;
+                    let value = adjacency::primary_posting(self, key, id)?;
                     property_bytes = property_bytes
                         .checked_add(value.len())
                         .ok_or_else(|| invalid("neighbor property-byte bound overflow"))?;
@@ -2189,6 +2773,7 @@ impl Database {
             };
             out.push(Edge {
                 key,
+                id,
                 properties: decode_properties(&value)?,
             });
         }
@@ -2256,171 +2841,6 @@ impl Database {
             ));
         }
         Ok(found)
-    }
-
-    /// One direction of one frontier entry's hop.
-    ///
-    /// The per-hop predicates of `docs/core/GRAPH_CONTRACT.md` §4.3 are applied
-    /// HERE, as the frontier expands, and not afterwards:
-    ///
-    ///   * `edge_where` reads the edge's own inline property bag. An OUTGOING
-    ///     posting carries that bag as its value, so the predicate costs the
-    ///     decode and nothing else. An INCOMING posting is a marker whose
-    ///     value is empty by construction, so the authoritative primary
-    ///     posting of the same edge is read back -- one edge-keyspace point
-    ///     read per candidate edge, never a row. Those reads are made AFTER
-    ///     the range walk, from a list the walk collected, because the walk
-    ///     holds a pinned leaf while it runs.
-    ///   * `gate` (the `node_where` conjunction) is tested on the far
-    ///     endpoint. A node it refuses is neither offered to the level nor
-    ///     expanded, and nothing about it is read from the primary tree. It
-    ///     is tested at most ONCE per distinct entity for the whole walk:
-    ///     an admitted node joins `seen` with its level, and a refused one
-    ///     joins `refused`, so no later edge -- at this depth or a deeper
-    ///     one -- probes it again. That is §4.3's "one index point read per
-    ///     visited node" rather than one per incident edge per depth.
-    ///
-    /// `wants_via` asks for the reaching edge to be bound to the node (§4.2).
-    /// It costs the same decode `edge_where` already pays, and for an
-    /// incoming hop the same primary-posting read.
-    #[allow(clippy::too_many_arguments)]
-    fn bfs_direction(
-        &self,
-        h: GraphHeader,
-        entity: EntityId,
-        direction: Direction,
-        request: &BfsRequest<'_>,
-        gate: &crate::query::StandaloneNodeGate,
-        wants_via: bool,
-        next: &mut Frontier,
-        seen: &[EntityId],
-        refused: &mut BTreeSet<EntityId>,
-        scanned: &mut usize,
-        cancel: &mut impl FnMut() -> bool,
-    ) -> Result<()> {
-        let incoming = direction == Direction::Incoming;
-        let tag = if incoming { REVERSE_EDGE } else { PRIMARY_EDGE };
-        let mut prefix = [0u8; MAX_EDGE_PREFIX];
-        let at0 =
-            edge_prefix_into(&mut prefix, tag, entity, Some(request.context), request.edge_type);
-        let p = &prefix[..at0];
-        let (pinned, context, max_edges) = (request.edge_type, request.context, request.max_edges);
-        // Whether this hop has to look at an edge's properties at all.
-        let reads_properties = wants_via || !request.edge_where.is_empty();
-        // `for_each_ref` hands the callback borrows into the pinned leaf. The
-        // allocating iterator built a key `Vec` and a value `Vec` for every
-        // edge walked, to hand a parser bytes it only reads and a marker check
-        // one byte of length. A traversal is a scan; it should cost the pages.
-        //
-        // The whole per-edge body lives here rather than in a helper: it used
-        // to take the 88-byte `BfsRequest` by value, so every edge paid for a
-        // copy of ten fields to read one of them.
-        let mut failure: Option<Error> = None;
-        // Incoming edges whose properties this hop still needs. Bounded by
-        // the edge budget the walk below trips on, so it is not a new bound.
-        let mut deferred: Vec<(EdgeKey, EntityId)> = Vec::new();
-        {
-            let mut step = |key: &[u8], value: &[u8]| -> Result<bool> {
-                if !key.starts_with(p) {
-                    return Ok(false);
-                }
-                if cancel() {
-                    return Err(invalid("graph query cancelled"));
-                }
-                *scanned = scanned
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("BFS edge work overflow"))?;
-                if *scanned > max_edges {
-                    return Err(invalid("BFS edge work limit exceeded"));
-                }
-                // BFS never reads across to the other direction of the pair
-                // for STRUCTURE: both directions are written in one
-                // transaction, so a committed snapshot cannot hold half a
-                // pair, and `verify_indexed_source` is the tool that checks
-                // pair consistency.
-                if incoming && !value.is_empty() {
-                    return Err(corrupt("nonempty reverse edge marker"));
-                }
-                let (edge_type, adjacent) = adjacent_from_tail(key, at0, pinned, context, h)?;
-                if seen.binary_search(&adjacent).is_ok() {
-                    return Ok(true);
-                }
-                if !reads_properties {
-                    if gate_admits(self, gate, refused, adjacent)? {
-                        next.offer(adjacent, None)?;
-                    }
-                    return Ok(true);
-                }
-                let edge = if incoming {
-                    EdgeKey { source: adjacent, context, edge_type, destination: entity }
-                } else {
-                    EdgeKey { source: entity, context, edge_type, destination: adjacent }
-                };
-                if incoming {
-                    deferred.push((edge, adjacent));
-                    return Ok(true);
-                }
-                let properties = decode_properties(value)?;
-                if !edge_properties_match(&properties, request.edge_where) {
-                    return Ok(true);
-                }
-                if !gate_admits(self, gate, refused, adjacent)? {
-                    return Ok(true);
-                }
-                let via = wants_via.then(|| Arc::new(EdgeRef { key: edge, properties }));
-                next.offer(adjacent, via)?;
-                Ok(true)
-            };
-            self.store()?
-                .range(p)?
-                .for_each_ref(|key, value| match step(key, value) {
-                    Ok(keep_going) => keep_going,
-                    Err(error) => {
-                        failure = Some(error);
-                        false
-                    }
-                })?;
-        }
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        // The incoming hop's second pass: the reverse posting is a marker, so
-        // the properties come from the primary posting of the same edge.
-        for (edge, adjacent) in deferred {
-            if cancel() {
-                return Err(invalid("graph query cancelled"));
-            }
-            if seen.binary_search(&adjacent).is_ok() {
-                continue;
-            }
-            // The primary-posting read this loop is about is an edge-keyspace
-            // read like the range walk's own, so `max_edges` bounds it and
-            // `scanned_edges` reports it. It is charged HERE rather than at
-            // the top of the loop because the `seen` test above skips the
-            // read entirely, and charging for a read that does not happen
-            // would report work nobody did. This is the same point the query
-            // engine's meter charges `GraphEdges` for it (`drivers.rs`).
-            *scanned = scanned
-                .checked_add(1)
-                .ok_or_else(|| invalid("BFS edge work overflow"))?;
-            if *scanned > max_edges {
-                return Err(invalid("BFS edge work limit exceeded"));
-            }
-            let value = self
-                .store()?
-                .get(&edge_key(PRIMARY_EDGE, edge))?
-                .ok_or_else(|| corrupt("edge disappeared during traversal"))?;
-            let properties = decode_properties(&value)?;
-            if !edge_properties_match(&properties, request.edge_where) {
-                continue;
-            }
-            if !gate_admits(self, gate, refused, adjacent)? {
-                continue;
-            }
-            let via = wants_via.then(|| Arc::new(EdgeRef { key: edge, properties }));
-            next.offer(adjacent, via)?;
-        }
-        Ok(())
     }
 
     /// Deterministic distinct-entity BFS. Budget exhaustion is an error; the
@@ -2493,49 +2913,31 @@ impl Database {
         // The node predicates, compiled and their sets walked ONCE before the
         // first hop. A refused filter kind fails here, not per node.
         let gate = crate::query::StandaloneNodeGate::new(self, request.node_where)?;
-        // Every entity the gate has already turned away, so no later edge
-        // probes it a second time (`gate_admits`).
-        let mut refused: BTreeSet<EntityId> = BTreeSet::new();
+        let hop = Hop {
+            header: h,
+            context: request.context,
+            edge_type: request.edge_type,
+            edge_where: request.edge_where,
+            wants_via,
+            max_edges: request.max_edges,
+        };
+        let mut work = BfsWork {
+            db: self,
+            gate: &gate,
+            refused: BTreeSet::new(),
+            cancel,
+        };
         let mut frontier = vec![request.seed];
         let mut scanned_edges = 0usize;
         for depth in 1..=request.max_depth {
-            if cancel() {
-                return Err(invalid("graph query cancelled"));
-            }
+            work.poll()?;
             let mut next = Frontier::new(request.max_visited - seen.len());
             for entity in frontier {
-                if cancel() {
-                    return Err(invalid("graph query cancelled"));
-                }
-                if matches!(request.direction, Direction::Outgoing | Direction::Both) {
-                    self.bfs_direction(
-                        h,
-                        entity,
-                        Direction::Outgoing,
-                        &request,
-                        &gate,
-                        wants_via,
-                        &mut next,
-                        &seen,
-                        &mut refused,
-                        &mut scanned_edges,
-                        &mut cancel,
-                    )?;
-                }
-                if matches!(request.direction, Direction::Incoming | Direction::Both) {
-                    self.bfs_direction(
-                        h,
-                        entity,
-                        Direction::Incoming,
-                        &request,
-                        &gate,
-                        wants_via,
-                        &mut next,
-                        &seen,
-                        &mut refused,
-                        &mut scanned_edges,
-                        &mut cancel,
-                    )?;
+                work.poll()?;
+                for direction in [Direction::Outgoing, Direction::Incoming] {
+                    if matches!(request.direction, Direction::Both) || request.direction == direction {
+                        hop.walk(self, entity, direction, &seen, &mut next, &mut scanned_edges, &mut work)?;
+                    }
                 }
             }
             let level = next.into_sorted();
@@ -2572,7 +2974,7 @@ impl Database {
         })
     }
 
-    fn preflight_incident_edges(&self, entity: EntityId) -> Result<Vec<EdgeKey>> {
+    fn preflight_incident_edges(&self, entity: EntityId) -> Result<Vec<(EdgeKey, u64)>> {
         if !self
             .index_header
             .is_some_and(|header| header.features & GRAPH_FEATURE != 0)
@@ -2588,11 +2990,13 @@ impl Database {
                 if !key.starts_with(&p) {
                     break;
                 }
-                let edge = parse_edge_key(&key, tag)?;
+                let (edge, id) = parse_edge(&key, tag)?;
                 self.validate_stored_edge_ids(h, edge)?;
                 if tag == PRIMARY_EDGE {
                     decode_properties(&value)?;
-                    if self.store()?.get(&edge_key(REVERSE_EDGE, edge))?.as_deref() != Some(&[]) {
+                    if self.store()?.get(&edge_key_id(REVERSE_EDGE, edge, id))?.as_deref()
+                        != Some(&[])
+                    {
                         return Err(corrupt("missing/nonempty reverse edge marker"));
                     }
                 } else {
@@ -2601,11 +3005,13 @@ impl Database {
                     }
                     let primary = self
                         .store()?
-                        .get(&edge_key(PRIMARY_EDGE, edge))?
+                        .get(&edge_key_id(PRIMARY_EDGE, edge, id))?
                         .ok_or_else(|| corrupt("reverse edge without authoritative primary"))?;
                     decode_properties(&primary)?;
                 }
-                edges.insert(edge);
+                // Each PARALLEL edge is its own entry and counts against the
+                // cascade bound on its own.
+                edges.insert((edge, id));
                 if edges.len() > MAX_CASCADE {
                     return Err(invalid("entity has more than 256 incident graph edges"));
                 }
@@ -2661,7 +3067,7 @@ impl Database {
                 if !key.starts_with(&p) {
                     break;
                 }
-                let edge = parse_edge_key(&key, tag)?;
+                let (edge, _) = parse_edge(&key, tag)?;
                 self.validate_stored_edge_ids(h, edge)?;
                 found.insert(edge.context);
                 let near = if tag == PRIMARY_EDGE {
@@ -2722,7 +3128,7 @@ impl Database {
                 if !key.starts_with(&p) {
                     break;
                 }
-                let edge = parse_edge_key(&key, tag)?;
+                let (edge, _) = parse_edge(&key, tag)?;
                 self.validate_stored_edge_ids(h, edge)?;
                 found.insert(edge.context);
                 let Some(next) = edge.context.0.checked_add(1) else {
@@ -2751,13 +3157,14 @@ impl Database {
     pub(crate) fn cascade_graph_delete(&mut self, entity: EntityId) -> Result<()> {
         let edges = self.preflight_incident_edges(entity)?;
         let result = (|| {
-            for edge in &edges {
-                if !self.writer()?.delete(&edge_key(PRIMARY_EDGE, *edge))?
-                    || !self.writer()?.delete(&edge_key(REVERSE_EDGE, *edge))?
+            for (edge, id) in &edges {
+                if !self.writer()?.delete(&edge_key_id(PRIMARY_EDGE, *edge, *id))?
+                    || !self.writer()?.delete(&edge_key_id(REVERSE_EDGE, *edge, *id))?
                 {
                     return Err(corrupt("incident edge disappeared during cascade"));
                 }
             }
+            let edges: Vec<EdgeKey> = edges.iter().map(|(edge, _)| *edge).collect();
             // Every incident edge is gone before a single endpoint key is
             // probed, so the deleted entity's own keys all go and each
             // neighbour's goes only if this cascade took its last edge. The

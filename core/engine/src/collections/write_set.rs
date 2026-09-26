@@ -270,32 +270,6 @@ pub struct WriteProgress {
     pub work: QueryWork,
 }
 
-/// The budget one page of the candidate walk may still spend.
-fn remaining(budget: &QueryBudget, used: &QueryWork) -> QueryBudget {
-    let left = |limit: u64, spent: u64| limit.saturating_sub(spent);
-    QueryBudget {
-        candidates: left(budget.candidates, used.candidates),
-        primary_reads: left(budget.primary_reads, used.primary_reads),
-        scalar_postings: left(budget.scalar_postings, used.scalar_postings),
-        graph_edges: left(budget.graph_edges, used.graph_edges),
-        graph_visited: left(budget.graph_visited, used.graph_visited),
-        spatial_postings: left(budget.spatial_postings, used.spatial_postings),
-        text_postings: left(budget.text_postings, used.text_postings),
-        text_tokens: left(budget.text_tokens, used.text_tokens),
-        vector_locators: left(budget.vector_locators, used.vector_locators),
-        vector_sidecars: left(budget.vector_sidecars, used.vector_sidecars),
-        vector_lanes: left(budget.vector_lanes, used.vector_lanes),
-        key_postings: left(budget.key_postings, used.key_postings),
-        // The pages do not write; the pass does, and it charges this itself.
-        rows_written: budget.rows_written,
-        groups: budget.groups,
-        output_bytes: left(budget.output_bytes, used.output_bytes),
-        // A deadline is an instant, not an amount: every page keeps the
-        // statement's own.
-        deadline: budget.deadline,
-    }
-}
-
 /// A refusal raised once the pass has ALREADY written rows of its own.
 ///
 /// e4 has one transaction per handle and no savepoint, so a pass cannot undo
@@ -335,28 +309,6 @@ fn refusal_names_the_rows_already_written(error: QueryError, rows_written: u64) 
         }
         other => other,
     }
-}
-
-/// Add one page's charges to the pass's running total. `groups` and
-/// `membership_bytes` are high-water marks, not running totals, so they are
-/// maxed for the same reason their budgets bound simultaneous memory.
-fn add(used: &mut QueryWork, page: &QueryWork) {
-    used.candidates += page.candidates;
-    used.primary_reads += page.primary_reads;
-    used.row_decodes += page.row_decodes;
-    used.scalar_postings += page.scalar_postings;
-    used.graph_edges += page.graph_edges;
-    used.graph_visited += page.graph_visited;
-    used.spatial_postings += page.spatial_postings;
-    used.text_postings += page.text_postings;
-    used.text_tokens += page.text_tokens;
-    used.vector_locators += page.vector_locators;
-    used.vector_sidecars += page.vector_sidecars;
-    used.vector_lanes += page.vector_lanes;
-    used.key_postings += page.key_postings;
-    used.groups = used.groups.max(page.groups);
-    used.membership_bytes = used.membership_bytes.max(page.membership_bytes);
-    used.output_bytes += page.output_bytes;
 }
 
 impl Database {
@@ -563,7 +515,7 @@ impl Database {
                 if let WriteAction::Update(patch) = action {
                     self.refuse_a_patch_that_moves_its_driver(plan.driver, patch)?;
                 }
-                let page = prepared.next_page(page_size, remaining(budget, used), || false)?;
+                let page = prepared.next_page(page_size, budget.left_after(used), || false)?;
                 let ids: Vec<EntityId> = page.rows.iter().map(|row| row.id).collect();
                 (
                     ids,
@@ -573,7 +525,7 @@ impl Database {
                     page.work,
                 )
             };
-            add(used, &page_work);
+            used.add_page(&page_work);
             *reported = Some(page_driver);
             if ids.is_empty() {
                 return Ok(true);

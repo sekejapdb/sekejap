@@ -105,9 +105,11 @@ pub mod verification;
 // `crate::query`; every name this module has ever exported still leaves the
 // crate through `sekejap_core::collections`.
 pub use crate::index::graph::{
-    BfsRequest, Cmp, Direction, Edge, EdgeBudget, EdgeKey, EdgePredicate, EdgeRef, EdgeShape,
-    EdgeTypeId, GraphContextId, NeighborRequest, NewEdge, TraversalNode, TraversalResult,
+    BfsRequest, Cmp, Direction, Edge, EdgeBudget, EdgeId, EdgeKey, EdgePredicate, EdgeRef,
+    EdgeShape, EdgeTypeId, GraphContextId, NeighborRequest, NewEdge, TraversalNode,
+    TraversalResult, EDGE_ID_FEATURE,
 };
+pub use crate::index::graph::adjacency::{AdjacencyCursor, AdjacentEdge, PausedAdjacency, Posting};
 pub use crate::index::graph::endpoints::{EndpointProgress, ENDPOINT_FEATURE};
 pub use crate::index::spatial::point::{SpatialCandidates, SpatialHit};
 pub use crate::index::text::fuzzy::SearchExpansion;
@@ -153,6 +155,8 @@ pub use write_set::{
     MAX_PATCH_COLUMNS, MAX_WRITE_BATCH, RESTRICT_ROW_PROBE_SEEKS,
 };
 pub use crate::query::WriteCursor;
+/// The GQL profile's binding values and budgets (`docs/lang/GQL_PROFILE_DESIGN.md`).
+pub use crate::query::gql;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct IndexHeader {
     pub(crate) features: u64,
@@ -174,6 +178,20 @@ pub struct CollectionId(pub u32);
 pub struct EntityId {
     pub collection: CollectionId,
     pub sequence: u64,
+}
+impl EntityId {
+    /// The identity a row carries when it is NOT a stored row: a row of a
+    /// derived relation (a group, a catalog row, a `GRAPH_TABLE` result)
+    /// has no single owner, but the published row types
+    /// require an id. No stored row can carry this one, because collection
+    /// ids are allocated from 1 and verification refuses collection 0.
+    ///
+    /// Callers test for it with `owner()` on `sekejap_lang::SqlRow` and
+    /// `sekejap::Row`, which answer `None` for this value.
+    pub const NO_OWNER: EntityId = EntityId {
+        collection: CollectionId(0),
+        sequence: u64::MAX,
+    };
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entity {
@@ -420,6 +438,14 @@ pub struct Database {
     pub(crate) endpoint_backfill_at: Option<Vec<u8>>,
     pub(crate) endpoint_backfill_seen: u64,
     pub(crate) endpoint_backfill_written: u64,
+    /// The edge-id allocator (`src/index/graph/mod.rs`, tag `0x09`) as this
+    /// transaction sees it: `None` until the first `create_edge` reads it,
+    /// then the next id to hand out. `edge_id_dirty` says it moved and must
+    /// be written by `commit`, in the same transaction as the ids it
+    /// counted -- once per commit, not once per edge, the shape the entity
+    /// sequence already has. `rollback` forgets both.
+    pub(crate) edge_id_next: Option<u64>,
+    pub(crate) edge_id_dirty: bool,
     /// Endpoint keys this OPEN TRANSACTION has already put.
     ///
     /// The same saving `link_many` gets inside one batch, for the one-edge-
@@ -919,8 +945,10 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
 /// the VAMANA GRAPH keyspaces `0x7D` (node heads) and `0x7F` (adjacency)
 /// ([`crate::index::vector::graph`]);
 /// `0x10000` JSON-path expression indexes (`IndexExpr::JsonText`, descriptor
-/// version 4); `0x20000` named schemas ([`SCHEMA_FEATURE`]).
-/// The mask is therefore `0x3ffff`.
+/// version 4); `0x20000` named schemas ([`SCHEMA_FEATURE`]); `0x40000`
+/// independent EDGE IDENTITY -- id-bearing edge keys and the edge-id
+/// allocator under tag `0x09` ([`crate::index::graph::EDGE_ID_FEATURE`]).
+/// The mask is therefore `0x7ffff`.
 /// Every one is additive: set in the same transaction as the first record
 /// that uses it, never cleared, and a file that declares a bit outside this
 /// mask is refused as `Unsupported` at admission (Law 8).
@@ -950,7 +978,8 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | crate::index::graph::endpoints::ENDPOINT_FEATURE
     | crate::index::vector::graph::VAMANA_FEATURE
     | catalog::JSON_EXPRESSION_FEATURE
-    | SCHEMA_FEATURE;
+    | SCHEMA_FEATURE
+    | crate::index::graph::EDGE_ID_FEATURE;
 /// One header's feature word against the mask a binary implements.
 ///
 /// Split out of [`parse_header`] so a test can put an OLDER mask in place of
@@ -1086,6 +1115,7 @@ fn validate_features(s: &PageWalStore, header: Option<IndexHeader>) -> Result<()
         header.is_some_and(|h| {
             h.features & crate::index::graph::endpoints::ENDPOINT_FEATURE != 0
         }),
+        header.is_some_and(|h| h.features & crate::index::graph::EDGE_ID_FEATURE != 0),
     )
 }
 /// The typed refusal the page-WAL runs before it normalizes or creates
@@ -1228,6 +1258,8 @@ impl Database {
             endpoint_backfill_at: None,
             endpoint_backfill_seen: 0,
             endpoint_backfill_written: 0,
+            edge_id_next: None,
+            edge_id_dirty: false,
             endpoint_written: BTreeSet::new(),
         }
     }
@@ -2440,6 +2472,8 @@ impl Database {
             // One tree put per touched collection, into the same transaction
             // as the rows it counts, before the barrier. See `row_count.rs`.
             self.flush_row_counts()?;
+            // The edge-id allocator, once, beside the ids it handed out.
+            self.flush_edge_id_allocator()?;
             self.writer()?.commit()?;
             Ok(())
         })();
@@ -2489,6 +2523,10 @@ impl Database {
         self.endpoint_backfill_seen = 0;
         self.endpoint_backfill_written = 0;
         self.endpoint_written.clear();
+        // The allocator is re-read from the durable file on next use: ids
+        // handed out in the discarded transaction were never published.
+        self.edge_id_next = None;
+        self.edge_id_dirty = false;
         self.failed = true;
         self.store.rollback()?;
         if let Some(l) = self.limits {
@@ -3011,7 +3049,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x3ffff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x7ffff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -3032,17 +3070,18 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0x3ffff
+            0x7ffff
         );
         // A bit outside the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
         // The probe is always the next bit above the mask. Both the vamana
         // graph (`0x8000`) and the JSON-path expression index (`0x10000`)
-        // landed together, and named schemas took `0x20000`, so the mask is
-        // contiguous through bit 17 and the first unclaimed bit is `0x40000`.
+        // landed together, named schemas took `0x20000` and edge identity
+        // `0x40000`, so the mask is contiguous through bit 18 and the first
+        // unclaimed bit is `0x80000`.
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x40000)),
-            Err(Error::Unsupported(m)) if m.contains("0x7ffff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x80000)),
+            Err(Error::Unsupported(m)) if m.contains("0xfffff")
         ));
     }
     /// Law 8 for the live row count, the same shape the declared-type bit's
@@ -3073,9 +3112,9 @@ mod tests {
             Err(Error::Unsupported(m)) if m.contains("0x2001")
         ));
         // And a bit past every implemented family is refused by this build
-        // too. `0x20000` is named schemas now, so the probe is `0x40000`.
+        // too. `0x40000` is edge identity now, so the probe is `0x80000`.
         assert!(matches!(
-            admit_features(1 | 0x40000, SUPPORTED_LOGICAL_FEATURES),
+            admit_features(1 | 0x80000, SUPPORTED_LOGICAL_FEATURES),
             Err(Error::Unsupported(_))
         ));
     }

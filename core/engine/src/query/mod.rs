@@ -38,6 +38,7 @@ mod aggregate;
 mod cursors;
 mod drivers;
 mod filters;
+pub mod gql;
 mod membership;
 mod page;
 mod plan;
@@ -627,6 +628,35 @@ impl QueryBudget {
     pub fn groups_cap(accumulators: usize) -> u64 {
         aggregate::default_groups_cap(accumulators)
     }
+
+    /// What is left of this budget for one more page of a walk that has
+    /// already spent `used` over earlier pages: a bounded write pass paging
+    /// its candidates, a GQL seed paging an index. Every work allowance less
+    /// what was spent. `rows_written` and `groups` pass through: the pages
+    /// neither write nor aggregate -- their caller does, and charges that
+    /// itself. The deadline is an instant, not an amount, so every page
+    /// keeps the statement's own.
+    pub(crate) fn left_after(&self, used: &QueryWork) -> QueryBudget {
+        let left = |limit: u64, spent: u64| limit.saturating_sub(spent);
+        QueryBudget {
+            candidates: left(self.candidates, used.candidates),
+            primary_reads: left(self.primary_reads, used.primary_reads),
+            scalar_postings: left(self.scalar_postings, used.scalar_postings),
+            graph_edges: left(self.graph_edges, used.graph_edges),
+            graph_visited: left(self.graph_visited, used.graph_visited),
+            spatial_postings: left(self.spatial_postings, used.spatial_postings),
+            text_postings: left(self.text_postings, used.text_postings),
+            text_tokens: left(self.text_tokens, used.text_tokens),
+            vector_locators: left(self.vector_locators, used.vector_locators),
+            vector_sidecars: left(self.vector_sidecars, used.vector_sidecars),
+            vector_lanes: left(self.vector_lanes, used.vector_lanes),
+            key_postings: left(self.key_postings, used.key_postings),
+            rows_written: self.rows_written,
+            groups: self.groups,
+            output_bytes: left(self.output_bytes, used.output_bytes),
+            deadline: self.deadline,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -661,6 +691,31 @@ pub struct QueryWork {
     /// running total: what the cap bounds is simultaneous memory.
     pub membership_bytes: u64,
     pub output_bytes: u64,
+}
+
+impl QueryWork {
+    /// Add one page's charges to a running total over several pages.
+    /// `groups` and `membership_bytes` are high-water marks, not running
+    /// totals, so they are maxed for the same reason their budgets bound
+    /// simultaneous memory. `rows_written` is the paging caller's own.
+    pub fn add_page(&mut self, page: &QueryWork) {
+        self.candidates += page.candidates;
+        self.primary_reads += page.primary_reads;
+        self.row_decodes += page.row_decodes;
+        self.scalar_postings += page.scalar_postings;
+        self.graph_edges += page.graph_edges;
+        self.graph_visited += page.graph_visited;
+        self.spatial_postings += page.spatial_postings;
+        self.text_postings += page.text_postings;
+        self.text_tokens += page.text_tokens;
+        self.vector_locators += page.vector_locators;
+        self.vector_sidecars += page.vector_sidecars;
+        self.vector_lanes += page.vector_lanes;
+        self.key_postings += page.key_postings;
+        self.groups = self.groups.max(page.groups);
+        self.membership_bytes = self.membership_bytes.max(page.membership_bytes);
+        self.output_bytes += page.output_bytes;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -706,6 +761,26 @@ pub enum WorkResource {
     /// start, because the budget is supplied per page while the deadline is
     /// one absolute instant for the whole statement.
     Deadline,
+    // The six resources below belong to the GQL profile
+    // (`docs/lang/GQL_PROFILE_DESIGN.md` §3.4). Their ceilings live in
+    // `gql::GqlBudget`, not in `QueryBudget`, and only `gql::GqlMeter`
+    // charges them.
+    /// WORK: binding rows a GQL operator produced.
+    BindingRows,
+    /// WORK: partial paths or product states a path search created.
+    PathStates,
+    /// MEMORY: frontier, DFS stack and Dijkstra heap entries held at once.
+    /// Capped by the `RUN_BYTES` promise, which a caller cannot raise.
+    QueueEntries,
+    /// MEMORY: parent pointers held for witness paths. Capped like
+    /// `QueueEntries`.
+    PredecessorArcs,
+    /// MEMORY: bytes of sort buffers, distinct sets and group keys held at
+    /// once. Capped at `RUN_BYTES`.
+    SortBytes,
+    /// MEMORY: bytes of materialised lists held at once. Capped at
+    /// `RUN_BYTES`.
+    ListBytes,
 }
 
 #[derive(Debug)]
@@ -791,9 +866,9 @@ pub struct WorkMeter<'a, C> {
     /// never poll, and a paged scan is exactly how a service runs a long
     /// statement.
     since_clock: u64,
-    /// The slot [`WorkResource::Deadline`] maps to in
-    /// [`WorkMeter::slot`]. Never read as a total; it exists so the match is
-    /// exhaustive without giving a clock a counter it does not have.
+    /// The slot [`WorkResource::Deadline`] and the GQL-only resources map to
+    /// in [`WorkMeter::slot`]. Never read as a total; it exists so the match
+    /// is exhaustive without giving them a counter this meter does not keep.
     deadline_charges: u64,
 }
 
@@ -903,6 +978,15 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
             // outright rather than silently counted somewhere it does not
             // belong.
             WorkResource::Deadline => (&mut self.deadline_charges, 0),
+            // Charged only through `gql::GqlMeter`, which holds their
+            // ceilings; this meter has none for them, so it refuses them
+            // outright for the reason it refuses `Deadline`.
+            WorkResource::BindingRows
+            | WorkResource::PathStates
+            | WorkResource::QueueEntries
+            | WorkResource::PredecessorArcs
+            | WorkResource::SortBytes
+            | WorkResource::ListBytes => (&mut self.deadline_charges, 0),
         }
     }
 
