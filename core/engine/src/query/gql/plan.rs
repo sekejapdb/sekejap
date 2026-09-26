@@ -116,9 +116,18 @@ pub enum OpSpec {
     /// The whole input, ordered by `keys` in turn. Stable: rows equal on
     /// every key keep their input order. Directly under an [`OpSpec::Page`]
     /// with a limit it keeps only the first `offset + limit` rows (top-k).
+    ///
+    /// `monotone_first`: the planner proved the input arrives ordered by the
+    /// FIRST key, in its direction (an index-ordered seed, design §3.5 use
+    /// 2). Under a limit the sort then stops pulling once it holds
+    /// `offset + limit` rows and an incoming row's first key is strictly
+    /// worse than the worst held row's: every row not yet pulled is at least
+    /// as bad on that key, so the answer is the full sort's for any
+    /// tie-break keys.
     Sort {
         input: Box<OpSpec>,
         keys: Box<[SortKey]>,
+        monotone_first: bool,
     },
     /// `OFFSET` / `LIMIT`: skips `offset` rows, then stops after `limit`
     /// (`None`: no bound). Each count is an integer in `0..=i64::MAX`,

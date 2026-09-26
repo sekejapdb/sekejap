@@ -463,6 +463,7 @@ fn sort_rows() -> Vec<Vec<BindingValue>> {
 fn sort_plan(host: &mut TestHost) -> OpSpec {
     let (a, b) = (host.expr(E::Slot(1)), host.expr(E::Slot(2)));
     let sorted = OpSpec::Sort {
+        monotone_first: false,
         input: Box::new(input(host, 3)),
         keys: Box::new([
             SortKey {
@@ -509,6 +510,7 @@ fn sort_top_k_under_a_limit_equals_the_full_sort_and_holds_less() {
     let (a, b) = (host.expr(E::Slot(1)), host.expr(E::Slot(2)));
     // The top-k form: the Sort DIRECTLY under the Page.
     let sorted = OpSpec::Sort {
+        monotone_first: false,
         input: Box::new(input(&mut host, 3)),
         keys: Box::new([
             SortKey {
@@ -905,6 +907,7 @@ fn paging_equals_one_shot() {
     };
     let (count, a) = (host.expr(E::Slot(1)), host.expr(E::Slot(0)));
     let sorted = OpSpec::Sort {
+        monotone_first: false,
         input: Box::new(OpSpec::Distinct {
             input: Box::new(grouped),
         }),

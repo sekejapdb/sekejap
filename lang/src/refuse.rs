@@ -162,9 +162,8 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
 /// Tier 2 is a construct a named milestone builds; Tier 3 is one the profile
 /// does not adopt because another spelling already says it.
 pub(crate) const GQL_TABLE: &[(&str, Tier, &str)] = &[
-    // ── M6: host functions inside a GQL body ─────────────────────────────
-    ("host function", Tier::Two, "GQL profile M6: the spatial, vector and full-text host functions and casts (`ST_*`, `::geometry`, `::vector`, `to_tsvector`, `to_tsquery`, `bm25`) are evaluated inside a GQL body with index lineage in M6. The scalar pack (M3-C) is `ABS`, `SQRT`, `POWER`, `EXP`, `LN`, `LOWER`, `UPPER`, `TRIM`, `LENGTH`, `SUBSTRING`, `CONCAT`, `COALESCE`, `NULLIF`, `CAST`/`::`, `CASE`, arithmetic, `||`, `IN` and `IS [NOT] NULL`."),
     // ── P1: after the P0 release ─────────────────────────────────────────
+    ("search()", Tier::Two, "GQL profile P1: the typo-tolerant `search()` and `search_score()` inside a GQL body are P1 constructs (design Q30). A GQL body matches text through the index as SQL spells it, `to_tsvector('simple', n.field) @@ to_tsquery('simple', q)`, and ranks with `bm25(n.field, q)`."),
     ("ALL SHORTEST", Tier::Two, "GQL profile P1: ALL SHORTEST is a P1 construct, after the P0 release."),
     ("SIMPLE", Tier::Two, "GQL profile P1: the SIMPLE path mode is a P1 construct, after the P0 release."),
     ("selector with a path mode", Tier::Two, "GQL profile P1: a path pattern takes a selector (ANY, ANY SHORTEST, ANY CHEAPEST, which search walks) OR a path mode (WALK, TRAIL, ACYCLIC), not both; the combined form needs a separately verified nested pattern, a P1 construct."),
@@ -255,25 +254,5 @@ pub(super) fn refuse(keyword: &str) -> SqlError {
             tier: Tier::Three,
             reason: "QL_CONTRACT: not a Tier-1 construct and not in the Tier-2/3 table; no atomic is named for it.",
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::GQL_TABLE;
-    use crate::gql::ast::Func;
-
-    /// The `host function` reason lists the scalar pack by hand, since a
-    /// table row is a constant: it names every function the pack holds.
-    #[test]
-    fn the_host_function_reason_names_the_whole_scalar_pack() {
-        let (_, _, reason) = GQL_TABLE
-            .iter()
-            .find(|(keyword, _, _)| *keyword == "host function")
-            .expect("a row");
-        for func in Func::ALL {
-            let name = format!("`{}`", func.written());
-            assert!(reason.contains(&name), "{name} is not in: {reason}");
-        }
     }
 }

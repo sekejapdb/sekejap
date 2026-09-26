@@ -546,6 +546,7 @@ fn a_malformed_exists_plan_is_refused_at_open() {
     let plan = OpSpec::ExistsApply {
         input: Box::new(input(&mut host)),
         inner: Box::new(OpSpec::Sort {
+            monotone_first: false,
             input: Box::new(inner(&mut host)),
             keys: Box::new([SortKey {
                 expr: key,

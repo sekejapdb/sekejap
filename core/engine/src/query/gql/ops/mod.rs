@@ -427,9 +427,9 @@ pub(super) fn build_in<'q>(
             let (input, width) = build(input, params)?;
             (Box::new(distinct::Distinct::new(input)), width)
         }
-        OpSpec::Sort { input, keys } => {
+        OpSpec::Sort { input, keys, .. } => {
             let (input, width) = build(input, params)?;
-            (Box::new(sort::Sort::new(input, keys, None)), width)
+            (Box::new(sort::Sort::new(input, keys, None, false)), width)
         }
         OpSpec::Page {
             input,
@@ -444,10 +444,17 @@ pub(super) fn build_in<'q>(
             let (input, width) = match (&**input, limit) {
                 // Top-k: only the first `offset + limit` sorted rows can
                 // come out of the page, so the sort keeps no more.
-                (OpSpec::Sort { input, keys }, Some(limit)) => {
+                (
+                    OpSpec::Sort {
+                        input,
+                        keys,
+                        monotone_first,
+                    },
+                    Some(limit),
+                ) => {
                     let (input, width) = build(input, params)?;
                     let keep = offset.saturating_add(limit);
-                    let sort: Op<'q> = Box::new(sort::Sort::new(input, keys, Some(keep)));
+                    let sort: Op<'q> = Box::new(sort::Sort::new(input, keys, Some(keep), *monotone_first));
                     (sort, width)
                 }
                 _ => build(input, params)?,

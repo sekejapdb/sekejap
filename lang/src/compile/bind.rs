@@ -160,37 +160,7 @@ impl<'a> Binder<'a> {
     }
 
     pub(crate) fn geom_of(&self, argument: &GeoArg) -> SqlResult2<Geom> {
-        Ok(match argument {
-            GeoArg::Point(point) => {
-                let p = self.point_of(point)?;
-                Geom::Point(p.longitude(), p.latitude())
-            }
-            GeoArg::Envelope {
-                minlon,
-                minlat,
-                maxlon,
-                maxlat,
-            } => {
-                let (w, s, e, n) = (
-                    self.f64_of(minlon)?,
-                    self.f64_of(minlat)?,
-                    self.f64_of(maxlon)?,
-                    self.f64_of(maxlat)?,
-                );
-                Geom::Polygon(vec![vec![[w, s], [e, s], [e, n], [w, n], [w, s]]])
-            }
-            GeoArg::GeoJson(literal) => match self.value_of(literal)? {
-                Value::String(text) => geom_from_text(&text)?,
-                document => geom_from_json(&document)?,
-            },
-            GeoArg::Encoded { source, format } => {
-                let text = self.text_of(source)?;
-                match format {
-                    GeoFormat::Wkb => geom_from_wkb_hex(&text)?,
-                    GeoFormat::Wkt => geom_from_wkt(&text)?,
-                }
-            }
-        })
+        geom_with(argument, &|literal| self.value_of(literal))
     }
 
     /// The rectangle `col && <shape>` compares a POINT column against, as
@@ -265,70 +235,7 @@ impl<'a> Binder<'a> {
     /// The tsquery text, split into E4's `TextMatch`. A tsquery that mixes
     /// `&` and `|` is an AND/OR tree, which is Tier 2.
     pub(crate) fn tsquery(&self, query: &TsQuery) -> SqlResult2<(String, TextMatch)> {
-        let text = self.text_of(&query.source)?;
-        // `search()` names its own match mode: no tsquery operator chooses
-        // it, and no value can turn an ordinary text filter into one.
-        if query.fuzzy {
-            return Ok((text, TextMatch::Search));
-        }
-        if !query.tsquery_syntax {
-            return Ok((text, TextMatch::Any));
-        }
-        let trimmed = text.trim();
-        if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-            return Ok((
-                trimmed[1..trimmed.len() - 1].trim().to_owned(),
-                TextMatch::Phrase,
-            ));
-        }
-        if trimmed.contains('\'') {
-            let inner = trimmed.trim_matches('\'').trim();
-            if inner.split_whitespace().count() > 1 {
-                return Ok((inner.to_owned(), TextMatch::Phrase));
-            }
-        }
-        let has_or = trimmed.contains('|');
-        let has_and = trimmed.contains('&');
-        if has_or && has_and {
-            return Err(SqlError::Refused {
-                keyword: "tsquery & |".into(),
-                tier: Tier::Two,
-                reason: "QL_CONTRACT §4.6: a tsquery that mixes `&` and `|` is a boolean TREE inside one index's postings; the Tier-1 tsquery is one operator, and a union ACROSS predicates is written with SQL's own OR.",
-            });
-        }
-        if trimmed.contains('!') {
-            return Err(SqlError::Refused {
-                keyword: "tsquery !".into(),
-                tier: Tier::Two,
-                reason: "QL_CONTRACT §4.6: a tsquery `!` inside a larger tsquery is a boolean TREE over one index's postings; the Tier-1 spelling is `!term` alone, which is NOT over the text set.",
-            });
-        }
-        if trimmed.contains("<->") {
-            return Err(SqlError::Refused {
-                keyword: "tsquery <->".into(),
-                tier: Tier::Two,
-                reason: "QL_CONTRACT §4.6: a tsquery distance operator is a positional constraint; the Tier-1 phrase atomic is a quoted phrase (TextMatch::Phrase).",
-            });
-        }
-        let separator = if has_or { '|' } else { '&' };
-        let terms: Vec<&str> = trimmed
-            .split(separator)
-            .map(str::trim)
-            .filter(|term| !term.is_empty())
-            .collect();
-        if terms.iter().any(|term| term.contains(':')) {
-            return Err(SqlError::Refused {
-                keyword: "tsquery weight".into(),
-                tier: Tier::Three,
-                reason: "QL_CONTRACT §4.6: tsvector weights have no atomic; analyzer v1 stores one weight per token.",
-            });
-        }
-        let matching = if has_or || terms.len() == 1 {
-            TextMatch::Any
-        } else {
-            TextMatch::All
-        };
-        Ok((terms.join(" "), matching))
+        tsquery_of(self.text_of(&query.source)?, query)
     }
 }
 
@@ -473,4 +380,118 @@ impl Rebind {
             Some(self.refusals.join("; "))
         }
     }
+}
+
+/// The tsquery `text` of `query`, split into E4's `TextMatch`: the part of
+/// [`Binder::tsquery`] after the text is known, shared with the GQL body,
+/// which reads the text when an execution opens. A tsquery that mixes `&`
+/// and `|` is an AND/OR tree, which is Tier 2.
+pub(crate) fn tsquery_of(text: String, query: &TsQuery) -> SqlResult2<(String, TextMatch)> {
+    // `search()` names its own match mode: no tsquery operator chooses
+    // it, and no value can turn an ordinary text filter into one.
+    if query.fuzzy {
+        return Ok((text, TextMatch::Search));
+    }
+    if !query.tsquery_syntax {
+        return Ok((text, TextMatch::Any));
+    }
+    let trimmed = text.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        return Ok((
+            trimmed[1..trimmed.len() - 1].trim().to_owned(),
+            TextMatch::Phrase,
+        ));
+    }
+    if trimmed.contains('\'') {
+        let inner = trimmed.trim_matches('\'').trim();
+        if inner.split_whitespace().count() > 1 {
+            return Ok((inner.to_owned(), TextMatch::Phrase));
+        }
+    }
+    let has_or = trimmed.contains('|');
+    let has_and = trimmed.contains('&');
+    if has_or && has_and {
+        return Err(SqlError::Refused {
+            keyword: "tsquery & |".into(),
+            tier: Tier::Two,
+            reason: "QL_CONTRACT §4.6: a tsquery that mixes `&` and `|` is a boolean TREE inside one index's postings; the Tier-1 tsquery is one operator, and a union ACROSS predicates is written with SQL's own OR.",
+        });
+    }
+    if trimmed.contains('!') {
+        return Err(SqlError::Refused {
+            keyword: "tsquery !".into(),
+            tier: Tier::Two,
+            reason: "QL_CONTRACT §4.6: a tsquery `!` inside a larger tsquery is a boolean TREE over one index's postings; the Tier-1 spelling is `!term` alone, which is NOT over the text set.",
+        });
+    }
+    if trimmed.contains("<->") {
+        return Err(SqlError::Refused {
+            keyword: "tsquery <->".into(),
+            tier: Tier::Two,
+            reason: "QL_CONTRACT §4.6: a tsquery distance operator is a positional constraint; the Tier-1 phrase atomic is a quoted phrase (TextMatch::Phrase).",
+        });
+    }
+    let separator = if has_or { '|' } else { '&' };
+    let terms: Vec<&str> = trimmed
+        .split(separator)
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .collect();
+    if terms.iter().any(|term| term.contains(':')) {
+        return Err(SqlError::Refused {
+            keyword: "tsquery weight".into(),
+            tier: Tier::Three,
+            reason: "QL_CONTRACT §4.6: tsvector weights have no atomic; analyzer v1 stores one weight per token.",
+        });
+    }
+    let matching = if has_or || terms.len() == 1 {
+        TextMatch::Any
+    } else {
+        TextMatch::All
+    };
+    Ok((terms.join(" "), matching))
+}
+
+/// The geometry `argument` constructs, each literal read through `value_of`:
+/// the part of [`Binder::geom_of`] shared with the GQL body, which reads its
+/// parameters when an execution opens.
+pub(crate) fn geom_with(argument: &GeoArg, value_of: &dyn Fn(&Literal) -> SqlResult2<Value>) -> SqlResult2<Geom> {
+    let f64_of = |literal: &Literal| match value_of(literal)? {
+        Value::Number(n) => n
+            .as_f64()
+            .ok_or_else(|| SqlError::Parameter("number is not finite".into())),
+        other => Err(SqlError::Parameter(format!("expected a number, found {other}"))),
+    };
+    let text_of = |literal: &Literal| match value_of(literal)? {
+        Value::String(s) => Ok(s),
+        other => Err(SqlError::Parameter(format!("expected text, found {other}"))),
+    };
+    Ok(match argument {
+        GeoArg::Point(point) => {
+            let (lon, lat) = (f64_of(&point.lon)?, f64_of(&point.lat)?);
+            let p = Point::new(lon, lat)
+                .map_err(|e| SqlError::engine(format!("ST_MakePoint({lon}, {lat}): {e}")))?;
+            Geom::Point(p.longitude(), p.latitude())
+        }
+        GeoArg::Envelope {
+            minlon,
+            minlat,
+            maxlon,
+            maxlat,
+        } => {
+            let (w, s, e, n) = (f64_of(minlon)?, f64_of(minlat)?, f64_of(maxlon)?, f64_of(maxlat)?);
+            Geom::Polygon(vec![vec![[w, s], [e, s], [e, n], [w, n], [w, s]]])
+        }
+        GeoArg::GeoJson(literal) => match value_of(literal)? {
+            Value::String(text) => geom_from_text(&text)?,
+            document => geom_from_json(&document)?,
+        },
+        GeoArg::Encoded { source, format } => {
+            let text = text_of(source)?;
+            match format {
+                GeoFormat::Wkb => geom_from_wkb_hex(&text)?,
+                GeoFormat::Wkt => geom_from_wkt(&text)?,
+            }
+        }
+    })
 }

@@ -429,7 +429,7 @@ fn reads(op: &Op, program: &Program) -> Vec<SlotId> {
     match op {
         Op::Seed { source, .. } => match source {
             SeedSource::Key { key, .. } => expr(key),
-            SeedSource::Index { seed } => program.seed_value(*seed).refs(),
+            SeedSource::Index { seed } => program.seed_refs(*seed),
             SeedSource::Bound { slot, .. } => vec![*slot],
             SeedSource::Scan { .. } => Vec::new(),
         },

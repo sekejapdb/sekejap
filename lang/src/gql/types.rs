@@ -24,6 +24,7 @@
 //!   bound to a typed `$n` is checked against that type when an execution
 //!   opens ([`typed_param`]).
 
+use super::host::HostEx;
 use super::ast::{AggFunc, ArithOp, CastType, Func};
 use super::convert;
 use super::elements;
@@ -43,6 +44,7 @@ impl Planner<'_> {
             // A parameter's type is not decided by where it lands (Q8): it
             // is text, as the SQL surface reads an untyped `$n`.
             Ex::Param(_) => ValueType::Text,
+            Ex::Host(host) => host.value_type(),
             Ex::Slot(slot) => self.schema.slot(*slot).ty.clone(),
             // A fold's list variable is one element in its argument.
             Ex::Item(slot) => match &self.schema.slot(*slot).ty {
@@ -296,6 +298,25 @@ impl Planner<'_> {
                     self.param_uses(list, uses)?;
                 }
             },
+            // A host form's own argument shapes (M6-I): a tsquery is text; a
+            // coordinate, an envelope edge and a radius are double precision;
+            // a GeoJSON shape is text; an operand of a vector distance is a
+            // vector. Numbered from 1 there, as SQL's `Literal::Param` is.
+            Ex::Host(host) => {
+                for (n, ty) in host.param_types() {
+                    uses.push((n - 1, typed(Some(ty))));
+                }
+                if let HostEx::Vector { left, right, .. } = &**host {
+                    for side in [left, right] {
+                        if let Ex::Param(at) = side {
+                            uses.push((*at, typed(Some(ValueType::Vector(None)))));
+                        }
+                    }
+                }
+                for child in host.children() {
+                    self.param_uses(child, uses)?;
+                }
+            }
             // Every other expression decides nothing about a `$n` itself;
             // a parameter inside it is typed by the comparisons around it.
             other => {
@@ -434,7 +455,10 @@ pub(super) fn typed_param(param: &Param, ty: &ValueType, n: usize) -> SqlResult2
         | (ValueType::Text, Param::Text(_))
         | (ValueType::Int, Param::Int(_))
         | (ValueType::Float, Param::Int(_) | Param::Float(_))
-        | (ValueType::Bool, Param::Bool(_)) => true,
+        | (ValueType::Bool, Param::Bool(_))
+        // A vector, or pgvector's text form `'[0.1, ...]'`, read where it is
+        // used (`host::lanes`).
+        | (ValueType::Vector(_), Param::Vector(_) | Param::Text(_)) => true,
         _ => false,
     };
     if !fits {

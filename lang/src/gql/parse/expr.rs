@@ -7,7 +7,7 @@
 //! is_test    := comparison (IS [NOT] NULL)*
 //! comparison := membership [('=' | '<>' | '!=' | '<' | '<=' | '>' | '>=') membership]
 //! membership := concat [[NOT] IN '(' expr (',' expr)* ')']
-//! concat     := additive ('||' additive)*
+//! concat     := additive (('||' | '<=>' | '<->' | '<#>') additive)*
 //! additive   := term (('+' | '-') term)*
 //! term       := power (('*' | '/' | '%') power)*
 //! power      := unary ('^' unary)*
@@ -21,6 +21,12 @@
 //!             | COUNT '(' '*' ')' | aggregate '(' [DISTINCT] expr ')'
 //!             | graph_function '(' expr ')' | '[' [expr (',' expr)*] ']'
 //!             | EXISTS '{' exists_body '}'           -- `stage.rs`
+//!             | host_form                           -- `host.rs`
+//! host_form  := TO_TSVECTOR '(' 'simple' ',' property ')' '@@' tsquery
+//!             | BM25 '(' property ',' literal ')'
+//!             | ST_DWITHIN | ST_INTERSECTS | ST_WITHIN | ST_CONTAINS
+//!               '(' property casts ',' shape ... ')'  -- `Parser::spatial_rest`
+//!             | ST_DISTANCE '(' property casts ',' shape ')'
 //! literal    := number | string | TRUE | FALSE | NULL
 //! ```
 //!
@@ -28,6 +34,9 @@
 //! in PostgreSQL), a comparison does not chain (`a = b = c` is a syntax
 //! error), and `::` binds tighter than a unary minus (`-x::int` is
 //! `-(x::int)`). A minus written before a number is part of the literal.
+//! The vector distances `<=>`, `<->`, `<#>` sit with `||`, where PostgreSQL
+//! puts every operator it has no named level for, and `::vector` marks an
+//! operand as a vector without converting it (pgvector reads the text).
 //! A type is spelled as `CREATE TABLE` spells a column type
 //! (`Parser::column_type`), so a cast and a declaration cannot disagree on a
 //! name. This is NOT the SQL predicate grammar of `parser/expr.rs`, which is
@@ -35,7 +44,8 @@
 //! binding row.
 
 use super::super::ast::{AggFunc, ArithOp, CastType, Expr, Func, GraphFunc, Literal};
-use crate::ast::CmpOp;
+use super::super::host::Host;
+use crate::ast::{CmpOp, TsQuery, VecOp};
 use crate::lexer::Tok;
 use crate::parser::Parser;
 use crate::refuse;
@@ -43,9 +53,19 @@ use crate::sqlstate::UNDEFINED_FUNCTION;
 use crate::{SqlError, SqlResult2};
 use sekejap_core::Kind;
 
-/// SQL host functions that are not `ST_*`: the full-text ones. Inside a GQL
-/// body they are refused as M6's, not reported as unknown.
-const TEXT_FUNCTIONS: &[&str] = &["TO_TSVECTOR", "TO_TSQUERY", "BM25"];
+/// The typo-tolerant text forms, whose GQL spelling is P1's (Q30).
+const SEARCH_FUNCTIONS: &[&str] = &["SEARCH", "SEARCH_SCORE"];
+
+/// The spatial predicates `Parser::spatial_kind` reads; it accepts the
+/// first four and refuses the others with the reason.
+const SPATIAL_PREDICATES: &[&str] = &[
+    "ST_DWITHIN",
+    "ST_INTERSECTS",
+    "ST_WITHIN",
+    "ST_CONTAINS",
+    "ST_COVERS",
+    "ST_CROSSES",
+];
 
 impl Parser {
     pub(super) fn gql_expr(&mut self) -> SqlResult2<Expr> {
@@ -181,10 +201,25 @@ impl Parser {
 
     fn gql_concat(&mut self) -> SqlResult2<Expr> {
         let mut left = self.gql_additive()?;
-        while self.eat(&Tok::Concat) {
-            left = Expr::Concat(Box::new(left), Box::new(self.gql_additive()?));
+        loop {
+            let op = match self.peek() {
+                Tok::Concat => None,
+                Tok::VecCosine => Some(VecOp::Cosine),
+                Tok::VecL2 => Some(VecOp::L2),
+                Tok::VecDot => Some(VecOp::NegativeDot),
+                _ => return Ok(left),
+            };
+            self.bump();
+            let right = Box::new(self.gql_additive()?);
+            left = match op {
+                None => Expr::Concat(Box::new(left), right),
+                Some(op) => Expr::Host(Box::new(Host::Vector {
+                    op,
+                    left: Box::new(left),
+                    right,
+                })),
+            };
         }
-        Ok(left)
     }
 
     /// One level of left-associative arithmetic operators over `next`.
@@ -249,6 +284,15 @@ impl Parser {
     fn gql_cast(&mut self) -> SqlResult2<Expr> {
         let mut expr = self.gql_primary()?;
         while self.eat(&Tok::Cast) {
+            // `::vector` and `::vector(n)`: the operand of a distance, read
+            // as a vector where it is used, so the cast converts nothing.
+            if self.eat_word("VECTOR") {
+                if self.eat(&Tok::LParen) {
+                    self.literal()?;
+                    self.expect(&Tok::RParen)?;
+                }
+                continue;
+            }
             expr = Expr::Cast {
                 expr: Box::new(expr),
                 to: self.gql_cast_type()?,
@@ -259,13 +303,13 @@ impl Parser {
 
     /// A type name, the cursor on it.
     fn gql_cast_type(&mut self) -> SqlResult2<CastType> {
-        // `::vector` needs no dimension in a cast, which `column_type` asks
-        // for; every spatial and vector type is M6's either way.
-        if matches!(
-            self.word().as_deref(),
-            Some("VECTOR" | "GEOMETRY" | "GEOGRAPHY")
-        ) {
-            return Err(refuse::gql_refuse("host function"));
+        // A geometry is read only where a spatial form takes it, whose
+        // shape reader holds the casts (`Parser::optional_cast`).
+        if let Some(word @ ("VECTOR" | "GEOMETRY" | "GEOGRAPHY")) = self.word().as_deref() {
+            return Err(SqlError::unsupported(format!(
+                "a {} is not a value of its own in a GQL expression: write `x::vector` as an operand of `<=>`, `<->` or `<#>`, and a shape inside ST_DWithin, ST_Intersects, ST_Within, ST_Contains or ST_Distance",
+                word.to_ascii_lowercase()
+            )));
         }
         let (kind, declared) = self.column_type()?;
         Ok(match kind {
@@ -276,8 +320,11 @@ impl Parser {
             Kind::Real => CastType::Float,
             Kind::Bool => CastType::Bool,
             Kind::Json => CastType::Json,
-            // A geometry or a vector.
-            _ => return Err(refuse::gql_refuse("host function")),
+            other => {
+                return Err(SqlError::unsupported(format!(
+                    "a cast to {other:?} is not in the GQL expression pack"
+                )))
+            }
         })
     }
 
@@ -412,8 +459,11 @@ impl Parser {
             if let Some(refusal) = self.gql_listed(upper) {
                 return Err(refusal);
             }
-            if upper.starts_with("ST_") || TEXT_FUNCTIONS.contains(&upper) {
-                return Err(refuse::gql_refuse("host function"));
+            if let Some(host) = self.gql_host(upper)? {
+                return Ok(Expr::Host(Box::new(host)));
+            }
+            if SEARCH_FUNCTIONS.contains(&upper) {
+                return Err(refuse::gql_refuse("search()"));
             }
             let scalars: Vec<&str> = Func::ALL.iter().map(|f| f.written()).collect();
             return Err(SqlError::coded(UNDEFINED_FUNCTION, format!(
@@ -453,6 +503,82 @@ impl Parser {
             )));
         }
         Ok(Expr::Call { func, args })
+    }
+
+    /// A host form (`host.rs`), the cursor on its name and `(` after it, or
+    /// `None` when the name is none. The argument shapes are read by the SQL
+    /// sub-parsers, so a form keeps one spelling and one set of unit rules.
+    fn gql_host(&mut self, upper: &str) -> SqlResult2<Option<Host>> {
+        Ok(Some(match upper {
+            "TO_TSVECTOR" => {
+                self.bump();
+                self.bump();
+                self.simple_config()?;
+                self.expect(&Tok::Comma)?;
+                let target = self.gql_reference()?;
+                if matches!(self.peek(), Tok::Concat) {
+                    return Err(refuse::refuse("||"));
+                }
+                self.expect(&Tok::RParen)?;
+                if !self.eat(&Tok::Matches) {
+                    return Err(SqlError::syntax(
+                        format!(
+                            "expected `@@` after to_tsvector, found `{}`: a text vector is read only by a match",
+                            self.peek().written()
+                        ),
+                        self.here(),
+                    ));
+                }
+                Host::Text {
+                    target: Box::new(target),
+                    query: self.tsquery()?,
+                    score: false,
+                }
+            }
+            "BM25" => {
+                self.bump();
+                self.bump();
+                let target = self.gql_reference()?;
+                self.expect(&Tok::Comma)?;
+                let source = self.literal()?;
+                self.expect(&Tok::RParen)?;
+                Host::Text {
+                    target: Box::new(target),
+                    query: TsQuery {
+                        source,
+                        tsquery_syntax: false,
+                        fuzzy: false,
+                    },
+                    score: true,
+                }
+            }
+            _ if SPATIAL_PREDICATES.contains(&upper) => {
+                let predicate = self.spatial_kind()?;
+                self.expect(&Tok::LParen)?;
+                let target = self.gql_reference()?;
+                self.optional_cast()?;
+                let (shape, metres) = self.spatial_rest(predicate)?;
+                Host::Spatial {
+                    predicate,
+                    target: Box::new(target),
+                    shape,
+                    metres,
+                }
+            }
+            "ST_DISTANCE" => {
+                self.bump();
+                self.bump();
+                let target = self.gql_reference()?;
+                self.optional_cast()?;
+                let shape = self.distance_rest()?;
+                self.expect(&Tok::RParen)?;
+                Host::Distance {
+                    target: Box::new(target),
+                    shape,
+                }
+            }
+            _ => return Ok(None),
+        }))
     }
 
     /// `COUNT(*)`, `COUNT([DISTINCT] x)` and the other vertical

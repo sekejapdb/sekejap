@@ -125,6 +125,7 @@ pub(crate) fn bind_match(
     // Pass 2: expressions, against the scope with this MATCH's elements, so
     // an inline predicate may name a variable bound further along.
     let mut lowering = Lowering {
+        db,
         schema: &*schema,
         params,
         admitted: Vec::new(),

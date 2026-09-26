@@ -290,6 +290,30 @@ pub(super) fn score_f32_pre(
     Ok(Some(distance))
 }
 
+/// The distance between two vectors of equal width under `metric`, in the
+/// arithmetic of [`score_f32_pre`] (f64 accumulation): the squared L2
+/// distance, the negative inner product, or `1 - cosine` (`None` when a
+/// vector is all zero). A GQL expression reads it for two vectors it holds
+/// as values (`lang/src/gql/host.rs`).
+pub fn vector_distance(stored: &[f32], query: &[f32], metric: VectorMetric) -> Option<f64> {
+    let (mut dot, mut stored_norm, mut query_norm, mut squared_l2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for (a, b) in stored.iter().zip(query) {
+        let (a, b) = (f64::from(*a), f64::from(*b));
+        dot += a * b;
+        stored_norm += a * a;
+        query_norm += b * b;
+        let delta = a - b;
+        squared_l2 += delta * delta;
+    }
+    let distance = match metric {
+        VectorMetric::SquaredL2 => squared_l2,
+        VectorMetric::NegativeDot => -dot,
+        VectorMetric::Cosine if stored_norm == 0.0 || query_norm == 0.0 => return None,
+        VectorMetric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
+    };
+    Some(if distance == 0.0 { 0.0 } else { distance })
+}
+
 /// f32 sidecar distance. Widens the query once then scores.
 pub(super) fn score_f32_distance(
     bytes: &[u8],

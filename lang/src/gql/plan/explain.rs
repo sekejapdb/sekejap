@@ -202,16 +202,26 @@ impl GqlPlan {
                 let (mut how, charges) = match access {
                     Access::Key(key) => (
                         format!("key lookup of {} in {of}", text(key)),
-                        "key_postings, binding_rows",
+                        "key_postings, binding_rows".to_owned(),
                     ),
-                    Access::Index { name, field, op, value } => (
-                        format!("index `{name}` on {of} ({field} {} {value})", op.written()),
-                        "scalar_postings, candidates, binding_rows",
+                    Access::Index { parts, charges } => (
+                        match &parts[..] {
+                            [(name, what)] => format!("index `{name}` on {of} ({what})"),
+                            parts => format!(
+                                "indexes on {of}, intersected: {}",
+                                parts
+                                    .iter()
+                                    .map(|(name, what)| format!("`{name}` ({what})"))
+                                    .collect::<Vec<_>>()
+                                    .join(" AND ")
+                            ),
+                        },
+                        format!("{charges}, candidates, binding_rows"),
                     ),
                     Access::Bound => {
-                        (format!("the node already bound in {v}"), "binding_rows")
+                        (format!("the node already bound in {v}"), "binding_rows".to_owned())
                     }
-                    Access::Scan => (format!("SCAN of {of}"), "candidates, binding_rows"),
+                    Access::Scan => (format!("SCAN of {of}"), "candidates, binding_rows".to_owned()),
                 };
                 if per_row && !matches!(access, Access::Bound) {
                     how.push_str(", re-evaluated per input row");
@@ -449,6 +459,7 @@ pub(crate) fn show(ex: &Ex, schema: &BindingSchema) -> String {
             other => format!("{other:?}"),
         },
         Ex::Param(at) => format!("${}", at + 1),
+        Ex::Host(host) => host.show(&|ex| show(ex, schema)),
         Ex::Slot(slot) => var(*slot, schema),
         Ex::NodeProperty(slot, field) | Ex::EdgeProperty(slot, field) => {
             format!("{}.{field}", var(*slot, schema))

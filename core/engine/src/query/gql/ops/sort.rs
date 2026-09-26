@@ -9,7 +9,10 @@
 //!
 //! Directly under a `Page` with a limit, the sort keeps only the first
 //! `keep = offset + limit` rows (top-k): a max-heap of `keep` entries, whose
-//! worst entry a better row replaces. Otherwise it buffers every row.
+//! worst entry a better row replaces. Otherwise it buffers every row. When
+//! the input is proved ordered by the first key (`monotone_first`), a full
+//! heap stops pulling at the first row strictly worse on that key than its
+//! worst entry: nothing after it can enter.
 //!
 //! Charges: each kept entry's row, key and bookkeeping bytes as
 //! `sort_bytes`, held until the row is handed out and charged again to
@@ -28,6 +31,8 @@ pub(super) struct Sort<'q> {
     input: Option<Op<'q>>,
     keys: &'q [SortKey],
     keep: Option<u64>,
+    /// The input arrives ordered by the first key, in its direction.
+    monotone_first: bool,
     /// The rows still to hand out, LAST row first, so `pop` gives the next.
     sorted: Vec<Entry<'q>>,
     held: Held,
@@ -85,11 +90,12 @@ impl PartialEq for Entry<'_> {
 impl Eq for Entry<'_> {}
 
 impl<'q> Sort<'q> {
-    pub(super) fn new(input: Op<'q>, keys: &'q [SortKey], keep: Option<u64>) -> Self {
+    pub(super) fn new(input: Op<'q>, keys: &'q [SortKey], keep: Option<u64>, monotone_first: bool) -> Self {
         Self {
             input: Some(input),
             keys,
             keep,
+            monotone_first,
             sorted: Vec::new(),
             held: Held::default(),
         }
@@ -127,6 +133,16 @@ impl<'q> Sort<'q> {
                     best.push(entry);
                 }
                 Some(_) => {
+                    // Full, over an input ordered by the first key: a row
+                    // strictly worse on it than the worst kept one ends the
+                    // read, since every later row is at least as bad.
+                    if self.monotone_first
+                        && best.peek().is_some_and(|worst: &Entry<'_>| {
+                            key_order(&self.keys[0], &entry.keys[0], &worst.keys[0]) == Ordering::Greater
+                        })
+                    {
+                        break;
+                    }
                     // Full: a row enters only if it beats the worst kept one.
                     if best.peek().is_some_and(|worst| entry < *worst) {
                         self.held.charge(cx, WorkResource::SortBytes, bytes)?;

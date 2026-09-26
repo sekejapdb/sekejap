@@ -49,12 +49,22 @@ thread_local! {
     static EF_SEARCH: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
+/// The `ef_search` knob as this thread holds it now. A GQL execution reads
+/// it when it OPENS, so a cached GQL plan follows the transaction it runs in
+/// (GQL profile Q29).
+pub(crate) fn ef_search() -> Option<usize> {
+    EF_SEARCH.with(Cell::get)
+}
+
 // `super::parser` is reached by path from `predicates.rs`; the name has
 // to be bound here for `super::` to find it one level down.
 use super::parser;
 
 mod aggregate;
 mod bind;
+// Shared with a GQL body's host forms, which read their literals when an
+// execution opens (`gql/host.rs`).
+pub(crate) use bind::{geom_with, tsquery_of};
 mod boolean;
 mod ddl;
 mod dml;
@@ -595,7 +605,7 @@ impl Compiler<'_> {
 }
 
 /// pgvector's text form: `[a, b, c]`.
-fn parse_vector_literal(text: &str) -> SqlResult2<Vec<f32>> {
+pub(crate) fn parse_vector_literal(text: &str) -> SqlResult2<Vec<f32>> {
     let trimmed = text.trim();
     let inner = trimmed
         .strip_prefix('[')

@@ -202,6 +202,9 @@ pub enum SqlError {
 pub(crate) mod sqlstate {
     /// `22003 numeric_value_out_of_range`.
     pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
+    /// `22000 data_exception`: as pgvector, a distance between vectors of
+    /// two widths.
+    pub const DATA_EXCEPTION: &str = "22000";
     /// `22007 invalid_datetime_format`.
     pub const INVALID_DATETIME_FORMAT: &str = "22007";
     /// `22008 datetime_field_overflow`.

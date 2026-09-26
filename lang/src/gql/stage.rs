@@ -52,6 +52,7 @@
 //! by the other items. The body's last stage then names each column once
 //! and returns values only, since a relation's columns are what SQL reads.
 
+use super::lineage;
 use super::ast::{
     AggFunc, BodyPart, Count, Expr, Literal, Outer, Pipeline, Return, ReturnItem, Stage,
     Statement,
@@ -120,7 +121,9 @@ pub(crate) enum TableOp {
         shown: Shown,
     },
     Distinct,
-    Sort { keys: Box<[SortKey]>, shown: Vec<String> },
+    /// `monotone`: fed by an index-ordered seed on the first key
+    /// (`lineage.rs`), so a limited sort stops early.
+    Sort { keys: Box<[SortKey]>, shown: Vec<String>, monotone: bool },
     Page {
         offset: Option<CountExpr>,
         limit: Option<CountExpr>,
@@ -157,9 +160,10 @@ impl TableOp {
                 width: *width,
             },
             Self::Distinct => OpSpec::Distinct { input },
-            Self::Sort { keys, .. } => OpSpec::Sort {
+            Self::Sort { keys, monotone, .. } => OpSpec::Sort {
                 input,
                 keys: keys.clone(),
+                monotone_first: *monotone,
             },
             Self::Page { offset, limit } => OpSpec::Page {
                 input,
@@ -202,9 +206,14 @@ impl TableOp {
                 )
             }
             Self::Distinct => "Distinct -- holds sort_bytes".to_owned(),
-            Self::Sort { shown, .. } => format!(
-                "Sort by {} -- stable; holds sort_bytes (only offset + limit rows under a LIMIT)",
-                shown.join(", ")
+            Self::Sort { shown, monotone, .. } => format!(
+                "Sort by {} -- stable; holds sort_bytes (only offset + limit rows under a LIMIT){}",
+                shown.join(", "),
+                if *monotone {
+                    "; fed in the seed's index order, it stops at the first row past the worst it keeps"
+                } else {
+                    ""
+                }
             ),
             Self::Page { offset, limit } => {
                 let count = |c: &CountExpr| match c {
@@ -310,7 +319,7 @@ impl Planner<'_> {
                 Part::Outer(outer) => {
                     if let Some(predicate) = &outer.where_ {
                         let ex = self.lower(predicate, Horizontal::Refused, None, Role::Predicate)?;
-                        self.filter(vec![ex], FilterAt::Outer);
+                        self.filter_moving(ex, FilterAt::Outer, "the outer WHERE")?;
                     }
                     having = outer.having.as_ref();
                     select = self.outer_select(&outer.select, having)?;
@@ -360,6 +369,7 @@ impl Planner<'_> {
         role: Role<'_>,
     ) -> SqlResult2<Ex> {
         let mut lowering = Lowering {
+            db: self.db,
             schema: &self.schema,
             params: &mut self.params,
             admitted: Vec::new(),
@@ -418,7 +428,7 @@ impl Planner<'_> {
                 Some(Statement::Let(assignments)) => self.let_(assignments, number)?,
                 Some(Statement::Filter(predicate)) => {
                     let ex = self.lower(predicate, Horizontal::Allowed, None, Role::Predicate)?;
-                    self.filter(vec![ex], FilterAt::Statement);
+                    self.filter_moving(ex, FilterAt::Statement, "FILTER")?;
                 }
                 Some(Statement::For { var, list }) => self.for_(var, list, number)?,
                 Some(Statement::Call { imports, body }) => self.call(imports, body, number, patterns, notices)?,
@@ -489,6 +499,7 @@ impl Planner<'_> {
         }
         let mut assign = Vec::with_capacity(lowered.len());
         for (name, ex, ty, nullable) in lowered {
+            let lineage = lineage::of(&self.schema, &ex);
             let id = self.expr(ex);
             let slot = self.schema.add(SlotInfo {
                 name: Some(name.clone()),
@@ -496,6 +507,9 @@ impl Planner<'_> {
                 provenance: Provenance::Let { stage: number },
                 nullable,
             })?;
+            if let Some(lineage) = lineage {
+                self.schema.set_lineage(slot, lineage);
+            }
             self.bind_slot(slot);
             assign.push((slot, id));
         }
@@ -713,7 +727,34 @@ impl Planner<'_> {
             };
             lowered.push(ex);
         }
+        // A limited sort whose first key is a distance an index orders (use
+        // 2 of lineage) reads its seed in that order and stops early.
+        let first_key = match (order.first(), ret.order_by.first()) {
+            (Some(Some(hidden)), _) => lowered.get(*hidden),
+            (Some(None), Some(key)) => match &key.expr {
+                Expr::Var(name) => items[..visible]
+                    .iter()
+                    .position(|item| item.name.as_ref() == Some(name))
+                    .and_then(|at| lowered.get(at)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let monotone = match first_key {
+            Some(key) if ret.limit.is_some() && !grouped && !ret.distinct => {
+                let key = key.clone();
+                self.order_seed(&key, ret.order_by[0].descending)?
+            }
+            _ => false,
+        };
         let mut next = BindingSchema::default();
+        // A column that is exactly a node or a property with lineage keeps
+        // it across the projection; a grouped row has none.
+        let lineages: Vec<_> = if grouped {
+            Vec::new()
+        } else {
+            lowered.iter().map(|ex| lineage::of(&self.schema, ex)).collect()
+        };
         let mut types = Vec::with_capacity(visible);
         for (item, ex) in items.iter().zip(&lowered) {
             let ty = self.slot_type(ex)?;
@@ -731,6 +772,11 @@ impl Planner<'_> {
                 nullable,
             })?;
         }
+        for (at, lineage) in lineages.into_iter().enumerate() {
+            if let Some(lineage) = lineage {
+                next.set_lineage(SlotId(at as u16), lineage);
+            }
+        }
         // `EXPLAIN` prints a grouped row's slot as the key or aggregate it
         // holds.
         if let Some(display) = display {
@@ -746,7 +792,7 @@ impl Planner<'_> {
             self.ops.push(Op::Table(TableOp::Distinct));
         }
         if !ret.order_by.is_empty() {
-            self.sort(ret, &order, &next)?;
+            self.sort(ret, &order, &next, monotone)?;
         }
         if ret.offset.is_some() || ret.limit.is_some() {
             let offset = ret.offset.map(|c| self.count(c, "OFFSET")).transpose()?;
@@ -927,6 +973,7 @@ impl Planner<'_> {
         ret: &Return,
         order: &[Option<usize>],
         output: &BindingSchema,
+        monotone: bool,
     ) -> SqlResult2<()> {
         let stage_schema = std::mem::replace(&mut self.schema, output.clone());
         let result: SqlResult2<()> = (|| {
@@ -952,6 +999,7 @@ impl Planner<'_> {
             self.ops.push(Op::Table(TableOp::Sort {
                 keys: keys.into(),
                 shown,
+                monotone,
             }));
             Ok(())
         })();

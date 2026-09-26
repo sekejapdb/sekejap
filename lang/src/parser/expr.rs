@@ -477,7 +477,7 @@ impl Parser {
         Ok(column)
     }
 
-    fn tsquery(&mut self) -> SqlResult2<TsQuery> {
+    pub(crate) fn tsquery(&mut self) -> SqlResult2<TsQuery> {
         self.expect_word("TO_TSQUERY")?;
         self.expect(&Tok::LParen)?;
         self.simple_config()?;
@@ -513,8 +513,22 @@ impl Parser {
     }
 
     fn spatial_predicate(&mut self) -> SqlResult2<Predicate> {
+        let predicate = self.spatial_kind()?;
+        self.expect(&Tok::LParen)?;
+        let column = self.name()?;
+        self.optional_cast()?;
+        let (argument, metres) = self.spatial_rest(predicate)?;
+        Ok(Predicate::Spatial {
+            predicate,
+            column,
+            argument,
+            metres,
+        })
+    }
+
+    /// The spatial predicate the word at the cursor names, read past it.
+    pub(crate) fn spatial_kind(&mut self) -> SqlResult2<SpatialPredicate> {
         let name = self.word().expect("caller checked the word");
-        let at = self.here();
         self.bump();
         let predicate = match name.as_str() {
             "ST_DWITHIN" => SpatialPredicate::DWithin,
@@ -529,9 +543,16 @@ impl Parser {
                 })
             }
         };
-        self.expect(&Tok::LParen)?;
-        let column = self.name()?;
-        self.optional_cast()?;
+        Ok(predicate)
+    }
+
+    /// A spatial predicate after its first argument and that argument's
+    /// casts (`optional_cast`): the shape, the radius and `use_spheroid` of
+    /// `ST_DWithin`, the `)`, and every unit and CRS rule of QL_CONTRACT
+    /// §4.4. Shared by SQL, whose first argument is a column, and a GQL body,
+    /// whose first argument is a property (`gql/parse/expr.rs`), so the two
+    /// cannot disagree on a spelling.
+    pub(crate) fn spatial_rest(&mut self, predicate: SpatialPredicate) -> SqlResult2<(GeoArg, Option<Literal>)> {
         let column_cast = self.last_geo_cast;
         self.expect(&Tok::Comma)?;
         let argument = self.geo_argument()?;
@@ -570,7 +591,6 @@ impl Parser {
             None
         };
         self.expect(&Tok::RParen)?;
-        let _ = at;
         match predicate {
             SpatialPredicate::DWithin if !geography && !use_spheroid => {
                 return Err(SqlError::unsupported(
@@ -599,19 +619,30 @@ impl Parser {
             }
             _ => {}
         }
-        Ok(Predicate::Spatial {
-            predicate,
-            column,
-            argument,
-            metres,
-        })
+        Ok((argument, metres))
+    }
+
+    /// `ST_Distance`'s shape after its first argument and that argument's
+    /// casts, with the unit rule: metres need geography on one side, as
+    /// PostGIS returns degrees for SRID 4326 geometry. Shared by SQL and a GQL
+    /// body; the caller reads the `)`.
+    pub(crate) fn distance_rest(&mut self) -> SqlResult2<GeoArg> {
+        let column_cast = self.last_geo_cast;
+        self.expect(&Tok::Comma)?;
+        let argument = self.geo_argument()?;
+        if column_cast != Some(GeoCast::Geography) && self.last_geo_cast != Some(GeoCast::Geography) {
+            return Err(SqlError::unsupported(
+                "ST_Distance needs geography here. On geometry PostGIS returns DEGREES for SRID 4326 (0.02, not 2,200 m). sekejap returns metres only, so write `ST_Distance(geom, ST_MakePoint(lon, lat)::geography)`, which PostGIS also returns in metres.",
+            ));
+        }
+        Ok(argument)
     }
 
     /// `::geography` / `::geometry` / `::vector` and the scalar casts. Nothing
     /// is converted; what is kept is WHICH spatial type the chain ended on,
     /// in `last_geo_cast`, because PostGIS picks a distance's unit from it
     /// and the spatial forms below have to agree with PostGIS.
-    fn optional_cast(&mut self) -> SqlResult2<()> {
+    pub(crate) fn optional_cast(&mut self) -> SqlResult2<()> {
         self.last_geo_cast = None;
         while self.eat(&Tok::Cast) {
             let at = self.here();
@@ -640,7 +671,7 @@ impl Parser {
         Ok(())
     }
 
-    pub(super) fn geo_argument(&mut self) -> SqlResult2<GeoArg> {
+    pub(crate) fn geo_argument(&mut self) -> SqlResult2<GeoArg> {
         self.deeper()?;
         let result = self.geo_argument_inner();
         self.shallower();
@@ -1000,16 +1031,7 @@ impl Parser {
                         self.expect(&Tok::LParen)?;
                         let column = self.name()?;
                         self.optional_cast()?;
-                        let column_cast = self.last_geo_cast;
-                        self.expect(&Tok::Comma)?;
-                        let argument = self.geo_argument()?;
-                        if column_cast != Some(GeoCast::Geography)
-                            && self.last_geo_cast != Some(GeoCast::Geography)
-                        {
-                            return Err(SqlError::unsupported(
-                                "ST_Distance needs geography here. On geometry PostGIS returns DEGREES for SRID 4326 (0.02, not 2,200 m). sekejap returns metres only, so write `ST_Distance(geom, ST_MakePoint(lon, lat)::geography)`, which PostGIS also returns in metres.",
-                            ));
-                        }
+                        let argument = self.distance_rest()?;
                         let point = match argument {
                             GeoArg::Point(point) => point,
                             _ => {
@@ -1815,7 +1837,7 @@ impl Parser {
         })
     }
 
-    pub(super) fn literal(&mut self) -> SqlResult2<Literal> {
+    pub(crate) fn literal(&mut self) -> SqlResult2<Literal> {
         self.deeper()?;
         let result = self.literal_inner();
         self.shallower();

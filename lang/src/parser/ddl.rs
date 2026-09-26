@@ -777,7 +777,7 @@ impl Parser {
         Ok(())
     }
 
-    pub(super) fn simple_config(&mut self) -> SqlResult2<()> {
+    pub(crate) fn simple_config(&mut self) -> SqlResult2<()> {
         match self.bump() {
             Tok::Str(name) if name.eq_ignore_ascii_case("simple") => Ok(()),
             Tok::Str(other) => Err(SqlError::Refused {

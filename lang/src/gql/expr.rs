@@ -36,11 +36,13 @@
 use super::ast::{ArithOp, CastType, Expr, Func, GraphFunc, Literal};
 use super::convert::{self, Element};
 use super::horizontal::{self, Fold, Horizontal};
+use super::host::{Host, HostEx};
 use super::schema::{BindingSchema, Name, Provenance, SlotInfo};
 use crate::ast::CmpOp;
 use crate::sqlstate::{DATATYPE_MISMATCH, GROUPING_ERROR, UNDEFINED_COLUMN};
 use crate::{SqlError, SqlResult2};
 use sekejap_core::collections::gql::{BindingValue, SlotId, ValueType};
+use sekejap_core::collections::{Database, IndexFamily, IndexState};
 
 /// A resolved expression.
 #[derive(Clone, Debug)]
@@ -85,6 +87,8 @@ pub(crate) enum Ex {
     Graph(GraphFunc, Box<Ex>),
     /// A list literal, its items in order.
     List(Vec<Ex>),
+    /// A spatial, text or vector host form (M6, `host.rs`).
+    Host(Box<super::host::HostEx>),
     /// A horizontal aggregate (§4.5).
     Fold(Box<Fold>),
     /// Inside a fold's argument: the element of the list in the slot, which
@@ -116,6 +120,13 @@ impl Ex {
             | Self::EdgeProperty(slot, _) => {
                 if !out.contains(slot) {
                     out.push(*slot);
+                }
+            }
+            // A text form reads its node through the index, not a child.
+            Self::Host(host) if host.node_slot().is_some() => {
+                let slot = host.node_slot().expect("checked");
+                if !out.contains(&slot) {
+                    out.push(slot);
                 }
             }
             other => {
@@ -153,6 +164,7 @@ impl Ex {
             Self::Fold(fold) => vec![&fold.arg],
             Self::In(expr, list) => std::iter::once(&**expr).chain(list).collect(),
             Self::Coalesce(args) | Self::Call(_, args) => args.iter().collect(),
+            Self::Host(host) => host.children(),
             Self::Case {
                 operand,
                 branches,
@@ -192,6 +204,8 @@ pub(crate) fn conjuncts(ex: Ex, out: &mut Vec<Conjunct>) {
 /// Lowers AST expressions against one stage's schema, and records the
 /// highest `$n` it meets.
 pub(crate) struct Lowering<'s> {
+    /// The database, for the text index a text host form reads (M6).
+    pub(crate) db: &'s Database,
     pub(crate) schema: &'s BindingSchema,
     /// How many parameters the statement reads: the highest `n` of `$n`,
     /// raised in place.
@@ -407,6 +421,7 @@ impl Lowering<'_> {
                 arg,
             } => return horizontal::aggregate(self, expr, *func, *distinct, arg.as_deref()),
             Expr::Graph { func, arg } => Ex::Graph(*func, Box::new(self.value(arg)?)),
+            Expr::Host(host) => self.host(host)?,
             Expr::List(items) => Ex::List(
                 items
                     .iter()
@@ -429,6 +444,95 @@ impl Lowering<'_> {
                 }
             },
         })
+    }
+
+    /// A host form (M6, `host.rs`): its property operands lowered as values;
+    /// a text form's node resolved, with the READY text index on the field
+    /// of each of its label collections -- a missing one is refused, naming
+    /// the index to create (Q27).
+    fn host(&mut self, host: &Host) -> SqlResult2<Ex> {
+        let lowered = match host {
+            Host::Text {
+                target,
+                query,
+                score,
+            } => {
+                let Expr::Property { var, property } = &**target else {
+                    return Err(SqlError::unsupported(
+                        "a text form reads a node's field: `to_tsvector('simple', n.field) @@ ...` or `bm25(n.field, ...)`",
+                    ));
+                };
+                let node = self.resolve(var)?;
+                let ValueType::Node(collections) = &self.schema.slot(node).ty else {
+                    return Err(SqlError::coded(DATATYPE_MISMATCH, format!(
+                        "`{var}` is not a node: a text form reads a node's field through its text index"
+                    )));
+                };
+                if collections.is_empty() {
+                    return Err(SqlError::unsupported(format!(
+                        "`{var}` has no label: a text index belongs to one collection, so a text form reads a labelled node, `({var} IS <label>)`"
+                    )));
+                }
+                let mut indexes = Vec::with_capacity(collections.len());
+                for collection in collections.iter() {
+                    let found = self
+                        .db
+                        .list_indexes(*collection)
+                        .map_err(SqlError::from)?
+                        .into_iter()
+                        .find(|info| {
+                            info.field == *property
+                                && info.family == IndexFamily::Text
+                                && info.expression.is_none()
+                                && info.state == IndexState::Ready
+                        });
+                    match found {
+                        Some(info) => indexes.push((*collection, info.id)),
+                        None => {
+                            let name = self.db.collection_info(*collection).map_err(SqlError::from)?.name;
+                            return Err(SqlError::unsupported(format!(
+                                "{} of `{var}.{property}` needs a READY text index on {name}.{property}: CREATE INDEX ON {name} USING gin (to_tsvector('simple', {property})). There is no analyzer outside a text index, so the row is never re-tokenized to answer it (GQL profile Q27)",
+                                if *score { "bm25" } else { "a text match" }
+                            )));
+                        }
+                    }
+                }
+                HostEx::Text {
+                    node,
+                    field: property.as_str().into(),
+                    indexes: indexes.into(),
+                    query: query.clone(),
+                    score: *score,
+                }
+            }
+            Host::Spatial {
+                predicate,
+                target,
+                shape,
+                metres,
+            } => HostEx::Spatial {
+                predicate: *predicate,
+                left: self.value(target)?,
+                shape: shape.clone(),
+                metres: metres.clone(),
+            },
+            Host::Distance { target, shape } => HostEx::Distance {
+                left: self.value(target)?,
+                shape: shape.clone(),
+            },
+            Host::Vector { op, left, right } => HostEx::Vector {
+                op: *op,
+                left: self.value(left)?,
+                right: self.value(right)?,
+            },
+        };
+        for n in lowered.params() {
+            if n == 0 {
+                return Err(SqlError::Parameter("parameters are numbered from $1".into()));
+            }
+            *self.params = (*self.params).max(n);
+        }
+        Ok(Ex::Host(Box::new(lowered)))
     }
 
     fn resolve(&self, name: &Name) -> SqlResult2<SlotId> {

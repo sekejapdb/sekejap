@@ -82,21 +82,25 @@ use super::ast::GqlGraphTable;
 use super::automaton::{self, BoundPath};
 use super::bind::{BoundMatch, BoundPattern, Chain, EdgeOcc, Labels, NodeOcc, TypeRef};
 use super::convert;
-use super::eval::{Host, IndexSeed, Program};
+use super::eval::{Host, IndexSeed, Program, SeedFilter};
+use super::host::HostEx;
+use super::lineage::Lineage;
 use super::expr::{Conjunct, Ex};
 use super::schema::{BindingSchema, Name, SlotInfo};
 use super::stage::{StageView, TableOp};
 use super::union::Union;
 use super::types::{self, spelling, ParamUse};
-use crate::ast::CmpOp;
+use crate::ast::{CmpOp, GeoArg, SpatialPredicate};
 use crate::{Param, SqlError, SqlResult2, SqlValue};
 use sekejap_core::collections::gql::{
     BindingRow, BindingValue, ExistsMode, ExprId, GqlBudget, GqlCursor, GqlPage, OpSpec,
     PathAutomaton, PathLink, PathSearch, SeedSource, SlotId, StepSpec, Target, ValueType,
 };
 use sekejap_core::collections::{
-    CollectionId, Database, Direction, EdgeTypeId, GraphContextId, IndexFamily, IndexState,
+    CollectionId, Database, Direction, EdgeTypeId, GraphContextId, IndexFamily, IndexInfo,
+    IndexState,
 };
+use sekejap_core::Kind;
 
 mod explain;
 mod reach;
@@ -142,7 +146,8 @@ pub(crate) struct GqlPlan {
 /// One operator, as the planner holds it until the names are resolved.
 #[derive(Clone, Debug)]
 pub(super) enum Op {
-    Seed { out: SlotId, source: SeedSource, access: Access, label: Option<String> },
+    /// `mark` names the seed for index lineage (`lineage.rs`).
+    Seed { out: SlotId, source: SeedSource, access: Access, label: Option<String>, mark: u32 },
     Expand { from: SlotId, edge: Option<SlotId>, to: Target, hop: Hop },
     Filter { predicate: ExprId, at: FilterAt },
     Project { cols: Box<[ExprId]>, width: u16 },
@@ -192,7 +197,9 @@ pub(super) enum Op {
 #[derive(Clone, Debug)]
 pub(super) enum Access {
     Key(ExprId),
-    Index { name: String, field: String, op: CmpOp, value: String },
+    /// Each index the seed reads, `(name, what it answers)`, and what the
+    /// walks charge.
+    Index { parts: Vec<(String, String)>, charges: String },
     Bound,
     Scan,
 }
@@ -254,6 +261,8 @@ impl GqlPlan {
             counts: Vec::new(),
             stages: Vec::new(),
             has_edges: false,
+            floor: 0,
+            marks: 0,
         };
         let output = planner.pipeline(&graph.body, graph.outer.as_ref(), notices)?;
         reach::choose(&mut planner.ops, &planner.program, &planner.stages);
@@ -553,7 +562,13 @@ fn types(db: &Database, hop: &Option<Vec<TypeRef>>) -> SqlResult2<Option<Box<[Ed
 /// A seed a node could start its pattern from, cheapest first.
 enum SeedChoice {
     Key { at: Taken, key: Ex },
-    Index { at: Taken, seed: IndexSeed, name: String, equality: bool },
+    Index {
+        at: Vec<Taken>,
+        seed: IndexSeed,
+        parts: Vec<(String, String)>,
+        charges: Vec<&'static str>,
+        equality: bool,
+    },
     Bound,
     Scan,
 }
@@ -600,9 +615,31 @@ pub(super) struct Planner<'a> {
     pub(super) stages: Vec<StageView>,
     /// True once a pattern has an edge, so the graph argument is read.
     has_edges: bool,
+    /// The first operator of the body being planned: a conjunct moves by
+    /// lineage only into a seed at or after it (`lineage.rs`).
+    pub(super) floor: usize,
+    /// Seeds planned so far, which numbers the next one's mark.
+    marks: u32,
 }
 
 impl Planner<'_> {
+    pub(super) fn program(&self) -> &Program {
+        &self.program
+    }
+
+    pub(super) fn program_mut(&mut self) -> &mut Program {
+        &mut self.program
+    }
+
+    /// Plan a body from operator `first` on, where a conjunct may move by
+    /// lineage only into a seed the body planned.
+    pub(super) fn scoped<T>(&mut self, first: usize, plan: impl FnOnce(&mut Self) -> SqlResult2<T>) -> SqlResult2<T> {
+        let floor = std::mem::replace(&mut self.floor, first);
+        let result = plan(self);
+        self.floor = floor;
+        result
+    }
+
     fn is_bound(&self, slot: SlotId) -> bool {
         self.bound.contains(&slot)
     }
@@ -706,13 +743,25 @@ impl Planner<'_> {
                 let labels = self.labels_or_all(labels)?;
                 (SeedSource::Key { key, labels }, Access::Key(key))
             }
-            SeedChoice::Index { at, seed, name, .. } => {
-                take(at, nodes, where_);
+            SeedChoice::Index {
+                mut at,
+                seed,
+                parts,
+                mut charges,
+                ..
+            } => {
+                // Inline conjuncts are removed by position: the last first.
+                at.sort_by_key(|taken| std::cmp::Reverse(match taken {
+                    Taken::Inline { at, .. } => *at,
+                    Taken::Where { .. } => 0,
+                }));
+                for taken in at {
+                    take(taken, nodes, where_);
+                }
+                charges.dedup();
                 let access = Access::Index {
-                    name,
-                    field: seed.field.clone(),
-                    op: seed.op,
-                    value: show(&seed.value, &self.schema),
+                    parts,
+                    charges: charges.join(", "),
                 };
                 let seed = self.program.seed(seed);
                 (SeedSource::Index { seed }, access)
@@ -723,11 +772,24 @@ impl Planner<'_> {
                 (SeedSource::Scan { labels }, Access::Scan)
             }
         };
+        let mark = self.marks;
+        self.marks += 1;
+        // A node of one label collection seeded by an index or a scan
+        // starts a lineage: a later conjunct may move into this seed.
+        if matches!(source, SeedSource::Index { .. })
+            || matches!(&source, SeedSource::Scan { labels } if labels.len() == 1)
+        {
+            self.schema.set_lineage(slot, Lineage {
+                mark,
+                origin: Ex::Slot(slot),
+            });
+        }
         self.ops.push(Op::Seed {
             out: slot,
             source,
             access,
             label,
+            mark,
         });
         self.bind_slot(slot);
         Ok(())
@@ -927,35 +989,85 @@ impl Planner<'_> {
                     .enumerate()
                     .filter_map(|(at, c)| c.as_ref().map(|c| (Taken::Where { at }, c))),
             );
+        // An index belongs to one collection: only a node of ONE label
+        // collection is index-seeded.
+        let one = match &node.labels {
+            Some(Labels { ids, .. }) if ids.len() == 1 => Some(ids[0]),
+            _ => None,
+        };
+        // The catalog is read only when a conjunct could use it: a node with
+        // no seedable conjunct -- the far node of most hops -- reads none of
+        // it, and planning costs what it did before host forms.
+        let (mut indexes, mut fields): (Option<Vec<IndexInfo>>, Option<Vec<(String, Kind)>>) = (None, None);
+        let mut seed = Vec::new();
+        let (mut taken, mut parts, mut charges, mut equality) = (Vec::new(), Vec::new(), Vec::new(), false);
         for (at, conjunct) in candidates {
-            let Some((op, field, value)) = self.seedable(node.slot, &conjunct.ex) else {
-                continue;
-            };
-            let choice = if field == crate::KEY_COLUMN {
-                if op != CmpOp::Eq {
-                    continue;
-                }
-                if let Ex::Const(value) = value {
-                    if !matches!(value, BindingValue::Text(_) | BindingValue::Null) {
-                        return Err(SqlError::unsupported(format!(
-                            "`_key` is text and is compared with {value:?}: a key seed looks up a text key"
-                        )));
+            if let Some((op, field, value)) = self.seedable(node.slot, &conjunct.ex) {
+                if field == crate::KEY_COLUMN {
+                    if op != CmpOp::Eq {
+                        continue;
                     }
-                }
-                SeedChoice::Key {
-                    at,
-                    key: value.clone(),
-                }
-            } else {
-                match self.index_seed(node, op, field, value)? {
-                    Some((seed, name)) => SeedChoice::Index {
+                    if let Ex::Const(value) = value {
+                        if !matches!(value, BindingValue::Text(_) | BindingValue::Null) {
+                            return Err(SqlError::unsupported(format!(
+                                "`_key` is text and is compared with {value:?}: a key seed looks up a text key"
+                            )));
+                        }
+                    }
+                    let choice = SeedChoice::Key {
                         at,
-                        seed,
-                        name,
-                        equality: op == CmpOp::Eq,
-                    },
-                    None => continue,
+                        key: value.clone(),
+                    };
+                    if choice.rank() < best.rank() {
+                        best = choice;
+                    }
+                } else if let Some(info) = match one {
+                    Some(collection) => ready(loaded_indexes(self.db, &mut indexes, collection)?, field, IndexFamily::Scalar),
+                    None => None,
+                } {
+                    seed.push(SeedFilter::Scalar {
+                        index: info.id,
+                        kind: info.kind.clone(),
+                        field: field.to_owned(),
+                        op,
+                        value: value.clone(),
+                    });
+                    taken.push(at);
+                    parts.push((info.name.clone(), format!("{field} {} {}", op.written(), show(value, &self.schema))));
+                    charges.push("scalar_postings");
+                    equality |= op == CmpOp::Eq;
                 }
+                continue;
+            }
+            let Some(collection) = one else { continue };
+            let Ex::Host(host) = &conjunct.ex else { continue };
+            let fields: &[(String, Kind)] = if matches!(**host, HostEx::Spatial { .. }) {
+                if fields.is_none() {
+                    fields = Some(self.db.collection_info(collection).map_err(SqlError::from)?.layout.fields);
+                }
+                fields.as_deref().unwrap_or_default()
+            } else {
+                &[]
+            };
+            let indexes = loaded_indexes(self.db, &mut indexes, collection)?;
+            if let Some((filter, name, charge)) = self.host_seed(node.slot, collection, indexes, fields, &conjunct.ex) {
+                seed.push(filter);
+                taken.push(at);
+                parts.push((name, show(&conjunct.ex, &self.schema)));
+                charges.push(charge);
+            }
+        }
+        if let (Some(collection), false) = (one, seed.is_empty()) {
+            let choice = SeedChoice::Index {
+                at: taken,
+                seed: IndexSeed {
+                    collection,
+                    filters: seed,
+                    order: None,
+                },
+                parts,
+                charges,
+                equality,
             };
             if choice.rank() < best.rank() {
                 best = choice;
@@ -964,9 +1076,78 @@ impl Planner<'_> {
         Ok(best)
     }
 
+    /// A host-form conjunct of `node` a READY index of `collection` answers
+    /// exactly, as the SQL side compiles the same form: a text match over
+    /// the field's text index, ST_DWithin to a point or ST_Within an envelope
+    /// over a point index, and every spatial predicate over a geometry index.
+    pub(super) fn host_seed(
+        &self,
+        node: SlotId,
+        collection: CollectionId,
+        indexes: &[IndexInfo],
+        fields: &[(String, Kind)],
+        ex: &Ex,
+    ) -> Option<(SeedFilter, String, &'static str)> {
+        let Ex::Host(host) = ex else { return None };
+        match &**host {
+            HostEx::Text {
+                node: at,
+                indexes: text,
+                query,
+                score: false,
+                ..
+            } if *at == node => {
+                let index = super::host::text_index(text, collection)?;
+                let name = indexes.iter().find(|info| info.id == index)?.name.clone();
+                Some((
+                    SeedFilter::Text {
+                        index,
+                        query: query.clone(),
+                    },
+                    name,
+                    "text_postings, text_tokens",
+                ))
+            }
+            HostEx::Spatial {
+                predicate,
+                left: Ex::NodeProperty(at, field),
+                shape,
+                metres,
+            } if *at == node => {
+                let point = match fields.iter().find(|(name, _)| **name == **field)?.1 {
+                    Kind::Point => true,
+                    Kind::Geo => false,
+                    _ => return None,
+                };
+                if point
+                    && !matches!(
+                        (predicate, shape),
+                        (SpatialPredicate::DWithin, GeoArg::Point(_)) | (SpatialPredicate::Within, GeoArg::Envelope { .. })
+                    )
+                {
+                    return None;
+                }
+                let family = if point { IndexFamily::SpatialPoint } else { IndexFamily::SpatialGeometry };
+                let info = ready(indexes, field, family)?;
+                Some((
+                    SeedFilter::Spatial {
+                        index: info.id,
+                        point,
+                        predicate: *predicate,
+                        shape: shape.clone(),
+                        metres: metres.clone(),
+                    },
+                    info.name.clone(),
+                    "spatial_postings",
+                ))
+            }
+            _ => None,
+        }
+    }
+
     /// `node.field op value`, with the field on the left, when `ex` is one
     /// and `value` can be evaluated before the node is bound.
-    fn seedable<'e>(&self, node: SlotId, ex: &'e Ex) -> Option<(CmpOp, &'e str, &'e Ex)> {
+    pub(super) fn seedable<'e>(&self, node: SlotId, ex: &'e Ex) -> Option<(CmpOp, &'e str, &'e Ex)> {
         let Ex::Compare(op, left, right) = ex else { return None };
         let (op, field, value) = match (&**left, &**right) {
             (Ex::NodeProperty(slot, field), value) if *slot == node => (*op, field, value),
@@ -979,39 +1160,6 @@ impl Planner<'_> {
         Some((op, field, value))
     }
 
-    /// A READY scalar index answering `node.field op value`: only over a
-    /// node of ONE label collection, since an index is one collection's.
-    fn index_seed(
-        &self,
-        node: &NodeOcc,
-        op: CmpOp,
-        field: &str,
-        value: &Ex,
-    ) -> SqlResult2<Option<(IndexSeed, String)>> {
-        let Some(Labels { ids, .. }) = &node.labels else { return Ok(None) };
-        let [collection] = **ids else { return Ok(None) };
-        let indexes = self.db.list_indexes(collection).map_err(SqlError::from)?;
-        Ok(indexes
-            .into_iter()
-            .find(|info| {
-                info.field == field
-                    && info.family == IndexFamily::Scalar
-                    && info.expression.is_none()
-                    && info.state == IndexState::Ready
-            })
-            .map(|info| {
-                let seed = IndexSeed {
-                    collection,
-                    index: info.id,
-                    kind: info.kind,
-                    field: field.to_owned(),
-                    op,
-                    value: value.clone(),
-                };
-                (seed, info.name)
-            }))
-    }
-
     /// The refusal of a label scan whose every node carries a predicate no
     /// seed answers (design Q5): it names the label, the field and the index
     /// that would answer it.
@@ -1021,9 +1169,19 @@ impl Planner<'_> {
             .as_ref()
             .map_or_else(|| "every collection".to_owned(), |l| format!("`{}`", l.written));
         let field = first_property(node.slot, predicate);
+        // The access method that answers the form: a spatial predicate is a
+        // GiST's, as in PostGIS; anything else a B-tree's.
+        let method = if host_form(predicate, &|host| matches!(host, HostEx::Spatial { .. })) {
+            "gist"
+        } else {
+            "btree"
+        };
         let create = match (&node.labels, field) {
+            _ if host_form(predicate, &|host| matches!(host, HostEx::Vector { .. } | HostEx::Distance { .. })) => {
+                "no index answers a distance as a filter; ORDER BY the distance with a LIMIT ranks through one".to_owned()
+            }
             (Some(labels), Some(field)) if labels.ids.len() == 1 => format!(
-                "CREATE INDEX ON {} USING btree ({field}) answers it",
+                "CREATE INDEX ON {} USING {method} ({field}) answers it",
                 labels.written
             ),
             _ => "a scalar index on one label's field answers it".to_owned(),
@@ -1065,6 +1223,33 @@ fn first_property(slot: SlotId, ex: &Ex) -> Option<&str> {
             .into_iter()
             .find_map(|child| first_property(slot, child)),
     }
+}
+
+/// `collection`'s indexes, read into `slot` the first time they are asked for.
+fn loaded_indexes<'s>(
+    db: &Database,
+    slot: &'s mut Option<Vec<IndexInfo>>,
+    collection: CollectionId,
+) -> SqlResult2<&'s [IndexInfo]> {
+    if slot.is_none() {
+        *slot = Some(db.list_indexes(collection).map_err(SqlError::from)?);
+    }
+    Ok(slot.as_deref().unwrap_or_default())
+}
+
+/// True when `ex` holds a host form `test` accepts.
+fn host_form(ex: &Ex, test: &dyn Fn(&HostEx) -> bool) -> bool {
+    match ex {
+        Ex::Host(host) if test(host) => true,
+        other => other.children().into_iter().any(|child| host_form(child, test)),
+    }
+}
+
+/// The READY index of `family` on `field`, not an expression index.
+pub(super) fn ready<'i>(indexes: &'i [IndexInfo], field: &str, family: IndexFamily) -> Option<&'i IndexInfo> {
+    indexes.iter().find(|info| {
+        info.field == field && info.family == family && info.expression.is_none() && info.state == IndexState::Ready
+    })
 }
 
 /// Remove a consumed conjunct from where it lives.

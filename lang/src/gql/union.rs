@@ -186,10 +186,12 @@ impl Planner<'_> {
             self.bound = (0..self.schema.width()).map(|i| SlotId(i as u16)).collect();
             let first = self.ops.len();
             let mut patterns = 0u16;
-            self.statements(&stage.statements, number, &mut patterns, notices)?;
-            self.return_exists(&stage.ret, number, &mut patterns, notices)?;
-            let width = self.schema.row_width();
-            let (next, project, columns, out) = self.ret(&stage.ret, number, reader, false, None)?;
+            let (width, (next, project, columns, out)) = self.scoped(first, |planner| {
+                planner.statements(&stage.statements, number, &mut patterns, notices)?;
+                planner.return_exists(&stage.ret, number, &mut patterns, notices)?;
+                let width = planner.schema.row_width();
+                Ok((width, planner.ret(&stage.ret, number, reader, false, None)?))
+            })?;
             planned.push(Branch {
                 ops: self.ops.drain(first..).collect(),
                 view: StageView {

@@ -298,7 +298,7 @@ impl Planner<'_> {
             ));
         }
         let (width, first_op, bound) = (self.schema.width(), self.ops.len(), self.bound.len());
-        self.statements(body, number, patterns, notices)?;
+        self.scoped(first_op, |planner| planner.statements(body, number, patterns, notices))?;
         let inner = self.ops.drain(first_op..).collect();
         self.schema.close_from(width);
         self.bound.truncate(bound);
@@ -332,9 +332,11 @@ impl Planner<'_> {
         }
         let (width, first_op, bound) = (self.schema.width(), self.ops.len(), self.bound.len());
         let hidden = self.schema.hide_except(&imported);
-        self.statements(&body.statements, number, patterns, notices)?;
-        self.return_exists(&body.ret, number, patterns, notices)?;
-        let (next, project, columns, out) = self.ret(&body.ret, number, Reader::Call, false, None)?;
+        let (next, project, columns, out) = self.scoped(first_op, |planner| {
+            planner.statements(&body.statements, number, patterns, notices)?;
+            planner.return_exists(&body.ret, number, patterns, notices)?;
+            planner.ret(&body.ret, number, Reader::Call, false, None)
+        })?;
         let visible = out.columns.len();
         if let Op::Project { width: at, .. } = &mut self.ops[project] {
             *at = next.row_width();

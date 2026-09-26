@@ -369,6 +369,8 @@ pub(crate) enum Expr {
     Graph { func: GraphFunc, arg: Box<Expr> },
     /// A list literal `[a, b, ...]`, possibly empty (design Q2).
     List(Vec<Expr>),
+    /// A spatial, text or vector host form (M6, `host.rs`).
+    Host(Box<super::host::Host>),
     /// `EXISTS { ... }` (M5-C, design §2.3): whether the body's statements
     /// give a row. The short form -- patterns and a `WHERE` -- is held as
     /// its `MATCH`, and a `RETURN` inside, whose items are ignored (Q18),
@@ -512,6 +514,7 @@ impl Expr {
             Self::Aggregate { arg, .. } => arg.as_deref().into_iter().collect(),
             Self::Graph { arg, .. } => vec![&**arg],
             Self::List(items) => items.iter().collect(),
+            Self::Host(host) => host.children(),
         }
     }
 
@@ -1055,6 +1058,7 @@ impl fmt::Display for Expr {
                 }
                 f.write_str(" }")
             }
+            Self::Host(host) => write!(f, "{host}"),
         }
     }
 }

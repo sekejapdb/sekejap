@@ -13,6 +13,7 @@
 //! PostgreSQL's rule, and it keeps "same name" an equivalence: `Person`,
 //! `PERSON` and `"person"` are one variable, `"Person"` is another.
 
+use super::lineage::Lineage;
 use super::ast::Expr;
 use crate::sqlstate::DUPLICATE_ALIAS;
 use crate::{SqlError, SqlResult2};
@@ -125,6 +126,8 @@ pub(crate) struct BindingSchema {
     /// Each `EXISTS` planned in its mark form, as written, with the slot
     /// its answer is written into; an expression reads that slot.
     marks: Vec<(Expr, SlotId)>,
+    /// Each slot's index lineage, where it has one (`lineage.rs`).
+    lineage: Vec<(SlotId, Lineage)>,
 }
 
 impl BindingSchema {
@@ -211,6 +214,16 @@ impl BindingSchema {
 
     /// What the binder knows about `slot`. Panics on a slot this schema did
     /// not allocate, which is a binder bug, never user input.
+    /// The index lineage of `slot`'s value (`lineage.rs`).
+    pub(crate) fn lineage(&self, slot: SlotId) -> Option<&Lineage> {
+        self.lineage.iter().find(|(at, _)| *at == slot).map(|(_, lineage)| lineage)
+    }
+
+    pub(crate) fn set_lineage(&mut self, slot: SlotId, lineage: Lineage) {
+        self.lineage.retain(|(at, _)| *at != slot);
+        self.lineage.push((slot, lineage));
+    }
+
     pub(crate) fn slot(&self, slot: SlotId) -> &SlotInfo {
         &self.slots[usize::from(slot.0)]
     }

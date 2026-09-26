@@ -45,6 +45,8 @@ mod elements;
 mod eval;
 mod expr;
 mod horizontal;
+mod host;
+mod lineage;
 mod parse;
 pub(crate) mod plan;
 mod scalar;

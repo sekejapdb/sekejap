@@ -29,17 +29,20 @@ use super::ast::Func;
 use super::convert::Element;
 use super::elements;
 use super::expr::Ex;
+use super::host::{self, HostEx};
 use super::scalar;
 use super::types;
-use crate::ast::CmpOp;
-use crate::sqlstate::DATATYPE_MISMATCH;
+use crate::ast::{CmpOp, GeoArg, Literal as SqlLiteral, SpatialPredicate, TsQuery};
+use crate::sqlstate::{DATATYPE_MISMATCH, DATA_EXCEPTION};
 use crate::SqlError;
 use sekejap_core::collections::gql::{
     BindingRow, BindingValue, EvalCx, ExprId, GqlHost, SeedId, SlotId, Truth,
 };
 use sekejap_core::collections::{
     CandidateDriver, CollectionId, Database, Error, IndexId, PreparedQuery, Projection, QueryError,
-    QueryFilter, QueryOrder, QueryRequest, QueryResult, ScalarFilter, ScalarValue,
+    GeometryFilter, PointFilter, QueryFilter, QueryOrder, QueryRequest, QueryResult, ScalarFilter,
+    ScalarValue, TextMatch, VectorMetric,
+    WorkResource,
 };
 use sekejap_core::Kind;
 use std::cell::RefCell;
@@ -98,18 +101,76 @@ pub(super) fn mismatch(message: impl fmt::Display) -> Fault {
     raise(DATATYPE_MISMATCH, message)
 }
 
-/// An index-candidate seed: `field op value` over one collection's READY
-/// scalar index, `value` evaluated per input row.
+/// An index-candidate seed over one collection: every conjunct of the node
+/// a READY index answers, which the engine intersects with its own driver
+/// choice (design §3.3). Every value is evaluated when the seed opens, per
+/// input row, so the plan stays rebindable.
 #[derive(Clone, Debug)]
 pub(crate) struct IndexSeed {
     pub(crate) collection: CollectionId,
-    pub(crate) index: IndexId,
-    /// The index's key kind, which the value must be read into.
-    pub(crate) kind: Kind,
-    pub(crate) field: String,
-    /// The comparison with the field on the LEFT; never `<>`.
-    pub(crate) op: CmpOp,
-    pub(crate) value: Ex,
+    pub(crate) filters: Vec<SeedFilter>,
+    /// The engine order the rows come in: the driver's own when `None`, an
+    /// index order when a limited sort is fed by it (`lineage.rs`).
+    pub(crate) order: Option<SeedOrder>,
+}
+
+/// An index order a seed is read in.
+#[derive(Clone, Debug)]
+pub(crate) enum SeedOrder {
+    /// Ascending exact distance of the field's vectors to `query`, over its
+    /// exact index; `dimension` is the field's declared width. When the
+    /// execution opens under `SET LOCAL ef_search`, and the column has an
+    /// `approximate` index (vamana, else quantized, as SQL prefers), the
+    /// order is that index's `ef`-bounded shortlist instead: APPROXIMATE by
+    /// the caller's request (design §3.6).
+    Vector {
+        index: IndexId,
+        approximate: Option<IndexId>,
+        metric: VectorMetric,
+        query: Ex,
+        dimension: usize,
+    },
+}
+
+impl IndexSeed {
+    /// The slots the seed's values read.
+    pub(crate) fn refs(&self) -> Vec<SlotId> {
+        self.filters
+            .iter()
+            .flat_map(|filter| match filter {
+                SeedFilter::Scalar { value, .. } => value.refs(),
+                SeedFilter::Text { .. } | SeedFilter::Spatial { .. } => Vec::new(),
+            })
+            .chain(self.order.iter().flat_map(|order| match order {
+                SeedOrder::Vector { query, .. } => query.refs(),
+            }))
+            .collect()
+    }
+}
+
+/// One conjunct of an [`IndexSeed`].
+#[derive(Clone, Debug)]
+pub(crate) enum SeedFilter {
+    /// `field op value` over a scalar index.
+    Scalar {
+        index: IndexId,
+        /// The index's key kind, which the value must be read into.
+        kind: Kind,
+        field: String,
+        /// The comparison with the field on the LEFT; never `<>`.
+        op: CmpOp,
+        value: Ex,
+    },
+    /// A text match over the field's text index.
+    Text { index: IndexId, query: TsQuery },
+    /// A spatial predicate over a point index (`point`) or a geometry index.
+    Spatial {
+        index: IndexId,
+        point: bool,
+        predicate: SpatialPredicate,
+        shape: GeoArg,
+        metres: Option<SqlLiteral>,
+    },
 }
 
 /// A row as an expression reads it: the engine's row and, inside a fold's
@@ -167,9 +228,71 @@ impl Program {
         SeedId(self.seeds.len() as u32 - 1)
     }
 
-    /// The value seed `id` compares its field with, evaluated per input row.
-    pub(crate) fn seed_value(&self, id: SeedId) -> &Ex {
-        &self.seeds[id.0 as usize].value
+    /// Seed `id`.
+    pub(crate) fn seed_at(&self, id: SeedId) -> &IndexSeed {
+        &self.seeds[id.0 as usize]
+    }
+
+    /// The collection seed `id` reads.
+    pub(crate) fn seed_collection(&self, id: SeedId) -> CollectionId {
+        self.seeds[id.0 as usize].collection
+    }
+
+    pub(crate) fn seed_mut(&mut self, id: SeedId) -> &mut IndexSeed {
+        &mut self.seeds[id.0 as usize]
+    }
+
+    /// The slots seed `id` reads, evaluated per input row.
+    pub(crate) fn seed_refs(&self, id: SeedId) -> Vec<SlotId> {
+        self.seeds[id.0 as usize].refs()
+    }
+
+    /// A host form (M6, `host.rs`): a text form through the node's text
+    /// index, a spatial or vector form pure over the values it reads; a
+    /// vector distance charges the lanes it compares, as the engine's
+    /// vector scan does.
+    fn host(&self, host: &HostEx, row: View<'_>, cx: &mut EvalCx<'_, '_>) -> Evaluated<BindingValue> {
+        Ok(match host {
+            HostEx::Text {
+                node,
+                indexes,
+                query,
+                score,
+                ..
+            } => match row.get(*node) {
+                BindingValue::Node(node) => {
+                    let (text, matching) = host::text_query(query, cx.params)?;
+                    let index = host::text_index(indexes, node.0.collection).ok_or_else(|| {
+                        mismatch("a text form met a node of a collection its label does not name")
+                    })?;
+                    if *score {
+                        BindingValue::Float(cx.reader.text_score(*node, index, &text, matching, cx.meter)?)
+                    } else {
+                        BindingValue::Bool(cx.reader.text_matches(*node, index, &text, matching, cx.meter)?)
+                    }
+                }
+                _ => BindingValue::Null,
+            },
+            HostEx::Spatial {
+                predicate,
+                left,
+                shape,
+                metres,
+            } => {
+                let left = self.value(left, row, cx)?;
+                host::spatial_value(Some(*predicate), &left, shape, metres.as_ref(), cx.params)?
+            }
+            HostEx::Distance { left, shape } => {
+                let left = self.value(left, row, cx)?;
+                host::spatial_value(None, &left, shape, None, cx.params)?
+            }
+            HostEx::Vector { op, left, right } => {
+                let (left, right) = (self.value(left, row, cx)?, self.value(right, row, cx)?);
+                let (value, lanes) = host::vector_value(*op, &left, &right)?;
+                cx.meter.charge(WorkResource::VectorLanes, lanes as u64)?;
+                value
+            }
+        })
     }
 
     fn value(&self, ex: &Ex, row: View<'_>, cx: &mut EvalCx<'_, '_>) -> Evaluated<BindingValue> {
@@ -326,6 +449,7 @@ impl Program {
                 }
                 scalar::call(*func, values)?
             }
+            Ex::Host(host) => self.host(host, row, cx)?,
             Ex::Graph(func, arg) => match self.value(arg, row, cx)? {
                 BindingValue::Null => BindingValue::Null,
                 value => elements::call(*func, &value, cx)?,
@@ -429,32 +553,127 @@ impl Program {
         cx: &mut EvalCx<'_, '_>,
     ) -> Evaluated<Option<PreparedQuery<'db>>> {
         let seed = &self.seeds[seed.0 as usize];
-        let value = self.value(&seed.value, View::of(row), cx)?;
-        let Some(key) = index_key(seed, &value)? else {
-            return Ok(None);
+        // Each filter's values, owned; `None` when one admits no row.
+        let mut built = Vec::with_capacity(seed.filters.len());
+        for filter in &seed.filters {
+            built.push(match filter {
+                SeedFilter::Scalar {
+                    index,
+                    kind,
+                    field,
+                    op,
+                    value,
+                } => {
+                    let value = self.value(value, View::of(row), cx)?;
+                    let Some(key) = index_key(kind, field, *op, &value)? else {
+                        return Ok(None);
+                    };
+                    Built::Scalar(*index, *op, key)
+                }
+                SeedFilter::Text { index, query } => {
+                    let (text, matching) = host::text_query(query, cx.params)?;
+                    Built::Text(*index, text, matching)
+                }
+                SeedFilter::Spatial {
+                    index,
+                    point,
+                    predicate,
+                    shape,
+                    metres,
+                } => match host::spatial_seed(*point, *predicate, shape, metres.as_ref(), cx.params)? {
+                    Some(host::SpatialSeed::Point(filter)) => Built::Point(*index, filter),
+                    Some(host::SpatialSeed::Geometry(filter)) => Built::Geometry(*index, filter),
+                    None => return Ok(None),
+                },
+            });
+        }
+        let filters: Vec<QueryFilter<'_>> = built.iter().map(Built::filter).collect();
+        let lanes;
+        let order = match &seed.order {
+            None => QueryOrder::Driver,
+            Some(SeedOrder::Vector {
+                index,
+                approximate,
+                metric,
+                query,
+                dimension,
+            }) => match host::lanes(&self.value(query, View::of(row), cx)?)? {
+                // A NULL query: every distance is NULL, so no order is
+                // asked of the index and the sort keeps its input order.
+                None => QueryOrder::Driver,
+                Some(query) if query.len() != *dimension => {
+                    return Err(raise(
+                        DATA_EXCEPTION,
+                        format!("different vector dimensions {dimension} and {}", query.len()),
+                    ))
+                }
+                Some(query) => {
+                    lanes = query;
+                    match (crate::compile::ef_search(), approximate) {
+                        (Some(ef), Some(approximate)) => QueryOrder::ApproximateVector {
+                            index: *approximate,
+                            query: &lanes,
+                            metric: *metric,
+                            ef,
+                        },
+                        _ => QueryOrder::ExactVector {
+                            index: *index,
+                            query: &lanes,
+                            metric: *metric,
+                        },
+                    }
+                }
+            },
         };
-        let predicate = match (seed.op, key.scalar()) {
-            (CmpOp::Eq, value) => ScalarFilter::Eq(value),
-            (CmpOp::Lt, value) => range(Bound::Unbounded, Bound::Excluded(value)),
-            (CmpOp::Le, value) => range(Bound::Unbounded, Bound::Included(value)),
-            (CmpOp::Gt, value) => range(Bound::Excluded(value), Bound::Unbounded),
-            (CmpOp::Ge, value) => range(Bound::Included(value), Bound::Unbounded),
-            (CmpOp::Ne, _) => unreachable!("the planner never seeds from `<>`"),
-        };
-        let filters = [QueryFilter::Scalar {
-            index: seed.index,
-            predicate,
-        }];
         Ok(db
             .prepare_query(QueryRequest {
                 collection: seed.collection,
                 filters: &filters,
-                order: QueryOrder::Driver,
+                order,
                 projection: Projection::Ids,
                 total_limit: None,
                 driver: CandidateDriver::Auto,
             })
             .map(Some)?)
+    }
+}
+
+/// A seed filter's values, owned while the engine's borrowed filter is built.
+enum Built {
+    Scalar(IndexId, CmpOp, Key),
+    Text(IndexId, String, TextMatch),
+    Point(IndexId, PointFilter),
+    Geometry(IndexId, GeometryFilter),
+}
+
+impl Built {
+    fn filter(&self) -> QueryFilter<'_> {
+        match self {
+            Self::Scalar(index, op, key) => QueryFilter::Scalar {
+                index: *index,
+                predicate: match (op, key.scalar()) {
+                    (CmpOp::Eq, value) => ScalarFilter::Eq(value),
+                    (CmpOp::Lt, value) => range(Bound::Unbounded, Bound::Excluded(value)),
+                    (CmpOp::Le, value) => range(Bound::Unbounded, Bound::Included(value)),
+                    (CmpOp::Gt, value) => range(Bound::Excluded(value), Bound::Unbounded),
+                    (CmpOp::Ge, value) => range(Bound::Included(value), Bound::Unbounded),
+                    (CmpOp::Ne, _) => unreachable!("the planner never seeds from `<>`"),
+                },
+            },
+            Self::Text(index, query, matching) => QueryFilter::Text {
+                index: *index,
+                query,
+                matching: *matching,
+            },
+            Self::Point(index, predicate) => QueryFilter::Point {
+                index: *index,
+                predicate: *predicate,
+            },
+            Self::Geometry(index, predicate) => QueryFilter::Geometry {
+                index: *index,
+                predicate: predicate.clone(),
+            },
+        }
     }
 }
 
@@ -481,18 +700,18 @@ impl Key {
     }
 }
 
-/// `value` as a key of `seed`'s index, so that the index walk admits
+/// `value` as a key of an index of `kind`, so that the index walk admits
 /// exactly the rows `field op value` is true for. `None`: no row can be
 /// (a `NULL`, or a fraction compared for equality with an integer field).
-fn index_key(seed: &IndexSeed, value: &BindingValue) -> Evaluated<Option<Key>> {
-    Ok(Some(match (&seed.kind, value) {
+fn index_key(kind: &Kind, field: &str, op: CmpOp, value: &BindingValue) -> Evaluated<Option<Key>> {
+    Ok(Some(match (kind, value) {
         (_, BindingValue::Null) => return Ok(None),
         (Kind::Int, BindingValue::Int(i)) => Key::Int(*i),
         (Kind::Int, BindingValue::Float(f)) if f.is_finite() && f.abs() < 9.2e18 => {
             // An integer field against a fraction: `x < 2.5` is `x < 3`,
             // `x <= 2.5` is `x <= 2`, `x > 2.5` is `x > 2`, `x >= 2.5` is
             // `x >= 3`, and `x = 2.5` holds for no integer.
-            let bound = match seed.op {
+            let bound = match op {
                 CmpOp::Lt | CmpOp::Ge => f.ceil(),
                 CmpOp::Le | CmpOp::Gt => f.floor(),
                 _ if f.fract() == 0.0 => *f,
@@ -507,7 +726,7 @@ fn index_key(seed: &IndexSeed, value: &BindingValue) -> Evaluated<Option<Key>> {
         (kind, other) => {
             return Err(mismatch(format!(
                 "`{}` is indexed as {kind:?} and is compared with {}",
-                seed.field,
+                field,
                 self::kind(other)
             )))
         }
