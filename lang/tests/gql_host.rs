@@ -45,7 +45,11 @@
 //! * `ef_search` is read when an execution opens: one prepared plan answers
 //!   exactly, then APPROXIMATELY under `SET LOCAL ef_search`, then exactly
 //!   again after COMMIT (M6-G, Q29,
-//!   `ef_search_is_read_when_the_execution_opens`);
+//!   `ef_search_is_read_when_the_execution_opens`); a column with ONLY an
+//!   approximate index is exact without the knob (read unordered, sorted
+//!   whole) and approximate through that index with it, as Oracle's
+//!   `FETCH APPROX` and Spanner's `APPROX_` functions are opt-in
+//!   (`an_approximate_only_column_is_exact_unless_ef_search_is_set`);
 //! * a host form types its parameters once, as the wire describes them: a
 //!   tsquery TEXT, a coordinate and a radius DOUBLE PRECISION, a distance's
 //!   operand VECTOR, two disagreeing uses `42P08`, and a vector bound as
@@ -629,4 +633,38 @@ fn an_ordered_top_k_puts_nan_then_null_last_as_the_scan_does() {
             assert_eq!(rows[3][1], SqlValue::Null, "no vector, no distance");
         }
     }
+}
+
+#[test]
+fn an_approximate_only_column_is_exact_unless_ef_search_is_set() {
+    let dir = TempDir::new().unwrap();
+    let mut db = fixture(&dir);
+    db.sql("CREATE TABLE tide (emb VECTOR(2)) WITH (index: none)", &[]).unwrap();
+    for (n, emb) in [[1.0, 0.0], [0.9, 0.1], [0.5, 0.5], [0.0, 1.0]].into_iter().enumerate() {
+        db.sql(
+            "INSERT INTO tide (_key, emb) VALUES ($1, $2)",
+            &[Param::Text(format!("t{n}")), Param::Vector(emb.to_vec())],
+        )
+        .unwrap();
+    }
+    db.sql("COMMIT", &[]).unwrap();
+    db.sql("CREATE INDEX tide_emb_q ON tide USING quantized (emb)", &[]).unwrap();
+    let sql = "SELECT * FROM GRAPH_TABLE (base MATCH (t IS tide) \
+               RETURN t._key AS k, t.emb <-> '[1,0]'::vector AS d ORDER BY d, k LIMIT 3)";
+    let prepared = prepare_sql(&db, sql, &[]).unwrap();
+    let answer = |db: &Database| -> Vec<String> {
+        let SqlResult::Rows { rows, .. } = prepared.run(db).unwrap() else { panic!("rows") };
+        keys(&rows.into_iter().map(|row| row.values).collect::<Vec<_>>())
+    };
+    let exact = ["t0", "t1", "t2"];
+    assert_eq!(answer(&db), exact, "no knob: exact, every row sorted");
+    let plain = explain_sql(&db, sql, &[]).unwrap();
+    assert!(plain.contains("the column has no exact index, so the rows are read unordered and sorted whole"), "{plain}");
+    assert!(plain.contains("when SET LOCAL ef_search is set, fed in the seed's index order"), "{plain}");
+    db.sql("SET LOCAL ef_search = 1", &[]).unwrap();
+    assert_eq!(answer(&db), ["t0"], "under the knob: the one-row shortlist of the quantized index");
+    let asked = explain_sql(&db, sql, &[]).unwrap();
+    assert!(asked.contains("APPROXIMATE (ef=1) through `tide_emb_q`"), "{asked}");
+    db.sql("COMMIT", &[]).unwrap();
+    assert_eq!(answer(&db), exact, "after the transaction: exact again");
 }
