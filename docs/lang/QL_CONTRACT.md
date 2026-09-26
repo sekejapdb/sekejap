@@ -361,7 +361,7 @@ M2-E (owner decision 1) removed the SQL/PGQ `GRAPH_TABLE (g MATCH ... COLUMNS (.
 |---|---|---|---|
 | element pattern `(v IS label)` / `(v:label)`, edge `-[e IS type]->`, `<-`, `-` | T1 | `sql_tier1.rs::graph_table_compiles_to_one_bounded_traversal`, `aggregate_graph_adversarial.rs::n_sql_graph_table_forms`, `lang/tests/gql_patterns.rs` | GQL's own `Expand`/`ExpandInto` (`core/engine/src/query/gql/`), not the SQL/PGQ `BfsRequest` driver |
 | inline `WHERE` in element, edge (`-[r:t WHERE r.p > v]->`) | T1 | `sql_tier1.rs::graph_table_inline_edge_where_compiles_to_a_per_hop_prune`, `sql_explain.rs::explain_prints_the_edge_predicates_and_the_node_membership_sets` (`#[ignore]`, needs M3-B for its ranking half), `lang/tests/gql_explain.rs` (`edge filter, per edge: (...)`) | per-hop edge predicate, evaluated over the edge's own bag |
-| inline `WHERE` in element, far node -- ANY pure expression, including `IS NULL`, a text search or a spatial predicate the row must be read for | T1 for the M2/M3-C expression pack; T2 (M6, `host function`) for `ST_*`/`to_tsvector`/`to_tsquery`/`bm25` | `sql_tier1.rs::graph_table_inline_node_where_compiles_to_a_membership_prune`, `::a_text_search_inline_node_predicate_is_refused_naming_its_milestone`, `aggregate_graph_adversarial.rs::n_sql_graph_table_forms`, `lang/tests/gql_explain.rs` (`far filter, per far node: (...)`) | a per-hop predicate is an ordinary pure expression over the bound row (`docs/LAYERS.md`: "lang may evaluate pure expressions over values core has already handed it"), never restricted to what an index posting answers without a row read -- the removed body's stricter rule (graph contract 4.3, "never reads a row for a predicate on a covered field") does not carry over |
+| inline `WHERE` in element, far node -- ANY pure expression, including `IS NULL`, a text search or a spatial predicate the row must be read for | T1 for the M2/M3-C expression pack and, since M6-A, the host forms (`to_tsvector(...) @@ to_tsquery(...)`, `bm25`, `ST_DWithin`/`ST_Intersects`/`ST_Within`/`ST_Contains`, `ST_Distance`, `<->`/`<=>`/`<#>`) | `sql_tier1.rs::graph_table_inline_node_where_compiles_to_a_membership_prune`, `::a_text_search_inline_node_predicate_matches_what_sql_matches`, `lang/tests/gql_host.rs`, `aggregate_graph_adversarial.rs::n_sql_graph_table_forms`, `lang/tests/gql_explain.rs` (`far filter, per far node: (...)`) | a per-hop predicate is an ordinary pure expression over the bound row (`docs/LAYERS.md`: "lang may evaluate pure expressions over values core has already handed it"), never restricted to what an index posting answers without a row read -- the removed body's stricter rule (graph contract 4.3, "never reads a row for a predicate on a covered field") does not carry over |
 | `RETURN r.<prop> AS name` (the reaching edge's own property) | T1 | `lang/tests/gql_patterns.rs`, `sql_tier1.rs::an_edge_variable_is_matched_without_case`, `aggregate_graph_adversarial.rs::k_reaching_edge_equals_bag_first_admitted_across_types` | the reaching edge, bound by the traversal (graph contract 4.2); a variable is matched WITHOUT case, as every unquoted name in this dialect is (`lang/src/gql/schema.rs`) |
 | `RETURN <expr> AS name` over ANY bound pattern variable, including the pattern's SEED | T1 | `lang/tests/gql_patterns.rs`, `dist/rust/tests/readme_correctness.rs::graph_hops_directions_and_depths` | every bound variable projects (design M2), unlike the removed body, whose match row carried only the far node and the edge and refused a `COLUMNS` entry over the starting node by name |
 | `ORDER BY <edge property>`, over a RETURNed edge column | T1 (the `RETURN` stage's own `ORDER BY`/`LIMIT`) | `sql_tier1.rs::graph_table_return_projects_the_reaching_edge_and_order_by_it` | the engine atomic (`QueryOrder::Edge`) is T1 and reachable directly (`aggregate_graph_adversarial.rs::l_edge_order_missing_text_last_paged_refuses_entities_keys`); the GQL surface for it waits on the stage grammar |
@@ -377,6 +377,12 @@ M2-E (owner decision 1) removed the SQL/PGQ `GRAPH_TABLE (g MATCH ... COLUMNS (.
 | `CALL (imports) { stage }` | T1 | `lang/tests/gql_call.rs` | one `CallApply`: per input row the body (one stage, seeing only its imports; `()` imports nothing) runs, and each row its `RETURN` gives extends the input row -- an inner join, so a body that gives no row drops it. `OPTIONAL CALL` and `NEXT` inside a body are P1 rows; a bare `CALL { }` names the import list |
 | `<stage> UNION [ALL \| DISTINCT] <stage>` inside the body | T1 | `lang/tests/gql_union.rs` | branches return the same columns by name and order (a count mismatch is `42601`, a name or type mismatch `42804`); mixing `UNION` and `UNION ALL` in one chain is a P1 row |
 | `OPTIONAL MATCH p1, p2, ...` (comma patterns, optional together) | T1 | `lang/tests/gql_optional.rs` | ISO's block form `OPTIONAL { ... }` is a P1 row |
+| host forms inside a GQL body: `to_tsvector('simple', n.f) @@ to_tsquery('simple', q)`, `bm25(n.f, q)`, `ST_DWithin`, `ST_Intersects`, `ST_Within`, `ST_Contains`, `ST_Distance`, `<->`, `<=>`, `<#>`, `x::vector` | T1 | `lang/tests/gql_host.rs` | one spelling with SQL: the argument shapes and the unit rules of §4.4 are the SQL parser's own. A text form reads the node's READY text index -- a label without one is refused naming the index to create, never re-tokenized (Q27); a spatial or vector form is pure over the values read; a vector width mismatch is `22000`; `<->` is Euclidean, `<=>` `1 - cos`, `<#>` the negative inner product |
+| a seed node's conjuncts answered by indexes | T1 | `lang/tests/gql_host.rs` (`every_index_answered_conjunct_seeds_the_node`) | every conjunct a READY index of the node's one label collection answers exactly -- scalar, text, point (ST_DWithin to a point, ST_Within an envelope), geometry -- becomes one seed, intersected by the engine; each value is read when the execution opens |
+| a later `FILTER`, or the outer `SELECT`'s `WHERE`, over columns that ARE the seed node or its property (index lineage) | T1 | `lang/tests/gql_host.rs` (`a_later_conjunct_moves_into_the_seed_by_lineage`, `nothing_moves_*`) | the conjunct moves into the seed when an index answers it exactly and only per-row streaming operators lie between; never past a sort, a page, a DISTINCT, a grouping, a selector, a CALL or a UNION, and never out of an EXISTS, CALL or UNION body. EXPLAIN says `moved from ... by lineage` |
+| `ORDER BY n.v <-> q` or `<#> q` of the seed node, with a `LIMIT` | T1 | `lang/tests/gql_host.rs` (`a_top_k_by_distance_*`, `only_an_order_*`) | the seed is read in the exact vector index's order and the sort stops at the first row strictly worse than the worst it keeps -- the full sort's answer. Only over a NOT NULL column (the index holds no row without a vector), ascending, and not for `<=>` (the index skips an all-zero vector the expression gives NULL for); anything else is scanned and sorted, exactly |
+| `SET LOCAL ef_search` and a GQL vector order | T1 | `lang/tests/gql_host.rs` (`ef_search_is_read_when_the_execution_opens`) | exact unless the transaction set `ef_search`; then, when the column also has a vamana or quantized index, APPROXIMATE with that shortlist, and EXPLAIN says so. Read when the execution OPENS, so one prepared plan follows the transaction it runs in (GQL profile Q29) |
+| `search(n.f, q)`, `search_score()` inside a GQL body | T2, P1 | `lang/tests/gql_parse.rs` | refused by name (design Q30); the typo-tolerant form is SQL's in P0 |
 | `COLUMNS (...)`, the removed SQL/PGQ projection | T3, not adopted | `lang/tests/gql_parse.rs::a_columns_body_is_refused_by_name_naming_return` | `GRAPH_TABLE` projects with `RETURN`; there is no compatibility alias |
 | a three-part name (`x.y.z`) inside a GQL body | syntax error naming the construct | `lang/tests/gql_parse.rs::a_property_reference_is_one_variable_and_one_property` | a property reference is one variable and one property; the removed body's separate "element name that belongs to another element" refusal does not carry over -- GQL's binder places an inline predicate wherever its variables are bound, so a forward reference across a pattern is accepted rather than refused (M4-A design: "the FIRST line position where everything it names is bound") |
 
@@ -1332,9 +1338,24 @@ SELECT * FROM GRAPH_TABLE (base MATCH SIMPLE (a:place WHERE a._key = 'p000')-[:n
 SELECT * FROM GRAPH_TABLE (base MATCH p = ANY SHORTEST (a:place WHERE a._key = 'p000')-[:near]->{1,4}(b:place) RETURN b._key AS k, PATH_LENGTH(p) AS d)
 ```
 
-```sql refused
--- refused 0A000: to_tsvector/to_tsquery are GQL profile M6 host functions
+```sql
+-- a text match on the far node reads its text index, as SQL does
 SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'p000')-[:near]->(b:place WHERE to_tsvector('simple', b.body) @@ to_tsquery('simple', 'garden')) RETURN b._key AS k)
+```
+
+```sql
+-- text and radius seed the pattern through their indexes; the top 5 by vector distance come in the exact index's order
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE to_tsvector('simple', a.body) @@ to_tsquery('simple', 'garden') AND ST_DWithin(a.loc, ST_MakePoint(106.82, -6.17)::geography, 50000)) RETURN a._key AS k, a.emb <-> '[1,0,0,0]'::vector AS d ORDER BY d LIMIT 5)
+```
+
+```sql refused
+-- refused 0A000: a text match needs a READY text index on the field, never a re-tokenized row
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE to_tsvector('simple', a.name) @@ to_tsquery('simple', 'garden')) RETURN a._key AS k)
+```
+
+```sql refused
+-- refused 0A000: search() inside a GQL body is a P1 construct
+SELECT * FROM GRAPH_TABLE (base MATCH (a:place) WHERE search(a.body, 'garden') RETURN a._key AS k)
 ```
 
 ### 8.5 Spatial (§4.4)
