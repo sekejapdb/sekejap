@@ -487,11 +487,12 @@ fn casts_to_the_declared_types() {
     // A cast with no meaning between the two kinds is an error naming both.
     let error = raises(&db, "i1", "1.5::boolean");
     assert!(error.contains("boolean"), "{error}");
-    // A type the pack does not cast to is refused when the text is compiled.
+    // A geometry is not a value of its own: it is refused when the text is
+    // compiled, naming the forms that take a shape (M6-A).
     let error = run_with(&db, "MATCH (a IS item) RETURN a.name::geometry AS v", &[])
         .unwrap_err()
         .to_string();
-    assert!(error.contains("M6"), "{error}");
+    assert!(error.contains("not a value of its own") && error.contains("ST_DWithin"), "{error}");
 }
 
 // ── strings ───────────────────────────────────────────────────────────────

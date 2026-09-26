@@ -1763,28 +1763,45 @@ fn graph_table_return_projects_the_reaching_edge_and_order_by_it() {
 /// of this test is DELETED, not converted: the property it pinned (an
 /// index-answerable-only inline predicate) does not hold for GQL.
 ///
-/// A text search is still refused inline, but for a different reason: the
-/// GQL M2/M3-C expression pack does not have `to_tsvector`/`to_tsquery` yet
-/// (GQL profile M6, "host function"), so the case that remains is converted
-/// to that refusal.
+/// A text search inline on a node was refused until the GQL host forms
+/// (M6-A): it is now answered through the node's text index, the same index
+/// the SQL statement reads, so the reached neighbours it keeps are exactly
+/// the neighbours SQL's own `@@` matches.
 #[test]
-fn a_text_search_inline_node_predicate_is_refused_naming_its_milestone() {
+fn a_text_search_inline_node_predicate_matches_what_sql_matches() {
     let (_dir, mut f) = open();
     let _ = weighted_graph(&mut f);
-    let error = f
-        .db
-        .sql(
-            "SELECT * FROM GRAPH_TABLE (routes MATCH \
-                (a IS place WHERE a._key = 'k00000')-[r:weighted]->\
-                (b IS place WHERE to_tsvector('simple', b.text) @@ to_tsquery('simple', 'harbour')) \
-                RETURN b._key AS k)",
-            &[],
-        )
-        .unwrap_err();
-    let text = format!("{error}");
-    assert!(text.contains("refused"), "{text}");
-    assert!(text.contains("host function"), "{text}");
-    assert!(text.contains("M6"), "{text}");
+    let keys = |f: &mut fixture::Fixture, sql: &str| -> std::collections::BTreeSet<String> {
+        let SqlResult::Rows { rows, .. } = f.db.sql(sql, &[]).unwrap() else {
+            panic!("`{sql}` gave no rows");
+        };
+        rows.into_iter()
+            .map(|row| match &row.values[0] {
+                SqlValue::Text(key) => key.clone(),
+                other => panic!("a key, not {other:?}"),
+            })
+            .collect()
+    };
+    let reached = keys(
+        &mut f,
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            (a IS place WHERE a._key = 'k00000')-[r:weighted]->(b IS place) \
+            RETURN b._key AS k)",
+    );
+    let matching = keys(
+        &mut f,
+        "SELECT _key FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'harbour')",
+    );
+    let kept = keys(
+        &mut f,
+        "SELECT * FROM GRAPH_TABLE (routes MATCH \
+            (a IS place WHERE a._key = 'k00000')-[r:weighted]->\
+            (b IS place WHERE to_tsvector('simple', b.text) @@ to_tsquery('simple', 'harbour')) \
+            RETURN b._key AS k)",
+    );
+    assert!(!reached.is_empty(), "the walk reaches someone");
+    let expected: std::collections::BTreeSet<String> = reached.intersection(&matching).cloned().collect();
+    assert_eq!(kept, expected);
 }
 
 /// D1 in the SQL surface: a `_key` predicate beside a traversal that reads

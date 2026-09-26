@@ -13,7 +13,12 @@
 //! * deep backward cause chains with an anti-join -- `{1,8}` backwards and
 //!   `NOT EXISTS` (`every_incident_traces_back_to_its_root_causes`);
 //! * optional evidence keeps the node -- `OPTIONAL MATCH` + `COUNT`
-//!   (`every_site_is_kept_with_its_good_reviews_counted`).
+//!   (`every_site_is_kept_with_its_good_reviews_counted`);
+//! * (M6-J) hybrid top-k, then deep backward cause chains, an anti-join and
+//!   two aggregations, as brief §9.5 writes it: text AND radius seeding the
+//!   incidents, read in exact vector order
+//!   (`hybrid_top_k_incidents_trace_back_to_their_root_causes`), and the M6
+//!   forms in combination with the M5 operators (`combination_m6_*`).
 //!
 //! Collaboration is stored as one edge per event, with its own identity:
 //! two events between one pair are two parallel edges, and an
@@ -26,7 +31,7 @@ use kernel::{
 };
 use sekejap_core::collections::{Database, EntityId, GraphContextId, QueryBudget};
 use sekejap_core::Kind;
-use sekejap_lang::{prepare_sql, Param, SqlResult, SqlRow, SqlValue};
+use sekejap_lang::{explain_sql, prepare_sql, Param, SqlDatabase, SqlResult, SqlRow, SqlValue};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use tempfile::TempDir;
@@ -88,6 +93,17 @@ const USEFUL_FOR: [(&str, &str); 4] = [
     ("first_aid", "dive_guide"),
 ];
 const INCIDENTS: [&str; 7] = ["reef_damage", "boat_anchor", "storm", "erosion", "footpath", "crowding", "tide"];
+/// Each incident's `(body, lon, lat, embedding, realm)`, M6-J's hybrid first
+/// stage reads them (brief §9.5).
+const INCIDENT_ROWS: [(&str, f64, f64, [f32; 3], &str); 7] = [
+    ("reef damage near uluwatu", 115.0849, -8.8291, [1.0, 0.0, 0.0], "sea"),
+    ("boat anchor dragged over the reef", 115.10, -8.80, [0.9, 0.1, 0.0], "sea"),
+    ("storm swell from the south", 115.60, -8.40, [0.5, 0.5, 0.0], "sea"),
+    ("beach erosion at seminyak", 115.158, -8.691, [0.0, 1.0, 0.0], "land"),
+    ("footpath across the dunes", 115.16, -8.70, [0.0, 0.9, 0.1], "land"),
+    ("crowding at the beach", 115.17, -8.71, [0.0, 0.5, 0.5], "land"),
+    ("king tide", 115.30, -8.95, [0.3, 0.0, 0.7], "sea"),
+];
 /// cause -causes-> effect: two chains that share a root
 const CAUSES: [(&str, &str); 6] = [
     ("boat_anchor", "reef_damage"),
@@ -121,7 +137,39 @@ fn fixture(dir: &TempDir) -> Database {
     coll(&mut db, "dance", &DANCES, &mut ids);
     coll(&mut db, "skill", &SKILLS, &mut ids);
     coll(&mut db, "job", &JOBS, &mut ids);
-    coll(&mut db, "incident", &INCIDENTS, &mut ids);
+    // The incidents carry the hybrid fields, with the indexes that seed them.
+    db.sql(
+        "CREATE TABLE incident (name TEXT, body TEXT, loc GEOMETRY(Point,4326), emb VECTOR(3) NOT NULL, realm TEXT) \
+         WITH (index: none)",
+        &[],
+    )
+    .unwrap();
+    for (key, (body, lon, lat, emb, realm)) in INCIDENTS.iter().zip(INCIDENT_ROWS) {
+        db.sql(
+            "INSERT INTO incident (_key, name, body, loc, emb, realm) VALUES ($1, $1, $2, $3, $4, $5)",
+            &[
+                Param::Text((*key).into()),
+                Param::Text(body.into()),
+                Param::Text(format!(r#"{{"type":"Point","coordinates":[{lon:?},{lat:?}]}}"#)),
+                Param::Vector(emb.to_vec()),
+                Param::Text(realm.into()),
+            ],
+        )
+        .unwrap();
+    }
+    db.sql("COMMIT", &[]).unwrap();
+    for ddl in [
+        "CREATE INDEX incident_body ON incident USING gin (to_tsvector('simple', body))",
+        "CREATE INDEX incident_loc ON incident USING gist (loc)",
+        "CREATE INDEX incident_emb ON incident USING exact (emb)",
+        "CREATE INDEX incident_realm ON incident USING btree (realm)",
+    ] {
+        db.sql(ddl, &[]).unwrap();
+    }
+    let incident = db.collection("incident").unwrap().unwrap();
+    for key in INCIDENTS {
+        ids.insert(key.to_owned(), db.get(incident, key).unwrap().unwrap().id);
+    }
     coll(&mut db, "site", &SITES, &mut ids);
     let review = db
         .create_collection("review", vec![("stars".to_owned(), Kind::Int)], Default::default())
@@ -284,24 +332,128 @@ fn every_incident_traces_back_to_its_root_causes() {
     );
     let mut expected = BTreeSet::new();
     for seed in seeds {
-        let mut ancestors: BTreeSet<&str> = BTreeSet::new();
-        let mut frontier = vec![seed];
-        for _ in 0..8 {
-            let next: Vec<&str> = CAUSES
-                .iter()
-                .filter(|(_, effect)| frontier.contains(effect))
-                .map(|(cause, _)| *cause)
-                .collect();
-            ancestors.extend(next.iter().copied());
-            frontier = next;
-        }
-        for cause in ancestors {
-            if !CAUSES.iter().any(|(_, effect)| *effect == cause) {
-                expected.insert(row(&[seed, cause]));
-            }
+        for cause in root_causes(seed) {
+            expected.insert(row(&[seed, cause]));
         }
     }
     assert_eq!(got, expected);
+}
+
+/// The causes of `effect` up to eight hops back that nothing causes.
+fn root_causes(effect: &str) -> BTreeSet<&'static str> {
+    let mut ancestors: BTreeSet<&str> = BTreeSet::new();
+    let mut frontier = vec![effect];
+    for _ in 0..8 {
+        let next: Vec<&str> = CAUSES
+            .iter()
+            .filter(|(_, effect)| frontier.contains(effect))
+            .map(|(cause, _)| *cause)
+            .collect();
+        ancestors.extend(next.iter().copied());
+        frontier = next;
+    }
+    ancestors
+        .into_iter()
+        .filter(|cause| !CAUSES.iter().any(|(_, effect)| effect == cause))
+        .collect()
+}
+
+/// Great-circle metres on a sphere of the WGS84 mean radius: the oracle's
+/// radius test, used only where every incident is kilometres from the edge.
+fn haversine_m((lon1, lat1): (f64, f64), (lon2, lat2): (f64, f64)) -> f64 {
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let (dp, dl) = ((lat2 - lat1).to_radians(), (lon2 - lon1).to_radians());
+    let a = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+    2.0 * 6_371_008.8 * a.sqrt().asin()
+}
+
+/// Brief §9.5 as written (M6-J): the top `k` incidents that match any of
+/// `words`, lie within `metres` of `centre`, ranked by L2 distance to
+/// `query`; then each one's root causes up to eight hops back, counted and
+/// the first named.
+fn hybrid_oracle(
+    words: &[&str],
+    centre: (f64, f64),
+    metres: f64,
+    query: [f32; 3],
+    k: usize,
+) -> BTreeSet<Vec<String>> {
+    let mut candidates: Vec<(f64, &str)> = INCIDENTS
+        .iter()
+        .zip(INCIDENT_ROWS)
+        .filter(|(_, (body, ..))| body.split(' ').any(|word| words.contains(&word)))
+        .filter(|(_, (_, lon, lat, ..))| {
+            let d = haversine_m(centre, (*lon, *lat));
+            assert!((d - metres).abs() > 1000.0, "an incident {d} m away is too close to the radius");
+            d <= metres
+        })
+        .map(|(key, (_, _, _, emb, _))| {
+            let squared: f64 = emb.iter().zip(query).map(|(a, b)| f64::from(a - b).powi(2)).sum();
+            (squared.sqrt(), *key)
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)));
+    candidates
+        .into_iter()
+        .take(k)
+        .filter_map(|(_, key)| {
+            let roots = root_causes(key);
+            let first = roots.iter().next()?;
+            Some(row(&[key, &roots.len().to_string(), first]))
+        })
+        .collect()
+}
+
+/// The hybrid body of brief §9.5, `$1` the words, `$2 $3` the centre, `$4`
+/// the radius, `$5` the query vector, `$6` the k.
+const HYBRID: &str = "MATCH (i IS incident WHERE to_tsvector('simple', i.body) @@ to_tsquery('simple', $1) \
+                      AND ST_DWithin(i.loc, ST_MakePoint($2, $3)::geography, $4)) \
+                      RETURN i, i.emb <-> $5::vector AS d ORDER BY d, i._key LIMIT $6 \
+                      NEXT MATCH (i)<-[:causes]-{1,8}(c IS incident) \
+                      FILTER NOT EXISTS { MATCH (c)<-[:causes]-(x) } \
+                      RETURN i._key AS incident, COUNT(DISTINCT c) AS roots, MIN(c._key) AS first_root";
+
+#[test]
+fn hybrid_top_k_incidents_trace_back_to_their_root_causes() {
+    let dir = TempDir::new().unwrap();
+    let db = fixture(&dir);
+    let centre = (115.17, -8.72);
+    for (words, query, k) in [
+        ("reef | erosion", [1.0f32, 0.0, 0.0], 2i64),
+        ("reef | erosion", [1.0, 0.0, 0.0], 3),
+        ("reef | erosion", [0.0, 1.0, 0.0], 1),
+        ("tide | storm | crowding", [0.0, 0.0, 1.0], 5),
+    ] {
+        let params = [
+            Param::Text(words.into()),
+            Param::Float(centre.0),
+            Param::Float(centre.1),
+            Param::Int(20_000),
+            Param::Vector(query.to_vec()),
+            Param::Int(k),
+        ];
+        let split: Vec<&str> = words.split(" | ").collect();
+        let expected = hybrid_oracle(&split, centre, 20_000.0, query, k as usize);
+        combo(&db, HYBRID, &params, expected);
+    }
+    // The first stage is ONE seed: text and radius through their indexes,
+    // read in the exact vector index's order, and the sort stops early.
+    let plan = explain_sql(
+        &db,
+        &format!("SELECT * FROM GRAPH_TABLE (base {HYBRID})"),
+        &[
+            Param::Text("reef".into()),
+            Param::Float(115.17),
+            Param::Float(-8.72),
+            Param::Int(20_000),
+            Param::Vector(vec![1.0, 0.0, 0.0]),
+            Param::Int(2),
+        ],
+    )
+    .unwrap();
+    for part in ["`incident_body`", "`incident_loc`", "`incident_emb` (ordered by", "stops at the first row past"] {
+        assert!(plan.contains(part), "{part} not in:\n{plan}");
+    }
 }
 
 #[test]
@@ -526,6 +678,86 @@ fn combination_not_exists_mark_beside_a_call() {
          CALL (d) { MATCH (d)-[:performs]->(k IS dance) RETURN COUNT(*) AS dances } \
          RETURN d._key AS dancer, dances, \
                 NOT EXISTS { MATCH (d)-[:member_of]->(t IS troupe WHERE t._key = 'troupe_a') } AS outsider",
+        &[],
+        expected,
+    );
+}
+
+// ── M6 features in combination ───────────────────────────────────────────
+
+fn incident_row(key: &str) -> (&'static str, f64, f64, [f32; 3], &'static str) {
+    INCIDENT_ROWS[INCIDENTS.iter().position(|k| *k == key).unwrap()]
+}
+
+#[test]
+fn combination_m6_lineage_moved_filter_before_a_call() {
+    let dir = TempDir::new().unwrap();
+    let db = fixture(&dir);
+    let body = "MATCH (i IS incident) RETURN i AS i NEXT FILTER i.realm = 'land' \
+                CALL (i) { MATCH (i)<-[:causes]-(c IS incident) RETURN COUNT(*) AS direct } \
+                RETURN i._key AS incident, direct";
+    let expected = INCIDENTS
+        .iter()
+        .filter(|key| incident_row(key).4 == "land")
+        .map(|key| {
+            let direct = CAUSES.iter().filter(|(_, effect)| effect == key).count();
+            row(&[key, &direct.to_string()])
+        })
+        .collect();
+    combo(&db, body, &[], expected);
+    let plan = explain_sql(&db, &format!("SELECT * FROM GRAPH_TABLE (base {body})"), &[]).unwrap();
+    assert!(plan.contains("moved from FILTER by lineage"), "{plan}");
+}
+
+#[test]
+fn combination_m6_text_match_on_a_far_node_inside_exists() {
+    let dir = TempDir::new().unwrap();
+    let db = fixture(&dir);
+    let expected = INCIDENTS
+        .iter()
+        .filter(|key| {
+            CAUSES
+                .iter()
+                .any(|(cause, effect)| effect == *key && incident_row(cause).0.split(' ').any(|w| w == "storm"))
+        })
+        .map(|key| row(&[key]))
+        .collect();
+    combo(
+        &db,
+        "MATCH (i IS incident) WHERE EXISTS { MATCH (i)<-[:causes]-(c IS incident \
+         WHERE to_tsvector('simple', c.body) @@ to_tsquery('simple', 'storm')) } RETURN i._key AS incident",
+        &[],
+        expected,
+    );
+}
+
+#[test]
+fn combination_m6_spatial_seed_optional_match_and_union() {
+    let dir = TempDir::new().unwrap();
+    let db = fixture(&dir);
+    let centre = (115.17, -8.72);
+    let near = |key: &str| {
+        let (_, lon, lat, ..) = incident_row(key);
+        let d = haversine_m(centre, (lon, lat));
+        assert!((d - 5000.0).abs() > 1000.0, "{key} is {d} m away, too close to the radius");
+        d <= 5000.0
+    };
+    let mut expected = BTreeSet::new();
+    for key in INCIDENTS.iter().filter(|key| near(key) || incident_row(key).4 == "sea") {
+        let causes: Vec<&str> = CAUSES.iter().filter(|(_, e)| e == key).map(|(c, _)| *c).collect();
+        if causes.is_empty() {
+            expected.insert(row(&[key, "NULL"]));
+        }
+        for cause in causes {
+            expected.insert(row(&[key, cause]));
+        }
+    }
+    combo(
+        &db,
+        "MATCH (i IS incident WHERE ST_DWithin(i.loc, ST_MakePoint(115.17, -8.72)::geography, 5000)) \
+         OPTIONAL MATCH (i)<-[:causes]-(c IS incident) RETURN i._key AS incident, c._key AS cause \
+         UNION MATCH (i IS incident WHERE i.realm = 'sea') \
+         OPTIONAL MATCH (i)<-[:causes]-(c IS incident) RETURN i._key AS incident, c._key AS cause",
         &[],
         expected,
     );

@@ -123,12 +123,9 @@ fn a_variable_or_property_named_columns_is_not_the_removed_body() {
 /// Every construct the profile will build later, written where a statement
 /// puts it, with the keyword and the milestone its refusal must name.
 const REFUSED: &[(&str, &str, &str)] = &[
-    // M6: host functions inside the body
-    ("MATCH (a) WHERE st_dwithin(a.g, $1, 10) RETURN a.y AS y", "host function", "M6"),
-    ("MATCH (a) RETURN to_tsvector(a.y) AS n", "host function", "M6"),
-    ("MATCH (a) RETURN a.v::vector AS n", "host function", "M6"),
-    ("MATCH (a) RETURN cast(a.g AS geometry) AS n", "host function", "M6"),
     // P1: after the P0 release
+    ("MATCH (a) WHERE search(a.y, 'kuta') RETURN a.y AS y", "search()", "P1"),
+    ("MATCH (a) RETURN search_score() AS s", "search()", "P1"),
     (
         "OPTIONAL { MATCH (a)-[e]->(b) } RETURN b.y AS y",
         "OPTIONAL block",

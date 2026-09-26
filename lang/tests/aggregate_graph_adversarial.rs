@@ -3278,20 +3278,35 @@ fn n_sql_graph_table_forms() {
             Ok(SqlResult::Rows { .. }) => {}
             other => panic!("node eq: {other:?}"),
         }
-        // The spatial radius form is GQL profile M6 (host functions),
-        // which is not built: it is refused naming that milestone rather
-        // than answering.
-        let radius = format!(
-            "SELECT * FROM GRAPH_TABLE (base MATCH \
-                (a IS person WHERE a._key = '{seed_key}')-[r:knows]->\
-                (b IS person WHERE ST_DWithin(b.loc, ST_SetSRID(ST_MakePoint({lon:?},{lat:?}),4326)::geography, {RADIUS_METRES}, true)) \
-                RETURN b._key AS k)"
+        // The spatial radius form (GQL profile M6-A) is answered on the far
+        // node, per hop, and keeps exactly the rows the same predicate keeps
+        // written as a FILTER after the pattern.
+        let within = format!(
+            "ST_DWithin(b.loc, ST_SetSRID(ST_MakePoint({lon:?},{lat:?}),4326)::geography, {RADIUS_METRES}, true)"
         );
-        let err = f.db.sql(&radius, &[]).unwrap_err();
-        let text = format!("{err}");
-        assert!(text.contains("refused"), "node radius: {text}");
-        assert!(text.contains("host function"), "node radius: {text}");
-        assert!(text.contains("M6"), "node radius: {text}");
+        let keys_of = |f: &mut Fixture, sql: &str| -> std::collections::BTreeSet<String> {
+            match f.db.sql(sql, &[]) {
+                Ok(SqlResult::Rows { rows, .. }) => rows.into_iter().map(|row| format!("{:?}", row.values)).collect(),
+                other => panic!("node radius `{sql}`: {other:?}"),
+            }
+        };
+        let inline = keys_of(
+            f,
+            &format!(
+                "SELECT * FROM GRAPH_TABLE (base MATCH \
+                    (a IS person WHERE a._key = '{seed_key}')-[r:knows]->(b IS person WHERE {within}) \
+                    RETURN b._key AS k)"
+            ),
+        );
+        let filtered = keys_of(
+            f,
+            &format!(
+                "SELECT * FROM GRAPH_TABLE (base MATCH \
+                    (a IS person WHERE a._key = '{seed_key}')-[r:knows]->(b IS person) FILTER {within} \
+                    RETURN b._key AS k)"
+            ),
+        );
+        assert_eq!(inline, filtered, "node radius");
 
         // An aliased edge property projects fine. The top-K selection the
         // legacy test used (`ORDER BY t DESC LIMIT 5`) is GQL profile M3-B
