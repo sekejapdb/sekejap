@@ -41,7 +41,6 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("WITH", Tier::Two, "QL_CONTRACT §2: a non-recursive WITH is materialised once, bounded by QueryBudget rows; WITH RECURSIVE is Tier 3 (recursion is a GRAPH_TABLE pattern)."),
     ("OVER", Tier::Three, "QL_CONTRACT §2 and §4.7: window functions have no atomic."),
     ("CREATE VIEW", Tier::Three, "QL_CONTRACT §2: a user view has no atomic."),
-    ("CREATE PROPERTY GRAPH", Tier::Two, "QL_CONTRACT §2: CREATE PROPERTY GRAPH optionally names a context and a label map; nothing is built. Not in this slice."),
     ("CREATE TRIGGER", Tier::Three, "QL_CONTRACT §2: triggers have no atomic."),
     ("DECLARE", Tier::Two, "QL_CONTRACT §2: DECLARE ... BINARY CURSOR / FETCH FORWARD / CLOSE are pages over prepare_query (p3-wire)."),
     ("FETCH", Tier::Two, "QL_CONTRACT §2: FETCH FORWARD n is a page over prepare_query (p3-wire)."),

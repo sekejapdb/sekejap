@@ -174,6 +174,10 @@ fn repeat(error: &QueryError) -> QueryError {
             Error::Corrupt(message) => Error::Corrupt(message.clone()),
             Error::Unsupported(message) => Error::Unsupported(message.clone()),
             Error::Cancelled => Error::Cancelled,
+            Error::Constraint { sqlstate, message } => Error::Constraint {
+                sqlstate,
+                message: message.clone(),
+            },
             Error::BudgetExceeded {
                 resource,
                 limit,

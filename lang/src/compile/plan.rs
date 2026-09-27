@@ -751,6 +751,40 @@ pub(crate) enum WritePlan {
         name: String,
         mode: DropMode,
     },
+    /// `CREATE TABLE` of an EDGE TABLE (`docs/core/EDGE_TABLES.md` §2.1):
+    /// the collection, then its declaration, in one statement.
+    CreateEdgeTable {
+        name: String,
+        fields: Vec<(String, Kind)>,
+        declared: Vec<(String, String)>,
+        rules: Vec<(String, ColumnRule)>,
+        /// Each REFERENCES column and the table it names.
+        references: Vec<(String, String)>,
+        key: Vec<String>,
+    },
+    /// `CREATE/ALTER PROPERTY GRAPH`: one `bind_edge_table` per edge table.
+    BindEdgeTables {
+        graph: String,
+        binds: Vec<(CollectionId, String, String, String)>,
+    },
+    DropPropertyGraph {
+        name: String,
+        if_exists: bool,
+    },
+    InsertEdges {
+        collection: CollectionId,
+        rows: Vec<Value>,
+        on_conflict: Option<sekejap_core::collections::OnConflict>,
+    },
+    UpdateEdges {
+        collection: CollectionId,
+        filter: Value,
+        patch: Value,
+    },
+    DeleteEdges {
+        collection: CollectionId,
+        filter: Value,
+    },
     Begin,
     Commit,
     Rollback,
@@ -764,7 +798,7 @@ pub(crate) enum WritePlan {
 /// One row field as a row expression reads it. `Missing` and `Null` are
 /// distinct in e4 and both are nullish to a row function, exactly as they are
 /// to a projected value.
-fn field_value(row: &Value, name: &str) -> SqlValue {
+pub(super) fn field_value(row: &Value, name: &str) -> SqlValue {
     match row.get(name) {
         None => SqlValue::Missing,
         Some(Value::Null) => SqlValue::Null,
@@ -833,6 +867,89 @@ impl WritePlan {
             SqlResult::Notice(all.join("; "))
         };
         Ok(match self {
+            Self::CreateEdgeTable {
+                name,
+                fields,
+                declared,
+                rules,
+                references,
+                key,
+            } => {
+                let (schema, table) = crate::split_table(&name);
+                let mut resolved = Vec::with_capacity(references.len());
+                for (column, target) in &references {
+                    let c = crate::find(db, target)?.ok_or_else(|| {
+                        SqlError::engine(format!("`{column}` REFERENCES {target}: no table named `{target}`"))
+                    })?;
+                    resolved.push((column.clone(), c));
+                }
+                let c = db.create_collection_in(
+                    schema,
+                    table,
+                    fields,
+                    declared,
+                    rules,
+                    CollectionOptions::default(),
+                )?;
+                db.declare_edge_table(c, resolved, key)?;
+                db.commit()?;
+                SqlResult::Affected(0)
+            }
+            Self::BindEdgeTables { graph, binds } => {
+                for (c, source, destination, label) in &binds {
+                    db.bind_edge_table(*c, source, destination, label, &graph)?;
+                }
+                db.commit()?;
+                notice(format!(
+                    "CREATE PROPERTY GRAPH {graph}: {} edge table(s) declared",
+                    binds.len()
+                ))
+            }
+            Self::DropPropertyGraph { name, if_exists } => {
+                let dropped = db.drop_property_graph(&name)?;
+                if dropped == 0 {
+                    if !if_exists {
+                        return Err(SqlError::coded(
+                            "42704",
+                            format!("property graph `{name}` does not exist"),
+                        ));
+                    }
+                    return Ok(notice(format!(
+                        "DROP PROPERTY GRAPH IF EXISTS {name}: no such property graph"
+                    )));
+                }
+                db.commit()?;
+                SqlResult::Affected(0)
+            }
+            Self::InsertEdges {
+                collection,
+                rows,
+                on_conflict,
+            } => {
+                let mut affected = 0u64;
+                for row in &rows {
+                    match &on_conflict {
+                        None => {
+                            db.insert_edge_row(collection, row)?;
+                            affected += 1;
+                        }
+                        Some(action) => {
+                            if db.upsert_edge_row(collection, row, action)?.is_some() {
+                                affected += 1;
+                            }
+                        }
+                    }
+                }
+                SqlResult::Affected(affected)
+            }
+            Self::UpdateEdges {
+                collection,
+                filter,
+                patch,
+            } => SqlResult::Affected(db.update_edge_rows(collection, &filter, &patch)? as u64),
+            Self::DeleteEdges { collection, filter } => {
+                SqlResult::Affected(db.delete_edge_rows(collection, &filter)? as u64)
+            }
             Self::Insert { collection, rows } => {
                 let mut affected = 0u64;
                 for (key, document) in rows {
@@ -1314,6 +1431,9 @@ pub(crate) enum Plan {
     /// (`docs/lang/GQL_PROFILE_DESIGN.md` §6.1), and its `EXPLAIN`.
     Gql(GqlSqlPlan),
     ExplainGql(GqlSqlPlan),
+    /// `SELECT ... FROM <edge table>`: one end's edges, read when the
+    /// statement runs (`docs/core/EDGE_TABLES.md` §5.1).
+    EdgeRows(super::edges::EdgeRowsPlan),
 }
 
 /// A compiled GQL statement and the parameters its next execution reads.

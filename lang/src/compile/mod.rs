@@ -82,6 +82,7 @@ pub(crate) use bind::{geom_with, tsquery_of};
 mod boolean;
 mod ddl;
 mod dml;
+pub(crate) mod edges;
 mod plan;
 mod predicates;
 mod row;
@@ -203,6 +204,14 @@ impl Compiler<'_> {
             // (`rows.rs`).
             Stmt::Gql(graph) => Plan::Gql(self.gql(&graph)?),
             Stmt::ExplainGql(graph) => Plan::ExplainGql(self.gql(&graph)?),
+            Stmt::Select(select) if self.edge_source(&select)?.is_some() => {
+                let (c, table, edge) = self.edge_source(&select)?.expect("checked by the guard");
+                Plan::EdgeRows(self.edge_select(c, &table, &edge, &select)?)
+            }
+            Stmt::Explain(select) if self.edge_source(&select)?.is_some() => {
+                let (c, table, edge) = self.edge_source(&select)?.expect("checked by the guard");
+                Plan::ExplainText(self.edge_select(c, &table, &edge, &select)?.render())
+            }
             Stmt::Select(select) => match Self::catalog_source(&select) {
                 Some(relation) => Plan::Rows(self.catalog_select(relation, *select, false)?),
                 None => match self.aggregate(&select)? {
@@ -224,7 +233,57 @@ impl Compiler<'_> {
                 table,
                 columns,
                 rows,
-            } => Plan::Write(self.insert(&table, &columns, &rows)?),
+                on_conflict,
+            } => match self.edge_table_of(&table)? {
+                Some((c, edge)) => {
+                    Plan::Write(self.insert_edges(c, &table, &edge, columns, &rows, on_conflict)?)
+                }
+                None => {
+                    if on_conflict.is_some() {
+                        return Err(SqlError::unsupported(
+                            "INSERT ... ON CONFLICT on a table of rows: `Database::put` replaces the row at a key, and a conditional write has no atomic; ON CONFLICT is an edge table's (docs/core/EDGE_TABLES.md §4.2)",
+                        ));
+                    }
+                    if columns.is_empty() {
+                        return Err(SqlError::unsupported(format!(
+                            "INSERT INTO {table} VALUES with no column list: name the columns, `_key` among them"
+                        )));
+                    }
+                    Plan::Write(self.insert(&table, &columns, &rows)?)
+                }
+            },
+            Stmt::Update { table, .. } | Stmt::Delete { table, .. }
+                if self.edge_table_of(&table)?.is_some() =>
+            {
+                return Err(SqlError::unsupported(format!(
+                    "`{table}` is an edge table and has no `_key`: name an end in the WHERE (docs/core/EDGE_TABLES.md §4)"
+                )));
+            }
+            Stmt::UpdateWhere {
+                table,
+                assignments,
+                predicates,
+            } if self.edge_table_of(&table)?.is_some() => {
+                let (c, edge) = self.edge_table_of(&table)?.expect("checked by the guard");
+                Plan::Write(self.update_edges(c, &table, &edge, &assignments, &predicates)?)
+            }
+            Stmt::DeleteWhere {
+                table: Some(table),
+                predicates,
+                cascade,
+            } if self.edge_table_of(&table)?.is_some() => {
+                let (c, edge) = self.edge_table_of(&table)?.expect("checked by the guard");
+                Plan::Write(self.delete_edges(c, &table, &edge, &predicates, cascade)?)
+            }
+            Stmt::PropertyGraph {
+                name,
+                alter,
+                vertex_tables,
+                edge_tables,
+            } => Plan::Write(self.property_graph(name, alter, vertex_tables, edge_tables)?),
+            Stmt::DropPropertyGraph { name, if_exists } => {
+                Plan::Write(WritePlan::DropPropertyGraph { name, if_exists })
+            }
             Stmt::Update {
                 table,
                 assignments,
@@ -251,9 +310,20 @@ impl Compiler<'_> {
             Stmt::CreateTable {
                 table,
                 columns,
+                primary_key,
+                if_not_exists,
+                indexes,
+                ..
+            } if !primary_key.is_empty() || columns.iter().any(|c| c.references.is_some()) => {
+                Plan::Write(self.create_edge_table(table, columns, primary_key, if_not_exists, &indexes)?)
+            }
+            Stmt::CreateTable {
+                table,
+                columns,
                 if_not_exists,
                 indexes,
                 automatic,
+                ..
             } => Plan::Write(self.create_table(
                 table,
                 columns,
@@ -342,6 +412,20 @@ impl Compiler<'_> {
     /// `parser/catalog.rs`, which is the value this engine actually has --
     /// `client_encoding` is `UTF8` because text is stored as UTF-8 and there
     /// is no other encoding, not because a `SET` said so.
+    /// The edge table a `SELECT`'s `FROM` names, if it names one.
+    fn edge_source(
+        &self,
+        select: &SelectStmt,
+    ) -> SqlResult2<Option<(CollectionId, String, sekejap_core::collections::EdgeTable)>> {
+        let Source::Table(table) = &select.source else {
+            return Ok(None);
+        };
+        if Self::catalog_source(select).is_some() {
+            return Ok(None);
+        }
+        Ok(self.edge_table_of(table)?.map(|(c, edge)| (c, table.clone(), edge)))
+    }
+
     fn set_guc(&mut self, name: &str, value: &str) -> WritePlan {
         match crate::parser::client_guc(name) {
             Some(have) => WritePlan::Notice(format!(

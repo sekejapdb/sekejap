@@ -223,7 +223,7 @@ impl Database {
     /// an INSERT that writes NULL on purpose keeps its NULL -- and is then
     /// refused if the column is NOT NULL. `now()` is read once for the row,
     /// so two `now()` columns of one row cannot disagree.
-    pub(super) fn apply_column_rules(&self, c: &Catalog, doc: &mut Value) -> Result<()> {
+    pub(crate) fn apply_column_rules(&self, c: &Catalog, doc: &mut Value) -> Result<()> {
         let mut now: Option<i64> = None;
         for (field, rule) in &c.rules {
             let Some(generator) = &rule.default else {

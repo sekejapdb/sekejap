@@ -246,6 +246,20 @@ impl Database {
         // Refuses a collection that is already DROPPING, which is what makes
         // "at most one drop in flight" true rather than hoped for.
         let mut c = self.catalog(id)?;
+        // An edge table names this collection as one end: dropping it would
+        // leave that table pointing at nothing (`docs/core/EDGE_TABLES.md`).
+        if let Some(table) = self.edge_table_referencing(id)? {
+            return Err(invalid(format!(
+                "`{}` cannot be dropped while edge table `{table}` references it",
+                c.name
+            )));
+        }
+        if c.edge.as_ref().is_some_and(|e| e.binding.is_some()) {
+            return Err(invalid(format!(
+                "`{}` is an edge table a property graph declared: dropping one is not supported yet; its edges stay under its label",
+                c.name
+            )));
+        }
         if let Some(other) = self.dropping {
             return Err(invalid(format!(
                 "collection {} is already DROPPING; finish it with drop_collection_step before starting another",

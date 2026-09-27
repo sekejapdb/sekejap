@@ -972,6 +972,9 @@ fn core_error(error: &CoreError) -> WireError {
                 .to_owned(),
         ),
         CoreError::Unsupported(what) => WireError::new(FEATURE_NOT_SUPPORTED, what.clone()),
+        // The data refused the write, with PostgreSQL's own SQLSTATE for it
+        // (23505, 23503, 23502): a client handles it as it would PostgreSQL's.
+        CoreError::Constraint { sqlstate, message } => WireError::new(sqlstate, message.clone()),
         CoreError::InvalidInput(what) => WireError::new(INVALID_PARAMETER, what.clone()),
         CoreError::Kernel(e) => {
             let text = e.to_string();

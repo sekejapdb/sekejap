@@ -308,13 +308,23 @@ impl std::error::Error for SqlError {}
 
 impl From<Error> for SqlError {
     fn from(value: Error) -> Self {
-        Self::Engine(value.to_string())
+        match value {
+            // The data refused the write with PostgreSQL's own SQLSTATE
+            // (23505, 23503, 23502), which a client reads as PostgreSQL's.
+            Error::Constraint { sqlstate, message } => Self::Coded { sqlstate, message },
+            other => Self::Engine(other.to_string()),
+        }
     }
 }
 
 impl From<QueryError> for SqlError {
     fn from(value: QueryError) -> Self {
-        Self::Engine(value.to_string())
+        match value {
+            QueryError::Database(Error::Constraint { sqlstate, message }) => {
+                Self::Coded { sqlstate, message }
+            }
+            other => Self::Engine(other.to_string()),
+        }
     }
 }
 
@@ -466,7 +476,8 @@ impl PreparedSql {
                 // in it is marked not rebindable and never reaches here.
                 compile::Plan::Write(_)
                 | compile::Plan::ExplainText(_)
-                | compile::Plan::Rows(_) => Ok(()),
+                | compile::Plan::Rows(_)
+                | compile::Plan::EdgeRows(_) => Ok(()),
             };
         }
         let statement = self.statement.clone().ok_or_else(|| {
@@ -504,6 +515,7 @@ impl PreparedSql {
                 &aggregate.columns
             }
             compile::Plan::Rows(rows) => &rows.columns,
+            compile::Plan::EdgeRows(edges) => &edges.columns,
             compile::Plan::Gql(gql) | compile::Plan::ExplainGql(gql) => gql.plan.columns(),
             _ => &[],
         }
@@ -549,7 +561,10 @@ impl PreparedSql {
 
     pub fn is_select(&self) -> bool {
         match &self.plan {
-            compile::Plan::Select(_) | compile::Plan::Aggregate(_) | compile::Plan::Gql(_) => true,
+            compile::Plan::Select(_)
+            | compile::Plan::Aggregate(_)
+            | compile::Plan::Gql(_)
+            | compile::Plan::EdgeRows(_) => true,
             // A catalog view, a `SHOW` and a `SELECT` with no `FROM` all
             // answer with rows; an `EXPLAIN` of one answers with its plan.
             compile::Plan::Rows(rows) => !rows.explain,
@@ -670,6 +685,14 @@ impl PreparedSql {
         // A catalog relation, `SHOW`, or the session rows: a bounded list
         // built at prepare (`docs/dist/PG_SURFACE.md`), handed out row by row.
         // There is no walk to charge and nothing to cancel between two rows.
+        if let compile::Plan::EdgeRows(edges) = &self.plan {
+            if let SqlResult::Rows { rows, .. } = edges.answer(db)? {
+                for row in &rows {
+                    body(row)?;
+                }
+            }
+            return Ok(());
+        }
         if let compile::Plan::Rows(rows) = &self.plan {
             if rows.explain {
                 return Err(SqlError::unsupported(
@@ -776,6 +799,7 @@ impl PreparedSql {
             )),
             compile::Plan::ExplainText(text) => Ok(SqlResult::Explain(text.clone())),
             compile::Plan::Gql(gql) => gql.answer(db),
+            compile::Plan::EdgeRows(edges) => edges.answer(db),
             compile::Plan::ExplainGql(gql) => Ok(SqlResult::Explain(explain::render_gql(
                 db,
                 gql,
@@ -1044,6 +1068,7 @@ impl SqlDatabase for Database {
                 Ok(SqlResult::Explain(text))
             }
             compile::Plan::Gql(gql) => gql.answer(self),
+            compile::Plan::EdgeRows(edges) => edges.answer(self),
             compile::Plan::ExplainGql(gql) => {
                 Ok(SqlResult::Explain(explain::render_gql(self, &gql, &notices)?))
             }

@@ -83,7 +83,7 @@ impl Cmp2 {
 /// either side NULL or MISSING. A comparison that is not comparable is
 /// FALSE, never an error and never a silent coercion: that is PostgreSQL's
 /// three-valued logic reduced to the two values a filter has.
-fn compare(left: &SqlValue, right: &SqlValue) -> Option<std::cmp::Ordering> {
+pub(super) fn compare(left: &SqlValue, right: &SqlValue) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     match (left, right) {
         (SqlValue::Null | SqlValue::Missing, _) | (_, SqlValue::Null | SqlValue::Missing) => None,
@@ -244,7 +244,7 @@ fn catalog_row_function(
 }
 
 /// One value, as an EXPLAIN line and a `SHOW CREATE TABLE` write it.
-fn shown(value: &SqlValue) -> String {
+pub(super) fn shown(value: &SqlValue) -> String {
     match value {
         SqlValue::Missing => "MISSING".into(),
         SqlValue::Null => "NULL".into(),

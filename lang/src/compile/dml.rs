@@ -92,7 +92,7 @@ impl Compiler<'_> {
     /// A `DATE` is midnight UTC of its day, so a literal that carries a time
     /// of day is REFUSED rather than silently truncated: a statement that
     /// wrote one meant a timestamp and the column is not one.
-    fn time_document_value(
+    pub(super) fn time_document_value(
         &self,
         literal: &Literal,
         column: &str,
@@ -124,7 +124,7 @@ impl Compiler<'_> {
         Ok(Value::from(micros))
     }
 
-    fn document_value(&self, kind: Kind, literal: &Literal, column: &str) -> SqlResult2<Value> {
+    pub(super) fn document_value(&self, kind: Kind, literal: &Literal, column: &str) -> SqlResult2<Value> {
         let value = self.value_of(literal)?;
         if value.is_null() {
             return Ok(Value::Null);

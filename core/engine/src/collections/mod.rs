@@ -40,6 +40,14 @@ pub enum Error {
         attempted: u64,
     },
     Kernel(kernel::Error),
+    /// A write the data refuses, with PostgreSQL's SQLSTATE for it:
+    /// `23505` (unique_violation) for a key that is already taken, `23503`
+    /// (foreign_key_violation) for an edge whose end names no row
+    /// (`docs/core/EDGE_TABLES.md` §4). Raised before anything is written.
+    Constraint {
+        sqlstate: &'static str,
+        message: String,
+    },
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -84,6 +92,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub(crate) fn invalid(e: impl fmt::Display) -> Error {
     Error::InvalidInput(e.to_string())
 }
+/// An edge table holds edges, never a row (`docs/core/EDGE_TABLES.md` §1.3).
+fn refuse_row_in_edge_table(c: &Catalog) -> Result<()> {
+    if c.edge.is_some() {
+        return Err(invalid(format!(
+            "`{}` is an edge table: it holds edges, written with `INSERT INTO {}`, never a row",
+            c.name, c.name
+        )));
+    }
+    Ok(())
+}
 pub(crate) fn corrupt(e: impl fmt::Display) -> Error {
     Error::Corrupt(e.to_string())
 }
@@ -108,6 +126,10 @@ pub use crate::index::graph::{
     BfsRequest, Cmp, Direction, Edge, EdgeBudget, EdgeId, EdgeKey, EdgePredicate, EdgeRef,
     EdgeShape, EdgeTypeId, GraphContextId, NeighborRequest, NewEdge, TraversalNode,
     TraversalResult, EDGE_ID_FEATURE,
+};
+pub use crate::index::graph::edge_table::{
+    EdgeBinding, EdgeTable, EdgeTableRow, OnConflict, EDGE_TABLE_FEATURE, FOREIGN_KEY_VIOLATION,
+    NOT_NULL_VIOLATION, UNIQUE_VIOLATION,
 };
 pub use crate::index::graph::adjacency::{AdjacencyCursor, AdjacentEdge, PausedAdjacency, Posting};
 pub use crate::index::graph::endpoints::{EndpointProgress, ENDPOINT_FEATURE};
@@ -273,6 +295,11 @@ pub(crate) struct Catalog {
     /// Recorded behind flag bit 4 ([`CATALOG_SCHEMA`]), behind
     /// [`SCHEMA_FEATURE`] at admission.
     pub(crate) schema: Option<String>,
+    /// `Some` for an EDGE TABLE (`docs/core/EDGE_TABLES.md`): its
+    /// `REFERENCES` columns, its key and, once a property graph declared it,
+    /// its binding. Recorded behind flag bit 5 ([`CATALOG_EDGE`]), behind
+    /// `EDGE_TABLE_FEATURE` at admission.
+    pub(crate) edge: Option<crate::index::graph::edge_table::EdgeTableRecord>,
     /// `Some` exactly while `begin_drop_collection` has published a DROPPING
     /// mark that `drop_collection_step` has not yet finished. It is the
     /// committed cursor of the drop: the phase it reached and how many
@@ -299,6 +326,10 @@ pub struct Database {
     failed: bool,
     sequence: Option<Sequence>,
     catalog_cache: RefCell<Option<Catalog>>,
+    /// Which edge types an edge table owns, built on the first untyped edge
+    /// write of a file that declares `EDGE_TABLE_FEATURE` and dropped on a
+    /// binding or a rollback (`index/graph/edge_table.rs`).
+    pub(crate) bound_edge_types: RefCell<Option<BTreeMap<EdgeTypeId, CollectionId>>>,
     layout_cache: RefCell<Option<Arc<Layout>>>,
     clock: Arc<dyn Clock>,
     pub(crate) limits: Option<ResourceLimits>,
@@ -765,6 +796,10 @@ pub(crate) use column_rules::CATALOG_RULES;
 /// refuses the record rather than reading the tail as part of the name. It
 /// is the second line behind [`SCHEMA_FEATURE`].
 pub(crate) const CATALOG_SCHEMA: u8 = 16;
+/// Bit 5 of the same frozen flags byte: the record carries an EDGE TABLE
+/// tail (`docs/core/EDGE_TABLES.md` §1). The second line behind
+/// `EDGE_TABLE_FEATURE`, for the reason [`CATALOG_SCHEMA`] is.
+pub(crate) const CATALOG_EDGE: u8 = 32;
 /// The collection header bit that says this database holds a NAMED SCHEMA:
 /// a schema record, or a catalog record with the [`CATALOG_SCHEMA`] tail.
 ///
@@ -797,14 +832,15 @@ fn catalog_bytes(c: &Catalog) -> Result<Vec<u8>> {
             | if c.drop.is_some() { CATALOG_DROPPING } else { 0 }
             | if c.declared.is_empty() { 0 } else { CATALOG_DECLARED }
             | if c.rules.is_empty() { 0 } else { CATALOG_RULES }
-            | if c.schema.is_none() { 0 } else { CATALOG_SCHEMA },
+            | if c.schema.is_none() { 0 } else { CATALOG_SCHEMA }
+            | if c.edge.is_none() { 0 } else { CATALOG_EDGE },
     );
     if let Some(d) = c.drop {
         b.push(d.phase.byte());
         b.push(d.mode.byte());
         b.extend_from_slice(&d.removed.to_be_bytes());
     }
-    if c.declared.is_empty() && c.rules.is_empty() && c.schema.is_none() {
+    if c.declared.is_empty() && c.rules.is_empty() && c.schema.is_none() && c.edge.is_none() {
         b.extend_from_slice(c.name.as_bytes());
     } else {
         // With a tail the name can no longer be "the rest of the packet", so
@@ -843,13 +879,18 @@ fn catalog_bytes(c: &Catalog) -> Result<Vec<u8>> {
             b.push(schema.len() as u8);
             b.extend_from_slice(schema.as_bytes());
         }
+        if let Some(edge) = &c.edge {
+            edge.encode(&mut b)?;
+        }
     }
     packet(CATALOG_MAGIC, &b)
 }
 fn parse_catalog(b: &[u8]) -> Result<Catalog> {
     let b = unpack(b, CATALOG_MAGIC)?;
     if b.len() < 10
-        || b[8] & !(1 | CATALOG_DROPPING | CATALOG_DECLARED | CATALOG_RULES | CATALOG_SCHEMA) != 0
+        || b[8]
+            & !(1 | CATALOG_DROPPING | CATALOG_DECLARED | CATALOG_RULES | CATALOG_SCHEMA | CATALOG_EDGE)
+            != 0
     {
         return Err(corrupt("catalog fields"));
     }
@@ -872,7 +913,8 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
     let mut declared = Vec::new();
     let mut rules = Vec::new();
     let mut schema = None;
-    let name = if b[8] & (CATALOG_DECLARED | CATALOG_RULES | CATALOG_SCHEMA) == 0 {
+    let mut edge = None;
+    let name = if b[8] & (CATALOG_DECLARED | CATALOG_RULES | CATALOG_SCHEMA | CATALOG_EDGE) == 0 {
         std::str::from_utf8(&b[at..]).map_err(corrupt)?.to_owned()
     } else {
         let mut read = |n: usize| -> Result<&[u8]> {
@@ -907,6 +949,11 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
             check_schema_name(&named).map_err(|_| corrupt("catalog schema tail"))?;
             schema = Some(named);
         }
+        if b[8] & CATALOG_EDGE != 0 {
+            edge = Some(crate::index::graph::edge_table::EdgeTableRecord::decode(|n| {
+                read(n).map(<[u8]>::to_vec)
+            })?);
+        }
         if at != b.len() {
             return Err(corrupt("catalog declared type tail"));
         }
@@ -924,6 +971,7 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
         declared,
         rules,
         schema,
+        edge,
     })
 }
 /// The kernel's own `E4LIMIT1` record: a damaged one is corruption, a valid
@@ -948,7 +996,9 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
 /// version 4); `0x20000` named schemas ([`SCHEMA_FEATURE`]); `0x40000`
 /// independent EDGE IDENTITY -- id-bearing edge keys and the edge-id
 /// allocator under tag `0x09` ([`crate::index::graph::EDGE_ID_FEATURE`]).
-/// The mask is therefore `0x7ffff`.
+/// `0x80000` EDGE TABLES -- the catalog's edge tail
+/// ([`crate::index::graph::edge_table::EDGE_TABLE_FEATURE`]).
+/// The mask is therefore `0xfffff`.
 /// Every one is additive: set in the same transaction as the first record
 /// that uses it, never cleared, and a file that declares a bit outside this
 /// mask is refused as `Unsupported` at admission (Law 8).
@@ -977,6 +1027,7 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | row_count::ROW_COUNT_FEATURE
     | crate::index::graph::endpoints::ENDPOINT_FEATURE
     | crate::index::vector::graph::VAMANA_FEATURE
+    | crate::index::graph::edge_table::EDGE_TABLE_FEATURE
     | catalog::JSON_EXPRESSION_FEATURE
     | SCHEMA_FEATURE
     | crate::index::graph::EDGE_ID_FEATURE;
@@ -1239,6 +1290,7 @@ impl Database {
             failed: false,
             sequence: None,
             catalog_cache: RefCell::new(None),
+            bound_edge_types: RefCell::new(None),
             layout_cache: RefCell::new(None),
             clock: Arc::new(SystemClock),
             limits,
@@ -1656,6 +1708,11 @@ impl Database {
         *self.layout_cache.borrow_mut() = Some(l.clone());
         Ok(l)
     }
+    /// Write a changed catalog record, for a module outside this one that
+    /// owns a tail of it (`index/graph/edge_table.rs`).
+    pub(crate) fn save_catalog(&mut self, c: &Catalog) -> Result<()> {
+        self.persist_catalog(c)
+    }
     fn persist_catalog(&mut self, c: &Catalog) -> Result<()> {
         let b = catalog_bytes(c)?;
         for i in 0..3 {
@@ -1783,6 +1840,7 @@ impl Database {
             declared,
             rules,
             schema,
+            edge: None,
         };
         let result = (|| {
             // The feature bit rides the same transaction as the first record
@@ -2235,6 +2293,7 @@ impl Database {
     pub fn put(&mut self, c: CollectionId, key: &str, doc: &Value) -> Result<EntityId> {
         self.user_write()?;
         let catalog = self.catalog(c)?;
+        refuse_row_in_edge_table(&catalog)?;
         self.validate_document(&catalog, key, doc)?;
         let old = self.load_entity(c, key, true, false)?;
         self.write_entity(&catalog, key, doc.clone(), old)
@@ -2242,6 +2301,7 @@ impl Database {
     pub fn update(&mut self, c: CollectionId, key: &str, patch: &Value) -> Result<EntityId> {
         self.user_write()?;
         let catalog = self.catalog(c)?;
+        refuse_row_in_edge_table(&catalog)?;
         self.validate_document(&catalog, key, patch)?;
         let old = self
             .load_entity(c, key, true, true)?
@@ -2500,6 +2560,7 @@ impl Database {
         }
         self.sequence = None;
         *self.catalog_cache.borrow_mut() = None;
+        *self.bound_edge_types.borrow_mut() = None;
         *self.layout_cache.borrow_mut() = None;
         self.graph_header_cache.set(None);
         self.index_cache.borrow_mut().clear();
@@ -3206,6 +3267,7 @@ mod tests {
         // class is Corrupt, which is why it cannot be the only line.
         let record = catalog_bytes(&Catalog {
             schema: None,
+            edge: None,
             id: CollectionId(1),
             name: "t".into(),
             layout: 1,

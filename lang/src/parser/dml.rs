@@ -8,19 +8,22 @@ impl Parser {
             return Err(SqlError::Refused {
                 keyword: "INSERT INTO GRAPH".into(),
                 tier: super::Tier::Two,
-                reason: "QL_CONTRACT §2: `INSERT INTO GRAPH g EDGE type (...) VALUES` compiles to put_edge; the spelling is still open and nothing is built in this slice.",
+                reason: "QL_CONTRACT §2: an edge is written through its EDGE TABLE, `INSERT INTO t VALUES (...)`, the PostgreSQL 19 / Oracle 23ai / Spanner spelling (docs/core/EDGE_TABLES.md); `INSERT INTO GRAPH` is not adopted.",
             });
         }
         let table = self.table_name()?;
-        self.expect(&Tok::LParen)?;
+        // No column list is every column of the table, in its order; the
+        // compiler fills it in (edge tables only).
         let mut columns = Vec::new();
-        loop {
-            columns.push(self.name()?);
-            if !self.eat(&Tok::Comma) {
-                break;
+        if self.eat(&Tok::LParen) {
+            loop {
+                columns.push(self.name()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
             }
+            self.expect(&Tok::RParen)?;
         }
-        self.expect(&Tok::RParen)?;
         self.expect_word("VALUES")?;
         let mut rows = Vec::new();
         loop {
@@ -33,7 +36,7 @@ impl Parser {
                 }
             }
             self.expect(&Tok::RParen)?;
-            if values.len() != columns.len() {
+            if !columns.is_empty() && values.len() != columns.len() {
                 return Err(SqlError::syntax(
                     format!(
                         "row {} has {} value(s) for {} column(s)",
@@ -49,11 +52,61 @@ impl Parser {
                 break;
             }
         }
-        if self.word().as_deref() == Some("ON") {
-            return Err(SqlError::unsupported(
-                "INSERT ... ON CONFLICT: `Database::put` replaces the row at a key, and a conditional write has no atomic",
-            ));
-        }
+        let on_conflict = if self.eat_word("ON") {
+            self.expect_word("CONFLICT")?;
+            let mut target = Vec::new();
+            if self.eat(&Tok::LParen) {
+                loop {
+                    target.push(self.name()?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+            } else if self.word().as_deref() == Some("ON") {
+                return Err(SqlError::unsupported(
+                    "ON CONFLICT ON CONSTRAINT: the one constraint is the primary key; name its columns",
+                ));
+            }
+            self.expect_word("DO")?;
+            let update = if self.eat_word("NOTHING") {
+                None
+            } else {
+                self.expect_word("UPDATE")?;
+                self.expect_word("SET")?;
+                let mut set = Vec::new();
+                loop {
+                    let column = self.name()?;
+                    self.expect(&Tok::Eq)?;
+                    let at = self.here();
+                    if !self.eat_word("EXCLUDED") || !self.eat(&Tok::Dot) {
+                        return Err(SqlError::unsupported(format!(
+                            "ON CONFLICT DO UPDATE SET {column} = ...: the value is `EXCLUDED.{column}`, the proposed row's own; another expression has no atomic"
+                        )));
+                    }
+                    let from = self.name()?;
+                    if from != column {
+                        return Err(SqlError::syntax(
+                            format!("SET {column} = EXCLUDED.{from}: a column takes the proposed row's value of itself"),
+                            at,
+                        ));
+                    }
+                    set.push(column);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                if self.word().as_deref() == Some("WHERE") {
+                    return Err(SqlError::unsupported(
+                        "ON CONFLICT DO UPDATE ... WHERE: a conditional update of the conflicting edge has no atomic",
+                    ));
+                }
+                Some(set)
+            };
+            Some(ConflictClause { target, update })
+        } else {
+            None
+        };
         if self.word().as_deref() == Some("RETURNING") {
             return Err(SqlError::unsupported(
                 "INSERT ... RETURNING: a write reports the rows it affected, not their contents",
@@ -63,6 +116,7 @@ impl Parser {
             table,
             columns,
             rows,
+            on_conflict,
         })
     }
 

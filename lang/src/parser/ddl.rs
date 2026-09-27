@@ -27,7 +27,7 @@ impl Parser {
             }
             Some("VIEW") | Some("MATERIALIZED") => Err(refuse::refuse("CREATE VIEW")),
             Some("TRIGGER") => Err(refuse::refuse("CREATE TRIGGER")),
-            Some("PROPERTY") => Err(refuse::refuse("CREATE PROPERTY GRAPH")),
+            Some("PROPERTY") => self.property_graph(false),
             Some("TABLE") => self.create_table(),
             Some("INDEX") | Some("UNIQUE") => self.create_index(),
             _ => Err(SqlError::syntax(
@@ -55,8 +55,37 @@ impl Parser {
         let table = self.table_name()?;
         self.expect(&Tok::LParen)?;
         let mut columns = Vec::new();
+        let mut primary_key = Vec::new();
         loop {
-            columns.push(self.column_def()?);
+            // A TABLE constraint: `PRIMARY KEY (a, b)`, optionally named
+            // with `CONSTRAINT name`. Every other table constraint is
+            // refused by name.
+            if self.eat_word("CONSTRAINT") {
+                let _ = self.name()?;
+            }
+            match (self.word().as_deref(), self.word_at(1).as_deref()) {
+                (Some("PRIMARY"), Some("KEY")) => {
+                    self.bump();
+                    self.bump();
+                    if !primary_key.is_empty() {
+                        return Err(SqlError::unsupported("two PRIMARY KEY clauses: a table has one key"));
+                    }
+                    self.expect(&Tok::LParen)?;
+                    loop {
+                        primary_key.push(self.name()?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&Tok::RParen)?;
+                }
+                (Some(what @ ("UNIQUE" | "FOREIGN" | "CHECK" | "EXCLUDE")), _) => {
+                    return Err(SqlError::unsupported(format!(
+                        "table constraint `{what}`: a table constraint here is `PRIMARY KEY (...)`, an edge table's key (docs/core/EDGE_TABLES.md §3)"
+                    )));
+                }
+                _ => columns.push(self.column_def()?),
+            }
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -73,6 +102,7 @@ impl Parser {
         Ok(Stmt::CreateTable {
             table,
             columns,
+            primary_key,
             if_not_exists,
             indexes,
             automatic,
@@ -233,6 +263,7 @@ impl Parser {
         let name = self.name()?;
         let (kind, declared) = self.column_type()?;
         let mut primary_key = false;
+        let mut references = None;
         let mut rule = ColumnRule::default();
         loop {
             match self.word().as_deref() {
@@ -255,7 +286,24 @@ impl Parser {
                     self.bump();
                     rule.default = Some(self.default_generator()?);
                 }
-                Some("UNIQUE") | Some("REFERENCES") | Some("CHECK") => {
+                Some("REFERENCES") => {
+                    self.bump();
+                    let target = self.table_name()?;
+                    let column = if self.eat(&Tok::LParen) {
+                        let column = self.name()?;
+                        self.expect(&Tok::RParen)?;
+                        Some(column)
+                    } else {
+                        None
+                    };
+                    if let Some(action @ ("ON" | "MATCH" | "DEFERRABLE")) = self.word().as_deref() {
+                        return Err(SqlError::unsupported(format!(
+                            "REFERENCES ... {action}: an edge's end is kept by the graph's own RESTRICT/CASCADE (GRAPH_CONTRACT 6.1); there are no referential actions to name"
+                        )));
+                    }
+                    references = Some((target, column));
+                }
+                Some("UNIQUE") | Some("CHECK") => {
                     return Err(SqlError::unsupported(format!(
                         "column constraint `{}`: the descriptor's per-field slot holds a DEFAULT generator and a NOT NULL flag, and nothing else",
                         self.peek().written()
@@ -276,6 +324,7 @@ impl Parser {
             kind,
             declared,
             primary_key,
+            references,
             rule: (rule != ColumnRule::default()).then_some(rule),
         })
     }
@@ -360,6 +409,7 @@ impl Parser {
         self.expect_word("ALTER")?;
         match self.word().as_deref() {
             Some("TABLE") => {}
+            Some("PROPERTY") => return self.property_graph(true),
             Some(other) => {
                 return Err(SqlError::unsupported(format!(
                     "ALTER {other}: ALTER TABLE is the catalog's own; there is no other alterable object"
@@ -833,9 +883,172 @@ impl Parser {
                 let _ = self.eat_word("RESTRICT");
                 Ok(Stmt::DropSchema { name, if_exists })
             }
+            "PROPERTY" => {
+                self.bump();
+                self.expect_word("GRAPH")?;
+                let if_exists = self.if_exists()?;
+                let name = self.name()?;
+                if let Some(word @ ("CASCADE" | "RESTRICT")) = self.word().as_deref() {
+                    if word == "CASCADE" {
+                        return Err(SqlError::unsupported(
+                            "DROP PROPERTY GRAPH ... CASCADE: a property graph is a definition and nothing depends on it; its edge tables and edges stay (docs/core/EDGE_TABLES.md §2.3)",
+                        ));
+                    }
+                    self.bump();
+                }
+                Ok(Stmt::DropPropertyGraph { name, if_exists })
+            }
             other => Err(SqlError::unsupported(format!(
                 "DROP {other}: DROP TABLE and DROP INDEX are the catalog's own"
             ))),
+        }
+    }
+
+    /// `CREATE PROPERTY GRAPH g [VERTEX|NODE TABLES (...)] [EDGE TABLES
+    /// (...)]`, or with `alter` set `ALTER PROPERTY GRAPH g ADD
+    /// {VERTEX|NODE|EDGE} TABLES (...)` (`docs/core/EDGE_TABLES.md` §2). The
+    /// PostgreSQL 19 / Oracle 23ai / Spanner spelling; the clauses that have
+    /// no mapping onto native edges are refused by name.
+    fn property_graph(&mut self, alter: bool) -> SqlResult2<Stmt> {
+        self.expect_word("PROPERTY")?;
+        self.expect_word("GRAPH")?;
+        let name = self.name()?;
+        let mut vertex_tables = Vec::new();
+        let mut edge_tables = Vec::new();
+        loop {
+            if alter {
+                match self.word().as_deref() {
+                    Some("ADD") => {
+                        self.bump();
+                    }
+                    Some(other @ ("DROP" | "ALTER")) => {
+                        return Err(SqlError::unsupported(format!(
+                            "ALTER PROPERTY GRAPH ... {other}: an edge table stays bound to its label once declared (docs/core/EDGE_TABLES.md §2.3); ADD is the form"
+                        )))
+                    }
+                    _ => break,
+                }
+            }
+            match self.word().as_deref() {
+                Some("VERTEX" | "NODE") => {
+                    self.bump();
+                    self.expect_word("TABLES")?;
+                    self.expect(&Tok::LParen)?;
+                    loop {
+                        vertex_tables.push(self.table_name()?);
+                        self.graph_element_tail(false)?;
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&Tok::RParen)?;
+                }
+                Some("EDGE" | "RELATIONSHIP") => {
+                    self.bump();
+                    self.expect_word("TABLES")?;
+                    self.expect(&Tok::LParen)?;
+                    loop {
+                        edge_tables.push(self.edge_table_decl()?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&Tok::RParen)?;
+                }
+                _ => break,
+            }
+        }
+        if vertex_tables.is_empty() && edge_tables.is_empty() {
+            return Err(SqlError::syntax(
+                format!(
+                    "expected VERTEX TABLES or EDGE TABLES, found `{}`",
+                    self.peek().written()
+                ),
+                self.here(),
+            ));
+        }
+        Ok(Stmt::PropertyGraph {
+            name,
+            alter,
+            vertex_tables,
+            edge_tables,
+        })
+    }
+
+    /// One edge table: `t [AS a] SOURCE KEY (c) REFERENCES v [(k)]
+    /// DESTINATION KEY (c) REFERENCES v [(k)] [LABEL l]`.
+    fn edge_table_decl(&mut self) -> SqlResult2<EdgeTableDecl> {
+        let table = self.table_name()?;
+        self.refuse_element_clause()?;
+        let mut end = |p: &mut Self, word: &str| -> SqlResult2<(String, String)> {
+            p.expect_word(word)?;
+            p.expect_word("KEY")?;
+            p.expect(&Tok::LParen)?;
+            let column = p.name()?;
+            if p.eat(&Tok::Comma) {
+                return Err(SqlError::unsupported(format!(
+                    "{word} KEY with two columns: an end names one row, by its key"
+                )));
+            }
+            p.expect(&Tok::RParen)?;
+            p.expect_word("REFERENCES")?;
+            let target = p.table_name()?;
+            if p.eat(&Tok::LParen) {
+                let key = p.name()?;
+                p.expect(&Tok::RParen)?;
+                if key != "_key" {
+                    return Err(SqlError::unsupported(format!(
+                        "{word} KEY ... REFERENCES {target} ({key}): an end names a row by its key, `_key`"
+                    )));
+                }
+            }
+            Ok((column, target))
+        };
+        let (source, source_table) = end(self, "SOURCE")?;
+        let (destination, destination_table) = end(self, "DESTINATION")?;
+        let label = self.graph_element_tail(true)?;
+        Ok(EdgeTableDecl {
+            table,
+            source,
+            source_table,
+            destination,
+            destination_table,
+            label,
+        })
+    }
+
+    /// `AS alias` and `KEY (...)` before an element's ends, refused by name.
+    fn refuse_element_clause(&mut self) -> SqlResult2<()> {
+        match self.word().as_deref() {
+            Some("AS") => Err(SqlError::unsupported(
+                "an element table's alias: a table is its own element here, named by its own name",
+            )),
+            Some("KEY") => Err(SqlError::unsupported(
+                "KEY (...) on an element table: the table's PRIMARY KEY is the element key (docs/core/EDGE_TABLES.md §3)",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// What may follow an element table: one `LABEL l` on an edge table.
+    /// `PROPERTIES`, `NO PROPERTIES`, `DEFAULT LABEL` and a second label are
+    /// refused by name; a vertex table takes none of them.
+    fn graph_element_tail(&mut self, edge: bool) -> SqlResult2<Option<String>> {
+        self.refuse_element_clause()?;
+        let mut label = None;
+        loop {
+            match self.word().as_deref() {
+                Some("LABEL") if edge && label.is_none() => {
+                    self.bump();
+                    label = Some(self.name()?);
+                }
+                Some(what @ ("LABEL" | "PROPERTIES" | "NO" | "DEFAULT")) => {
+                    return Err(SqlError::unsupported(format!(
+                        "`{what}` on a property graph element: the label of an edge table is its own name or one LABEL, the label of a vertex table is its name, and the properties are the table's columns (docs/core/EDGE_TABLES.md §6)"
+                    )))
+                }
+                _ => return Ok(label),
+            }
         }
     }
 

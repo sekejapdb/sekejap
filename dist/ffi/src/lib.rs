@@ -221,7 +221,10 @@ fn status_of_sql(error: &SqlError) -> SekejapStatus {
 
 fn status_of_core(error: &CoreError) -> SekejapStatus {
     match error {
-        CoreError::InvalidInput(_) | CoreError::NotFound(_) | CoreError::AlreadyExists => {
+        CoreError::InvalidInput(_)
+        | CoreError::NotFound(_)
+        | CoreError::AlreadyExists
+        | CoreError::Constraint { .. } => {
             SekejapStatus::Invalid
         }
         CoreError::ReadOnly => SekejapStatus::Refused,

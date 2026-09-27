@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub(crate) mod adjacency;
+pub(crate) mod edge_table;
 pub mod endpoints;
 
 pub(crate) const GRAPH_FEATURE: u64 = 2;
@@ -1916,6 +1917,24 @@ impl Database {
         destination: EntityId,
         properties: &Value,
     ) -> Result<EdgeKey> {
+        self.refuse_bound_edge_type(edge_type)?;
+        self.put_edge_inner(context, source, edge_type, destination, properties)
+    }
+
+    /// `put_edge` for an edge table's own write, which has checked the
+    /// edge's types and key (`edge_table.rs`).
+    pub(crate) fn put_edge_typed(&mut self, key: EdgeKey, properties: &Value) -> Result<EdgeKey> {
+        self.put_edge_inner(key.context, key.source, key.edge_type, key.destination, properties)
+    }
+
+    fn put_edge_inner(
+        &mut self,
+        context: GraphContextId,
+        source: EntityId,
+        edge_type: EdgeTypeId,
+        destination: EntityId,
+        properties: &Value,
+    ) -> Result<EdgeKey> {
         self.ready_write()?;
         let h = self.graph_header()?;
         let key = EdgeKey {
@@ -1991,6 +2010,7 @@ impl Database {
         edges: &[NewEdge],
     ) -> Result<Vec<EdgeKey>> {
         self.ready_write()?;
+        self.refuse_bound_edge_type(edge_type)?;
         if edges.is_empty() {
             return Ok(Vec::new());
         }
@@ -2248,6 +2268,7 @@ impl Database {
             edge_type: EdgeTypeId(type_id),
             destination,
         };
+        self.refuse_bound_edge_type(key.edge_type)?;
         let existed = self.preflight_unless_provably_absent(key)?;
         let result = (|| {
             let maintain = self.endpoint_maintenance()?;
@@ -2448,6 +2469,23 @@ impl Database {
         destination: EntityId,
         properties: &Value,
     ) -> Result<EdgeId> {
+        self.refuse_bound_edge_type(edge_type)?;
+        self.create_edge_inner(context, source, edge_type, destination, properties)
+    }
+
+    /// `create_edge` for an edge table's own write (`edge_table.rs`).
+    pub(crate) fn create_edge_typed(&mut self, key: EdgeKey, properties: &Value) -> Result<EdgeId> {
+        self.create_edge_inner(key.context, key.source, key.edge_type, key.destination, properties)
+    }
+
+    fn create_edge_inner(
+        &mut self,
+        context: GraphContextId,
+        source: EntityId,
+        edge_type: EdgeTypeId,
+        destination: EntityId,
+        properties: &Value,
+    ) -> Result<EdgeId> {
         self.user_write()?;
         let h = self.graph_header()?;
         let key = EdgeKey {
@@ -2495,6 +2533,17 @@ impl Database {
     /// and the endpoint sets are untouched. Returns `false` when no such edge
     /// exists.
     pub fn update_edge_properties(&mut self, edge: EdgeId, properties: &Value) -> Result<bool> {
+        self.refuse_bound_edge_type(edge.key.edge_type)?;
+        self.update_edge_inner(edge, properties)
+    }
+
+    /// An edge table's own property rewrite, which has checked the bag
+    /// against the table's columns (`edge_table.rs`).
+    pub(crate) fn write_edge_bag(&mut self, edge: EdgeId, properties: &Value) -> Result<bool> {
+        self.update_edge_inner(edge, properties)
+    }
+
+    fn update_edge_inner(&mut self, edge: EdgeId, properties: &Value) -> Result<bool> {
         self.user_write()?;
         let h = self.graph_header()?;
         self.validate_edge_ids(h, edge.key)?;

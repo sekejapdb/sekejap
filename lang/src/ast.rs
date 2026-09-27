@@ -673,6 +673,27 @@ pub(super) struct SelectStmt {
     pub(super) limit: Option<usize>,
 }
 
+/// One edge table of a `CREATE PROPERTY GRAPH`: which column is the source,
+/// which the destination, the tables they name, and the label.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct EdgeTableDecl {
+    pub(super) table: String,
+    pub(super) source: String,
+    pub(super) source_table: String,
+    pub(super) destination: String,
+    pub(super) destination_table: String,
+    pub(super) label: Option<String>,
+}
+
+/// `ON CONFLICT (target) DO NOTHING` or `DO UPDATE SET c = EXCLUDED.c, ...`.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ConflictClause {
+    pub(super) target: Vec<String>,
+    /// `None` is `DO NOTHING`; `Some` lists the columns `DO UPDATE` sets,
+    /// each from the same column of the proposed row.
+    pub(super) update: Option<Vec<String>>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct ColumnDef {
     pub(super) name: String,
@@ -681,6 +702,11 @@ pub(super) struct ColumnDef {
     /// stored as `Kind::Int` and only the declaration says which.
     pub(super) declared: String,
     pub(super) primary_key: bool,
+    /// `REFERENCES table [(column)]`: the column names a row of `table` by
+    /// its key, which makes the table an EDGE TABLE
+    /// (`docs/core/EDGE_TABLES.md`). The optional column is kept so the
+    /// compiler can require it to be `_key`.
+    pub(super) references: Option<(String, Option<String>)>,
     /// `DEFAULT <generator>` and `NOT NULL`, as the per-field COLUMN RULE
     /// the collection descriptor records (QL_CONTRACT §2). `None` when the
     /// column clauses set neither.
@@ -818,8 +844,25 @@ pub(super) enum Stmt {
     ExplainGql(Box<super::gql::ast::GqlGraphTable>),
     Insert {
         table: String,
+        /// Empty when the statement wrote no column list: every column of
+        /// the table, in its order (edge tables only).
         columns: Vec<String>,
         rows: Vec<Vec<Literal>>,
+        /// `ON CONFLICT (...) DO NOTHING | DO UPDATE SET c = EXCLUDED.c`.
+        on_conflict: Option<ConflictClause>,
+    },
+    /// `CREATE PROPERTY GRAPH g VERTEX TABLES (...) EDGE TABLES (...)`, and
+    /// `ALTER PROPERTY GRAPH g ADD ...` with `alter` set
+    /// (`docs/core/EDGE_TABLES.md` §2).
+    PropertyGraph {
+        name: String,
+        alter: bool,
+        vertex_tables: Vec<String>,
+        edge_tables: Vec<EdgeTableDecl>,
+    },
+    DropPropertyGraph {
+        name: String,
+        if_exists: bool,
     },
     Update {
         table: String,
@@ -860,6 +903,8 @@ pub(super) enum Stmt {
     CreateTable {
         table: String,
         columns: Vec<ColumnDef>,
+        /// A table-level `PRIMARY KEY (a, b, ...)`: an edge table's key.
+        primary_key: Vec<String>,
         /// `IF NOT EXISTS`: a catalog probe decides, and a table that is
         /// already there raises a NOTICE rather than an error.
         if_not_exists: bool,

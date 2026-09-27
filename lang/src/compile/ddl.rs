@@ -817,6 +817,11 @@ impl Compiler<'_> {
         method: IndexMethod,
     ) -> SqlResult2<WritePlan> {
         let c = collection(self.db, table)?;
+        if self.db.edge_table(c).map_err(SqlError::from)?.is_some() {
+            return Err(SqlError::unsupported(format!(
+                "CREATE INDEX on `{table}`: `{table}` is an edge table, and there is no index over edge properties yet; its edges are read from an end (docs/core/EDGE_TABLES.md §5.1)"
+            )));
+        }
         let method = match method {
             IndexMethod::Btree(field) => {
                 self.kind_of(c, &field)?;

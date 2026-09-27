@@ -267,7 +267,20 @@ impl GqlPlan {
         let output = planner.pipeline(&graph.body, graph.outer.as_ref(), notices)?;
         reach::choose(&mut planner.ops, &planner.program, &planner.stages);
         let reads_graph = planner.has_edges;
-        let context = if graph.graph.eq_ignore_ascii_case("base") || !reads_graph {
+        // A PROPERTY GRAPH's name reads the base graph: its edge tables write
+        // there (`docs/core/EDGE_TABLES.md` §5.2).
+        let property_graph = !graph.graph.eq_ignore_ascii_case("base")
+            && !db
+                .property_graph_tables(&graph.graph)
+                .map_err(SqlError::from)?
+                .is_empty();
+        if property_graph {
+            notices.push(format!(
+                "property graph `{}` is read as the base graph: a label outside its tables is not refused (docs/core/EDGE_TABLES.md §5.2)",
+                graph.graph
+            ));
+        }
+        let context = if graph.graph.eq_ignore_ascii_case("base") || property_graph || !reads_graph {
             ContextRef::Id(GraphContextId::BASE)
         } else {
             match db.graph_context(&graph.graph).map_err(SqlError::from)? {
