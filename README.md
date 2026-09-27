@@ -210,6 +210,18 @@ As in PostgreSQL, `INSERT` of a key that already exists is refused
 (`23505`); `INSERT ... ON CONFLICT (_key) DO UPDATE SET col = EXCLUDED.col`
 is the upsert, and a `UNIQUE` column refuses a second equal value.
 
+Passwords are stored with pgcrypto's functions, as in PostgreSQL:
+
+```python
+db.execute("CREATE TABLE account (_key TEXT PRIMARY KEY, email TEXT UNIQUE, password_hash TEXT)")
+db.execute("INSERT INTO account (_key, email, password_hash) VALUES ($1, $2, crypt($3, gen_salt('bf')))",
+           ["u1", "chloe@example.com", "correct horse"])
+# At login: read the stored hash by email, then check the typed password against it.
+stored_hash = db.query("SELECT password_hash FROM account WHERE email = $1", ["chloe@example.com"])[0]["password_hash"]
+db.query("SELECT crypt($1, $2) = $2 AS ok", ["correct horse", stored_hash])
+# → { ok: true }
+```
+
 ### 4. Run a query
 
 Ordinary SQL works as you'd expect:

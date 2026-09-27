@@ -125,6 +125,7 @@ mod functions;
 mod gql;
 mod lexer;
 mod parser;
+mod pgcrypto;
 mod refuse;
 
 use sekejap_core::collections::{

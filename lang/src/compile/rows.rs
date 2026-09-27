@@ -656,6 +656,12 @@ impl Compiler<'_> {
                 },
                 SessionItem::PostgisVersion => SqlValue::Text(catalog::POSTGIS_VERSION.into()),
                 SessionItem::Lit(literal) => self.catalog_value(literal)?,
+                SessionItem::Eq(left, right) => {
+                    match (self.catalog_value(left)?, self.catalog_value(right)?) {
+                        (SqlValue::Null, _) | (_, SqlValue::Null) => SqlValue::Null,
+                        (a, b) => SqlValue::Bool(a == b),
+                    }
+                }
             });
         }
         let text = format!("SELECT {}", columns.join(", "));

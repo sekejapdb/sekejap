@@ -66,6 +66,18 @@ refused with `23505` instead of replacing the row. Write
   unique now, and `CREATE UNIQUE INDEX ... ON t (col)` is accepted.
 - A unique violation reaches a PostgreSQL client as `23505`, not `42P07`.
 
+### pgcrypto-compatible functions
+
+- `digest` (md5, sha1, sha224, sha256, sha384, sha512), `hmac`,
+  `gen_random_bytes`, `gen_salt('bf' | 'md5' [, rounds])` and `crypt`, with
+  PostgreSQL's `encode` / `decode` (`hex`, `base64`). Every answer matches
+  PostgreSQL 16 with pgcrypto, and errors carry its SQLSTATEs.
+- They are values: in `INSERT`, `UPDATE ... SET` and a `SELECT` with no
+  `FROM`, so a password is stored with
+  `crypt($1, gen_salt('bf'))` and checked with `SELECT crypt($1, $2) = $2`.
+- The DES and extended-DES `crypt` formats are refused by name rather than
+  emulated.
+
 ### Vector ordering follows PostgreSQL
 
 - Under a vector `ORDER BY`, a row with no vector (missing, or written

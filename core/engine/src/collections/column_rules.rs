@@ -285,6 +285,14 @@ fn format_uuid(b: &[u8; 16]) -> String {
     )
 }
 
+/// Fill `out` with the operating system's randomness, through the same
+/// `getrandom` the page-WAL identity and `uuid4()` use. For the query
+/// layer's pgcrypto functions (`gen_salt`, `gen_random_bytes`).
+pub fn random_bytes(out: &mut [u8]) -> Result<()> {
+    getrandom::fill(out)
+        .map_err(|e| Error::Kernel(kernel::Error::Io(std::io::Error::other(e.to_string()))))
+}
+
 /// RFC 4122 §4.4: sixteen random bytes with the version and variant fields
 /// overwritten. The randomness is the operating system's, through the same
 /// `getrandom` the page-WAL identity uses.

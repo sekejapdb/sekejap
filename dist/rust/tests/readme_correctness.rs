@@ -232,6 +232,36 @@ fn graph_hops_directions_and_depths() {
 }
 
 #[test]
+fn a_password_is_stored_with_pgcrypto_and_checked() {
+    let (_dir, db) = open();
+    run(&db, readme("CREATE TABLE account (_key TEXT PRIMARY KEY, email TEXT UNIQUE, password_hash TEXT)"));
+    db.execute(
+        readme("INSERT INTO account (_key, email, password_hash) VALUES ($1, $2, crypt($3, gen_salt('bf')))"),
+        &[json!("u1"), json!("chloe@example.com"), json!("correct horse")],
+    )
+    .unwrap();
+    let rows = db
+        .query(readme("SELECT password_hash FROM account WHERE email = $1"), &[json!("chloe@example.com")])
+        .unwrap();
+    let stored = texts(&rows, "password_hash").remove(0);
+    assert!(stored.starts_with("$2a$06$"), "{stored}");
+    let check = |password: &str| {
+        let rows = db
+            .query(readme("SELECT crypt($1, $2) = $2 AS ok"), &[json!(password), json!(stored)])
+            .unwrap();
+        column(&rows, "ok")[0].clone()
+    };
+    assert_eq!(check("correct horse"), json!(true));
+    // Contrast: a wrong password, and a second account on the same email.
+    assert_eq!(check("wrong horse"), json!(false));
+    let taken = db.execute(
+        "INSERT INTO account (_key, email, password_hash) VALUES ('u2', 'chloe@example.com', 'x')",
+        &[],
+    );
+    assert!(taken.unwrap_err().to_string().contains("23505"));
+}
+
+#[test]
 fn an_edge_table_writes_edges_in_sql() {
     let (_dir, db) = bali();
     run(&db, readme("CREATE TABLE visited (

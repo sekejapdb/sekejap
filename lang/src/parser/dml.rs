@@ -258,7 +258,40 @@ impl Parser {
     /// A value to WRITE: a literal, or a geometry constructor. A constructor
     /// is read only here and in `SET`, where the value is a document field;
     /// in a comparison it would be a different question.
+    /// A pgcrypto-compatible call at the cursor (`lang/src/pgcrypto.rs`),
+    /// whose arguments are constants, `$n` parameters and such calls.
+    pub(super) fn crypto_call(&mut self) -> SqlResult2<Option<Literal>> {
+        let Some(word) = self.word() else {
+            return Ok(None);
+        };
+        if !crate::pgcrypto::is_function(&word) || !matches!(self.peek_at(1), Tok::LParen) {
+            return Ok(None);
+        }
+        self.bump();
+        self.bump();
+        let mut args = Vec::new();
+        if !self.eat(&Tok::RParen) {
+            loop {
+                args.push(match self.crypto_call()? {
+                    Some(call) => call,
+                    None => self.literal()?,
+                });
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Tok::RParen)?;
+        }
+        Ok(Some(Literal::Call(Box::new(CallExpr {
+            name: word.to_ascii_lowercase(),
+            args,
+        }))))
+    }
+
     fn value_literal(&mut self) -> SqlResult2<Literal> {
+        if let Some(call) = self.crypto_call()? {
+            return Ok(call);
+        }
         if !self.at_geo_constructor() {
             return self.literal();
         }
@@ -272,6 +305,9 @@ impl Parser {
     }
 
     fn set_value(&mut self) -> SqlResult2<SetValue> {
+        if let Some(call) = self.crypto_call()? {
+            return Ok(SetValue::Lit(call));
+        }
         if self.at_geo_constructor() {
             return Ok(SetValue::Lit(self.value_literal()?));
         }

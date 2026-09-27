@@ -149,15 +149,36 @@ impl Parser {
                 return Ok(Some(SessionItem::Setting(name)));
             }
         }
-        // `SELECT 1`, the liveness probe every pool sends.
+        // `SELECT 1`, the liveness probe every pool sends; a `$n`; a
+        // pgcrypto call; and `a = b` over two of them.
+        let Some(left) = self.session_value()? else {
+            return Ok(None);
+        };
+        if self.eat(&Tok::Eq) {
+            let Some(right) = self.session_value()? else {
+                return Ok(None);
+            };
+            return Ok(Some(SessionItem::Eq(left, right)));
+        }
+        Ok(Some(SessionItem::Lit(left)))
+    }
+
+    fn session_value(&mut self) -> SqlResult2<Option<Literal>> {
+        if let Some(call) = self.crypto_call()? {
+            return Ok(Some(call));
+        }
         match self.peek().clone() {
             Tok::Num(value, exact) => {
                 self.bump();
-                Ok(Some(SessionItem::Lit(Literal::Num(value, exact))))
+                Ok(Some(Literal::Num(value, exact)))
             }
             Tok::Str(text) => {
                 self.bump();
-                Ok(Some(SessionItem::Lit(Literal::Str(text))))
+                Ok(Some(Literal::Str(text)))
+            }
+            Tok::Param(n) => {
+                self.bump();
+                Ok(Some(Literal::Param(n)))
             }
             _ => Ok(None),
         }

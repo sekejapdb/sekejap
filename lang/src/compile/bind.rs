@@ -73,6 +73,27 @@ impl<'a> Binder<'a> {
                 Param::Json(v) => v.clone(),
             },
             Literal::Geo(argument) => geom_to_json(&self.geom_of(argument)?),
+            Literal::Call(call) => {
+                let mut args = Vec::with_capacity(call.args.len());
+                for arg in &call.args {
+                    args.push(match self.value_of(arg)? {
+                        Value::Null => SqlValue::Null,
+                        Value::Bool(b) => SqlValue::Bool(b),
+                        Value::Number(n) => match n.as_i64() {
+                            Some(i) => SqlValue::Int(i),
+                            None => SqlValue::Float(n.as_f64().unwrap_or(f64::NAN)),
+                        },
+                        Value::String(s) => SqlValue::Text(s),
+                        other => SqlValue::Json(other),
+                    });
+                }
+                match crate::pgcrypto::call(&call.name, &args)? {
+                    SqlValue::Text(t) => Value::String(t),
+                    SqlValue::Bool(b) => Value::Bool(b),
+                    SqlValue::Int(i) => Value::from(i),
+                    _ => Value::Null,
+                }
+            }
             Literal::Subquery(query) => {
                 let collection = collection(self.db, &query.table)?;
                 let key = self.text_of(&query.key)?;
@@ -275,6 +296,10 @@ pub(crate) fn literal_is_bound(literal: &Literal) -> bool {
         // point-get again rather than serving what a prepare once read.
         Literal::Subquery(_) => true,
         Literal::Geo(argument) => geo_is_bound(argument),
+        // A pgcrypto call is computed again at every bind: `gen_salt` and
+        // `gen_random_bytes` must never serve one execution's randomness to
+        // the next.
+        Literal::Call(_) => true,
         _ => false,
     }
 }

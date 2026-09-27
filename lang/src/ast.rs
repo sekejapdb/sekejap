@@ -47,6 +47,18 @@ pub(super) enum Literal {
     /// in `INSERT ... VALUES` and `UPDATE ... SET`. Its value is the GeoJSON
     /// document a geometry column stores.
     Geo(Box<GeoArg>),
+    /// A pgcrypto-compatible function (`lang/src/pgcrypto.rs`) over
+    /// constants, parameters and other such calls, in a VALUE position -- an
+    /// INSERT value, an UPDATE SET, a SELECT with no FROM. Its value is
+    /// computed while the statement compiles, like a scalar subquery's.
+    Call(Box<CallExpr>),
+}
+
+/// `name(arg, ...)` for a pgcrypto-compatible function.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CallExpr {
+    pub(super) name: String,
+    pub(super) args: Vec<Literal>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -615,6 +627,9 @@ pub(super) enum SessionItem {
     /// (`catalog::POSTGIS_VERSION`).
     PostgisVersion,
     Lit(Literal),
+    /// `a = b` over two values: `SELECT crypt($1, $2) = $2`, the password
+    /// check against a stored hash.
+    Eq(Literal, Literal),
 }
 
 impl SessionItem {
@@ -629,7 +644,8 @@ impl SessionItem {
             Self::BackendPid => "pg_backend_pid".into(),
             Self::Setting(_) => "current_setting".into(),
             Self::PostgisVersion => "postgis_version".into(),
-            Self::Lit(_) => "?column?".into(),
+            Self::Lit(Literal::Call(call)) => call.name.to_ascii_lowercase(),
+            Self::Lit(_) | Self::Eq(..) => "?column?".into(),
         }
     }
 }
@@ -1024,6 +1040,11 @@ impl Literal {
             Self::Param(n) => format!("${n}"),
             Self::Subquery(_) => "(SELECT ...)".into(),
             Self::Geo(_) => "<geometry>".into(),
+            Self::Call(call) => format!(
+                "{}({})",
+                call.name,
+                call.args.iter().map(Literal::written).collect::<Vec<_>>().join(", ")
+            ),
         }
     }
 }
