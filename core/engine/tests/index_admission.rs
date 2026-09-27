@@ -374,9 +374,10 @@ fn building_unique_index_cannot_become_ready_with_an_unseen_duplicate() {
     // table-wide uniqueness. The live write is indexed but cannot make READY.
     db.put(c, "duplicate", &json!({"name":"B"})).unwrap();
     db.commit().unwrap();
+    // A unique violation is PostgreSQL's 23505, raised by name.
     assert!(matches!(
         db.build_index_step(index, 8),
-        Err(Error::AlreadyExists)
+        Err(Error::Constraint { sqlstate: "23505", .. })
     ));
     assert!(
         db.commit().is_err(),

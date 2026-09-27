@@ -3130,7 +3130,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x7ffff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0xfffff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -3151,7 +3151,7 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0x7ffff
+            0xfffff
         );
         // A bit outside the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
@@ -3159,10 +3159,10 @@ mod tests {
         // graph (`0x8000`) and the JSON-path expression index (`0x10000`)
         // landed together, named schemas took `0x20000` and edge identity
         // `0x40000`, so the mask is contiguous through bit 18 and the first
-        // unclaimed bit is `0x80000`.
+        // unclaimed bit is `0x100000` (edge tables took `0x80000`).
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x80000)),
-            Err(Error::Unsupported(m)) if m.contains("0xfffff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x100000)),
+            Err(Error::Unsupported(m)) if m.contains("0x1fffff")
         ));
     }
     /// Law 8 for the live row count, the same shape the declared-type bit's
@@ -3193,9 +3193,9 @@ mod tests {
             Err(Error::Unsupported(m)) if m.contains("0x2001")
         ));
         // And a bit past every implemented family is refused by this build
-        // too. `0x40000` is edge identity now, so the probe is `0x80000`.
+        // too. `0x80000` is edge tables now, so the probe is `0x100000`.
         assert!(matches!(
-            admit_features(1 | 0x80000, SUPPORTED_LOGICAL_FEATURES),
+            admit_features(1 | 0x100000, SUPPORTED_LOGICAL_FEATURES),
             Err(Error::Unsupported(_))
         ));
     }

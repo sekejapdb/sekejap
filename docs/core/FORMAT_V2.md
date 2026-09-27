@@ -533,7 +533,15 @@ these persistent tags blindly.
   forward-only allocator lives under tag `0x09`. A tuple-keyed edge (id 0)
   carries no segment, so a file that never creates an id-bearing edge
   carries none of it; the first `create_edge` sets the bit in its own
-  transaction. The next unclaimed bit is `0x80000`.
+  transaction.
+  `EDGE_TABLE_FEATURE = 0x80000` (2026-09-27) is EDGE TABLES
+  (`docs/core/EDGE_TABLES.md`), and the mask is `0xfffff`: catalog flag bit 5
+  (`CATALOG_EDGE`) with a versioned edge tail -- the REFERENCES columns and
+  the collection each names, the primary key, and once bound the source and
+  destination columns, the edge type and the property graph's name. No new
+  keyspace: the edges are ordinary `0x71`/`0x72` edges. A file that never
+  declares an edge table carries none of it. The next unclaimed bit is
+  `0x100000`.
   Every bit in it is
   additive: set in the same transaction as the first record that needs it,
   never cleared, and a file declaring a bit outside the mask is refused as
