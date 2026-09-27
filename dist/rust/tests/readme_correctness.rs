@@ -232,6 +232,33 @@ fn graph_hops_directions_and_depths() {
 }
 
 #[test]
+fn an_edge_table_writes_edges_in_sql() {
+    let (_dir, db) = bali();
+    run(&db, readme("CREATE TABLE visited (
+        tourist TEXT REFERENCES tourists, place TEXT REFERENCES restaurants,
+        rating REAL, PRIMARY KEY (tourist, place)
+    )"));
+    run(&db, readme("CREATE PROPERTY GRAPH bali
+        VERTEX TABLES (tourists, restaurants)
+        EDGE TABLES (visited SOURCE KEY (tourist) REFERENCES tourists (_key)
+                             DESTINATION KEY (place) REFERENCES restaurants (_key))"));
+    run(&db, readme("INSERT INTO visited VALUES ('chloe', 'warung-sunset', 4.5)"));
+    let rows = query(&db, readme("SELECT place, rating FROM visited WHERE tourist = 'chloe'"));
+    assert_eq!(texts(&rows, "place"), ["warung-sunset"]);
+    assert_eq!(column(&rows, "rating"), [json!(4.5)]);
+    // Contrast: the same pair again is refused, a restaurant that is not
+    // there is refused, and the edge is walked by GQL under its label.
+    let taken = db.execute("INSERT INTO visited VALUES ('chloe', 'warung-sunset', 3.0)", &[]);
+    assert!(taken.unwrap_err().to_string().contains("23505"));
+    let missing = db.execute("INSERT INTO visited VALUES ('chloe', 'no-such-place', 3.0)", &[]);
+    assert!(missing.unwrap_err().to_string().contains("23503"));
+    let rows = query(&db, "SELECT * FROM GRAPH_TABLE (bali MATCH
+        (t:tourists WHERE t._key = 'chloe')-[v:visited]->(r:restaurants)
+        RETURN r.name AS name, v.rating AS rating)");
+    assert_eq!(texts(&rows, "name"), ["Warung Sunset"]);
+}
+
+#[test]
 fn spatial_radius_in_metres_and_its_refused_degree_form() {
     let (_dir, db) = bali();
     let rows = query(&db, readme("SELECT name FROM restaurants

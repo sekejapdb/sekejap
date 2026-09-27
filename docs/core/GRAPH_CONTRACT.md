@@ -56,6 +56,12 @@ native, not a layer declared over tables.
     in the bag. The declaration is an additive descriptor; no format change for
     undeclared types. Reason: a predicate or a Score leaf on a declared property
     runs at scan speed, the same loop the vector scan uses.
+    SHIPPED as EDGE TABLES (`docs/core/EDGE_TABLES.md`, additive
+    `EDGE_TABLE_FEATURE = 0x80000`): an edge type bound to an edge table has
+    typed properties -- the table's columns, checked on every write with the
+    row encoder itself -- a primary key, and takes no untyped write. The
+    properties are still encoded in the bag; the fixed-width, read-by-offset
+    encoding above is not built.
 2.5 Edge types are interned on first use. The catalog's edge-type rows (which
     collections an edge type connects) are derived from written edges, so a
     tool sees the graph shape without any declaration.

@@ -8,7 +8,7 @@ It runs inside your application, like SQLite, with no separate server to install
 
 It's available as a Rust/Python/Dart/Kotlin/Swift/Node.js/Go library, and a command-line tool.
 
-📝 **Changelog:** [CHANGELOG.md](CHANGELOG.md) — 0.18.0 makes graph queries ISO GQL inside `GRAPH_TABLE`, adds PostGIS geometry input and output, and named schemas. The storage format does not change.
+📝 **Changelog:** [CHANGELOG.md](CHANGELOG.md) — 0.18.0 makes graph queries ISO GQL inside `GRAPH_TABLE`, writes edges in SQL through edge tables, and adds PostGIS geometry input and output and named schemas. A 0.17 database opens as it is.
 
 📖 **Documentation:** [`docs/lang/GQL_PROFILE.md`](docs/lang/GQL_PROFILE.md) (graph queries, with examples), [`docs/lang/QL_CONTRACT.md`](docs/lang/QL_CONTRACT.md) (the query language), [`docs/dist/RUST_API.md`](docs/dist/RUST_API.md) (the Rust surface), and [`docs/core/GRAPH_CONTRACT.md`](docs/core/GRAPH_CONTRACT.md) (edge semantics).
 
@@ -272,6 +272,33 @@ db.query("""
 
 A pattern usually starts at one row, named by its key, and walks out from
 it; with no key predicate it starts by scanning the collection instead.
+
+Edges can also be written in SQL, the way PostgreSQL, Oracle and Spanner
+write a property graph's edges: an **edge table** whose `REFERENCES` columns
+name the two rows an edge joins, declared in a property graph, then plain
+`INSERT`, `UPDATE`, `DELETE` and `SELECT`. Its `PRIMARY KEY` decides how many
+edges one pair may have, and a taken key is refused as in PostgreSQL. It is a
+view over the graph's own edges, not a table of rows
+([edge tables](docs/core/EDGE_TABLES.md)).
+
+```python
+# Which restaurants a tourist has visited, and what they thought of them.
+db.execute("""
+    CREATE TABLE visited (
+        tourist TEXT REFERENCES tourists, place TEXT REFERENCES restaurants,
+        rating REAL, PRIMARY KEY (tourist, place)
+    )
+""")
+db.execute("""
+    CREATE PROPERTY GRAPH bali
+        VERTEX TABLES (tourists, restaurants)
+        EDGE TABLES (visited SOURCE KEY (tourist) REFERENCES tourists (_key)
+                             DESTINATION KEY (place) REFERENCES restaurants (_key))
+""")
+db.execute("INSERT INTO visited VALUES ('chloe', 'warung-sunset', 4.5)")
+db.query("SELECT place, rating FROM visited WHERE tourist = 'chloe'")
+# → { place: "warung-sunset", rating: 4.5 }
+```
 
 Graph queries follow ISO GQL: each matching path is one row, so a place
 reached two ways is returned twice, and `RETURN DISTINCT` returns it once.

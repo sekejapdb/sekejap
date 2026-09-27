@@ -2,8 +2,9 @@
 
 ## 0.18.0
 
-The storage format does not change: 0.18.0 opens a 0.17 database as it is,
-with no migration and no index rebuild.
+0.18.0 opens a 0.17 database as it is, with no migration and no index
+rebuild. A database that uses a new 0.18 feature (edge tables, named schemas)
+is refused by 0.17 by name, never misread.
 
 ### Graph queries are ISO GQL
 
@@ -28,6 +29,28 @@ with no migration and no index rebuild.
   twice; `RETURN DISTINCT` returns it once.
 - `{0,n}` includes the starting node, and an unbounded quantifier is no
   longer capped at 16 steps.
+
+### Edges are written in SQL, through edge tables
+
+- The PostgreSQL 19, Oracle 23ai and Spanner way of writing a property
+  graph's edges: `CREATE TABLE` with `REFERENCES` columns naming the two rows
+  an edge joins, `CREATE PROPERTY GRAPH ... EDGE TABLES (t SOURCE KEY (a)
+  REFERENCES v (_key) DESTINATION KEY (b) REFERENCES w (_key))`, then plain
+  `INSERT`, `UPDATE`, `DELETE` and `SELECT`. See
+  [`docs/core/EDGE_TABLES.md`](docs/core/EDGE_TABLES.md).
+- An edge table is a view over the graph's own edges, not a table of rows:
+  nothing is stored twice, and `GRAPH_TABLE` walks the same edges.
+- The edge table's columns type the edges' properties, and its
+  `PRIMARY KEY` decides how many edges one pair may have: one per pair, one
+  per value of extra key columns, or one per source. A taken key is `23505`,
+  an end that names no row is `23503`, and `INSERT ... ON CONFLICT` is the
+  upsert. A plain `INSERT` never overwrites.
+- A `WHERE` on an edge table names an end, because the read is one node's
+  edges; there is no index over edge properties yet.
+- `ALTER PROPERTY GRAPH ... ADD` and `DROP PROPERTY GRAPH`, which keeps every
+  edge. A table that an edge table references cannot be dropped.
+- Over the PostgreSQL wire, a refused edge write carries PostgreSQL's own
+  SQLSTATE.
 
 ### Vector ordering follows PostgreSQL
 
