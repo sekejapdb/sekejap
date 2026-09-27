@@ -3838,10 +3838,15 @@ fn e4sql_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(String,
             let seed = v.text(q.seed_key(i)?);
             let lower = v.int(born_lower);
             let upper = v.int(born_upper);
+            // The born window sits on EVERY node the walk enters, inside the
+            // quantified subpath, as the other arms filter each hop: a WHERE
+            // on the endpoint alone would also admit a two-hop place reached
+            // through a middle place outside the window.
             format!(
                 "SELECT * FROM GRAPH_TABLE (base MATCH \
-                 (a IS place WHERE a._key = {seed})-[r:{RELATED}]->{{1,2}}\
-                 (b IS place WHERE b.born >= {lower} AND b.born <= {upper}) RETURN b._key AS k)"
+                 (a IS place WHERE a._key = {seed})\
+                 ((x)-[r:{RELATED}]->(y IS place WHERE y.born >= {lower} AND y.born <= {upper})){{1,2}}\
+                 (b IS place) RETURN b._key AS k)"
             )
         }
         // `ORDER BY w DESC LIMIT {K}` ranked by the reaching edge's property:
@@ -4350,6 +4355,16 @@ fn open_pg(dsn: &str, expected_rows: usize) -> R<(Client, Vec<Value>)> {
 /// `destination` is created for the same reason in the other direction --
 /// `graph_1hop_weight_top10` walks the fan-in, and E4's reverse mirror
 /// (`GRAPH_CONTRACT` 2.2) is exactly that index, always written.
+/// True when a previous load left exactly `expected` `related` edges.
+fn pg_edges_loaded(client: &mut Client, expected: usize) -> R<bool> {
+    let exists: bool = client.query_one("SELECT to_regclass($1) IS NOT NULL", &[&RELATED])?.get(0);
+    if !exists {
+        return Ok(false);
+    }
+    let count: i64 = client.query_one(&format!("SELECT count(*) FROM {RELATED}"), &[])?.get(0);
+    Ok(usize::try_from(count).ok() == Some(expected))
+}
+
 fn load_graph_pg(client: &mut Client, corpus: &Corpus, edges: &[Related]) -> R<Value> {
     let at = Instant::now();
     client.batch_execute(&format!(
@@ -5649,6 +5664,20 @@ fn open_sqlite(path: &Path, expected_rows: usize) -> R<(SqliteCtx, Vec<Value>)> 
 /// forward index is what the recursive CTE's hop reads and the reverse one is
 /// E4's always-written reverse posting (GRAPH_CONTRACT 2.2), which
 /// `graph_1hop_weight_top10` walks.
+/// True when a previous load left exactly `expected` `related` edges.
+fn lite_edges_loaded(ctx: &SqliteCtx, expected: usize) -> R<bool> {
+    let tables: i64 = ctx.conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [RELATED],
+        |row| row.get(0),
+    )?;
+    if tables == 0 {
+        return Ok(false);
+    }
+    let count: i64 = ctx.conn.query_row(&format!("SELECT count(*) FROM {RELATED}"), [], |row| row.get(0))?;
+    Ok(usize::try_from(count).ok() == Some(expected))
+}
+
 fn load_graph_sqlite(ctx: &SqliteCtx, corpus: &Corpus, edges: &[Related]) -> R<Value> {
     let at = Instant::now();
     ctx.conn.execute_batch(&format!(
@@ -6495,7 +6524,15 @@ pub fn run_arm(options: &Options) -> R<Value> {
                 load_e4(&options.db_dir, &corpus)?
             };
             if options.graph {
-                built.push(load_graph_e4(&mut ctx, &corpus, &edges)?);
+                // `--reuse` keeps the edges a completed load wrote: re-linking
+                // 3M identical edges per pass costs minutes and answers nothing.
+                built.push(if options.reuse && ctx.db.edge_type(RELATED)?.is_some() {
+                    ctx.related = ctx.db.edge_type(RELATED)?;
+                    eprintln!("[e4] `related` edges already loaded; reused");
+                    skipped_stage("graph (reused)")
+                } else {
+                    load_graph_e4(&mut ctx, &corpus, &edges)?
+                });
             } else {
                 built.push(skipped_stage("graph"));
             }
@@ -6579,7 +6616,15 @@ pub fn run_arm(options: &Options) -> R<Value> {
                 load_e4(&options.db_dir, &corpus)?
             };
             if options.graph {
-                built.push(load_graph_e4(&mut ctx, &corpus, &edges)?);
+                // `--reuse` keeps the edges a completed load wrote: re-linking
+                // 3M identical edges per pass costs minutes and answers nothing.
+                built.push(if options.reuse && ctx.db.edge_type(RELATED)?.is_some() {
+                    ctx.related = ctx.db.edge_type(RELATED)?;
+                    eprintln!("[e4] `related` edges already loaded; reused");
+                    skipped_stage("graph (reused)")
+                } else {
+                    load_graph_e4(&mut ctx, &corpus, &edges)?
+                });
             } else {
                 built.push(skipped_stage("graph"));
             }
@@ -6731,7 +6776,12 @@ pub fn run_arm(options: &Options) -> R<Value> {
                 load_pg(dsn, &corpus)?
             };
             if options.graph {
-                built.push(load_graph_pg(&mut client, &corpus, &edges)?);
+                built.push(if options.reuse && pg_edges_loaded(&mut client, edges.len())? {
+                    eprintln!("[postgres] `related` edges already loaded; reused");
+                    skipped_stage("graph (reused)")
+                } else {
+                    load_graph_pg(&mut client, &corpus, &edges)?
+                });
             } else {
                 built.push(skipped_stage("graph"));
             }
@@ -6851,7 +6901,12 @@ pub fn run_arm(options: &Options) -> R<Value> {
             eprintln!("[sqlite] SQLite {version} (rusqlite's bundled build)");
             engine = json!({"sqlite_version": version});
             if options.graph {
-                built.push(load_graph_sqlite(&ctx, &corpus, &edges)?);
+                built.push(if options.reuse && lite_edges_loaded(&ctx, edges.len())? {
+                    eprintln!("[sqlite] `related` edges already loaded; reused");
+                    skipped_stage("graph (reused)")
+                } else {
+                    load_graph_sqlite(&ctx, &corpus, &edges)?
+                });
             } else {
                 built.push(skipped_stage("graph"));
             }
