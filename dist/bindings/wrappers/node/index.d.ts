@@ -63,8 +63,25 @@ export interface IndexDecl {
   ready: boolean;
 }
 
+export interface EdgeTableInfo {
+  /** Each REFERENCES column and the table it names. */
+  references: Array<[string, string]>;
+  key: string[];
+  /** Null until a property graph declares the table. */
+  source: string | null;
+  source_table: string | null;
+  destination: string | null;
+  destination_table: string | null;
+  label: string | null;
+  graph: string | null;
+}
+
 export interface CollectionDescriptor {
   name: string;
+  /** `public`, or the named schema the table belongs to. */
+  schema: string;
+  /** Set for an edge table, null for a table of rows. */
+  edge: EdgeTableInfo | null;
   timestamps: boolean;
   rows: number | null;
   fields: Array<FieldDecl & { declared: string | null; primary_key: boolean }>;

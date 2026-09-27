@@ -109,6 +109,10 @@ class IndexInfo {
 class CollectionDescription {
   CollectionDescription.fromJson(Map<String, Object?> json)
       : name = json['name'] as String,
+        schema = json['schema'] as String? ?? 'public',
+        edge = json['edge'] == null
+            ? null
+            : EdgeTableInfo.fromJson(json['edge'] as Map<String, Object?>),
         timestamps = json['timestamps'] as bool? ?? false,
         rows = json['rows'] as int?,
         fields = [
@@ -120,7 +124,16 @@ class CollectionDescription {
             IndexInfo.fromJson(i as Map<String, Object?>)
         ];
 
+  /// The table's own name, without its schema.
   final String name;
+
+  /// `public`, or the named schema the table belongs to.
+  final String schema;
+
+  /// Set for an edge table (a table whose rows are edges), null for a table
+  /// of rows.
+  final EdgeTableInfo? edge;
+
   final bool timestamps;
 
   /// The live row count in rows, or null where this database keeps no record
@@ -134,6 +147,33 @@ class CollectionDescription {
   @override
   String toString() => 'CollectionDescription($name, '
       '${fields.length} fields, ${indexes.length} indexes, rows=$rows)';
+}
+
+/// What an edge table declares: its REFERENCES columns and the tables they
+/// name, its key, and -- once a property graph declares it -- which column
+/// is the source and which the destination, the label, and the graph.
+class EdgeTableInfo {
+  EdgeTableInfo.fromJson(Map<String, Object?> json)
+      : references = [
+          for (final r in (json['references'] as List<Object?>? ?? const []))
+            ((r as List<Object?>)[0] as String, r[1] as String)
+        ],
+        key = [for (final k in (json['key'] as List<Object?>? ?? const [])) k as String],
+        source = json['source'] as String?,
+        sourceTable = json['source_table'] as String?,
+        destination = json['destination'] as String?,
+        destinationTable = json['destination_table'] as String?,
+        label = json['label'] as String?,
+        graph = json['graph'] as String?;
+
+  final List<(String, String)> references;
+  final List<String> key;
+  final String? source;
+  final String? sourceTable;
+  final String? destination;
+  final String? destinationTable;
+  final String? label;
+  final String? graph;
 }
 
 /// One row a hop away, from `Db.neighbours`. The collection is part of the

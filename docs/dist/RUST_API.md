@@ -279,8 +279,9 @@ one spelling and this crate does not add a second.
 
 | item | engine call | one line |
 |---|---|---|
-| `Db::collections() -> Result<Vec<String>>` | `Database::list_collections` (new, §8) | `for name in db.collections()? { .. }` |
-| `Db::describe(collection) -> Result<Option<Collection>>` | `Database::collection` + `collection_info` (`:1474`, `:1487`) + `list_indexes` (`collections/catalog.rs:887`) | `let schema = db.describe("posts")?;` |
+| `Db::collections() -> Result<Vec<String>>` | `Database::list_qualified_collections`: a `public` table by its name, a table in a named schema as `schema.table` (0.18.1) | `for name in db.collections()? { .. }` |
+| `Db::describe(collection) -> Result<Option<Collection>>` | `Database::collection_in` + `collection_info` + `list_indexes` + `edge_table` | `let shape = db.describe("geo.places")?;` -- `shape.schema` is the table's schema, and `shape.edge` is `Some(EdgeTableInfo)` for an edge table: its REFERENCES, key, source and destination columns and tables, label and property graph; an edge table's `fields` have no `_key` (0.18.1) |
+| collection names everywhere | `resolve`: `table`, `public.table`, or `schema.table` for a schema that exists | `db.get(("geo.places", "p1"))?`, `db.count_rows("geo.places")?`; a name whose part before the first dot is not a schema is looked up whole (0.18.1) |
 | `Db::count_rows(collection) -> Result<u64>` | `Database::row_count` (the live record) and, only where there is none, the walk | `let n = db.count_rows("posts")?;` |
 | `Db::scan_count_rows(collection) -> Result<u64>` | `Database::scan` walked to the end | `let n = db.scan_count_rows("posts")?;` |
 | `Db::scan_count_all_rows() -> Result<u64>` | the same walk per collection | `let n = db.scan_count_all_rows()?;` |

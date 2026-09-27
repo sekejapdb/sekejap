@@ -450,15 +450,21 @@ int32_t sekejap_create_collection(SekejapDb *db, const char *name, const char *f
 // `db` must be a live handle and `name` a valid C string.
 int32_t sekejap_drop_collection(SekejapDb *db, const char *name);
 
-// Every collection name in the catalog, in key order, as a heap JSON array
-// of strings. `NULL` on failure.
+// Every collection name in the catalog, as a heap JSON array of strings:
+// a `public` table by its name, a table in a named schema as
+// `schema.table`. `NULL` on failure.
 //
 // # Safety
 // `db` must be a live handle.
 char *sekejap_collections(SekejapDb *db);
 
 // The declared shape of one collection, as a heap JSON object:
-// `{"name", "timestamps", "rows", "fields": [...], "indexes": [...]}`.
+// `{"name", "schema", "timestamps", "rows", "fields": [...], "indexes":
+// [...], "edge"}`. `collection` may be `schema.table`. `edge` is `null` for
+// a table of rows and, for an edge table, `{"references": [[column, table],
+// ...], "key": [...], "source", "source_table", "destination",
+// "destination_table", "label", "graph"}` -- the last six `null` until a
+// property graph declares it (`docs/core/EDGE_TABLES.md`).
 // `rows` is the LIVE row count or `null` where this database keeps no
 // record for the collection -- `null` is "no record", not "no rows".
 // `NULL` with `SekejapStatus_Ok` means there is no such collection.

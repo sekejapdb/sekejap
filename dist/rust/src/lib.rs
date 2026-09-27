@@ -38,7 +38,7 @@ mod plans;
 mod rows;
 mod scan;
 
-pub use catalog::{Collection, Field, Index};
+pub use catalog::{Collection, EdgeTableInfo, Field, Index};
 pub use db::{Db, Tx, KEY, MAX_NEIGHBOURS, QUERY_PAGE, SCAN_PAGE};
 /// The bounded prepared-plan cache (`docs/lang/QL_CONTRACT.md` §2) and the
 /// statement a caller prepares by hand.

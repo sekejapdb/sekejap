@@ -1,11 +1,12 @@
 //! `Db`: the one handle an application opens. `docs/dist/RUST_API.md`.
 
-use crate::catalog::{Collection, Field, Index};
+use crate::catalog::{Collection, EdgeTableInfo, Field, Index};
 use crate::error::{Error, Result};
 use crate::rows::{expect_affected, expect_rows, params_of, Rows};
 use crate::scan::Scan;
 use crate::{Addr, Document, Mode, Storage};
 use sekejap_core::collections::{
+    PUBLIC_SCHEMA,
     CollectionId, CollectionOptions, Database, Direction, DropMode, EntityId, GraphContextId,
     NeighborRequest,
 };
@@ -265,10 +266,18 @@ impl Db {
             .map(|(n, k)| ((*n).to_owned(), k.clone()))
             .collect();
         let out = self.write(|db| {
-            if db.collection(name)?.is_some() {
+            if resolve(db, name)?.is_some() {
                 return Ok(false);
             }
-            db.create_collection(name, fields, CollectionOptions::default())?;
+            let (schema, table) = split_name(db, name)?;
+            db.create_collection_in(
+                &schema,
+                &table,
+                fields,
+                Vec::new(),
+                Vec::new(),
+                CollectionOptions::default(),
+            )?;
             Ok(true)
         });
         self.catalog_changed();
@@ -279,7 +288,7 @@ impl Db {
     /// `false` if there was no such collection.
     pub fn drop_collection(&self, name: &str) -> Result<bool> {
         let out = self.write(|db| {
-            let Some(id) = db.collection(name)? else {
+            let Some(id) = resolve(db, name)? else {
                 return Ok(false);
             };
             db.begin_drop_collection_mode(id, DropMode::Cascade)?;
@@ -311,7 +320,7 @@ impl Db {
     pub fn get<'a>(&self, addr: impl Into<Addr<'a>>) -> Result<Option<Value>> {
         let addr = addr.into();
         self.read(|db| {
-            let Some(id) = db.collection(addr.collection)? else {
+            let Some(id) = resolve(db, addr.collection)? else {
                 return Ok(None);
             };
             Ok(db
@@ -324,7 +333,7 @@ impl Db {
     pub fn exists<'a>(&self, addr: impl Into<Addr<'a>>) -> Result<bool> {
         let addr = addr.into();
         self.read(|db| {
-            let Some(id) = db.collection(addr.collection)? else {
+            let Some(id) = resolve(db, addr.collection)? else {
                 return Ok(false);
             };
             Ok(db.get(id, addr.key)?.is_some())
@@ -623,25 +632,42 @@ impl Db {
 
     // ── §5 catalog ───────────────────────────────────────────────────────
 
-    /// Every collection name in the catalog, in key order.
+    /// Every collection name in the catalog: a `public` table by its name,
+    /// a table in a named schema as `schema.table`, as PostgreSQL shows them
+    /// with the default search path.
     pub fn collections(&self) -> Result<Vec<String>> {
-        self.read(|db| Ok(db.list_collections()?))
+        self.read(|db| {
+            Ok(db
+                .list_qualified_collections()?
+                .into_iter()
+                .map(|(schema, name)| shown_name(&schema, &name))
+                .collect())
+        })
     }
 
     /// The declared shape of one collection. `None` if there is no such
     /// collection.
     pub fn describe(&self, collection: &str) -> Result<Option<Collection>> {
         self.read(|db| {
-            let Some(id) = db.collection(collection)? else {
+            let Some(id) = resolve(db, collection)? else {
                 return Ok(None);
             };
             let info = db.collection_info(id)?;
-            let mut fields = vec![Field {
-                name: KEY.to_owned(),
-                kind: Kind::Text,
-                declared: Some("TEXT".to_owned()),
-                primary_key: true,
-            }];
+            let edge = match db.edge_table(id)? {
+                None => None,
+                Some(table) => Some(edge_info(db, table)?),
+            };
+            // An edge table has no `_key`: its ends name the rows it joins.
+            let mut fields = if edge.is_some() {
+                Vec::new()
+            } else {
+                vec![Field {
+                    name: KEY.to_owned(),
+                    kind: Kind::Text,
+                    declared: Some("TEXT".to_owned()),
+                    primary_key: true,
+                }]
+            };
             for (name, kind) in &info.layout.fields {
                 fields.push(Field {
                     name: name.clone(),
@@ -670,10 +696,12 @@ impl Db {
                 .collect();
             Ok(Some(Collection {
                 name: info.name,
+                schema: info.schema,
                 fields,
                 indexes,
                 timestamps: info.timestamps,
                 rows: db.row_count(id)?,
+                edge,
             }))
         })
     }
@@ -690,7 +718,7 @@ impl Db {
     /// without paying for either.
     pub fn count_rows(&self, collection: &str) -> Result<u64> {
         self.read(|db| {
-            let Some(id) = db.collection(collection)? else {
+            let Some(id) = resolve(db, collection)? else {
                 return Err(Error::UnknownCollection(collection.to_owned()));
             };
             match db.row_count(id)? {
@@ -705,7 +733,7 @@ impl Db {
     /// the one that reads the record when there is one.
     pub fn scan_count_rows(&self, collection: &str) -> Result<u64> {
         self.read(|db| {
-            let Some(id) = db.collection(collection)? else {
+            let Some(id) = resolve(db, collection)? else {
                 return Err(Error::UnknownCollection(collection.to_owned()));
             };
             count_rows(db, id)
@@ -716,8 +744,8 @@ impl Db {
     pub fn scan_count_all_rows(&self) -> Result<u64> {
         self.read(|db| {
             let mut total = 0u64;
-            for name in db.list_collections()? {
-                if let Some(id) = db.collection(&name)? {
+            for (schema, name) in db.list_qualified_collections()? {
+                if let Some(id) = db.collection_in(&schema, &name)? {
                     total += count_rows(db, id)?;
                 }
             }
@@ -862,7 +890,7 @@ impl Tx<'_> {
     /// Delete one row.
     pub fn delete<'a>(&mut self, addr: impl Into<Addr<'a>>) -> Result<bool> {
         let addr = addr.into();
-        let Some(id) = self.database().collection(addr.collection)? else {
+        let Some(id) = resolve(self.database(), addr.collection)? else {
             return Ok(false);
         };
         match &mut self.inner {
@@ -1019,8 +1047,76 @@ fn open_or_create(path: &Path, config: Config) -> Result<Database> {
 }
 
 pub(crate) fn collection_id(db: &Database, name: &str) -> Result<CollectionId> {
-    db.collection(name)?
-        .ok_or_else(|| Error::UnknownCollection(name.to_owned()))
+    resolve(db, name)?.ok_or_else(|| Error::UnknownCollection(name.to_owned()))
+}
+
+/// A collection name as the API takes it: `table`, `public.table`, or
+/// `schema.table` for a table in a named schema that exists. A name whose
+/// part before the first dot is not a schema is looked up whole, so a table
+/// whose own name holds a dot still resolves.
+pub(crate) fn resolve(db: &Database, name: &str) -> Result<Option<CollectionId>> {
+    let (schema, table) = split_name(db, name)?;
+    Ok(db.collection_in(&schema, &table)?)
+}
+
+fn split_name(db: &Database, name: &str) -> Result<(String, String)> {
+    if let Some((schema, table)) = name.split_once('.') {
+        if schema.eq_ignore_ascii_case(PUBLIC_SCHEMA) {
+            return Ok((PUBLIC_SCHEMA.to_owned(), table.to_owned()));
+        }
+        if db.schema_exists(schema)? {
+            return Ok((schema.to_owned(), table.to_owned()));
+        }
+    }
+    Ok((PUBLIC_SCHEMA.to_owned(), name.to_owned()))
+}
+
+/// A table as a statement names it: bare in `public`, qualified elsewhere.
+fn shown_name(schema: &str, name: &str) -> String {
+    if schema == PUBLIC_SCHEMA {
+        name.to_owned()
+    } else {
+        format!("{schema}.{name}")
+    }
+}
+
+fn table_name(db: &Database, id: CollectionId) -> Result<String> {
+    let info = db.collection_info(id)?;
+    Ok(shown_name(&info.schema, &info.name))
+}
+
+fn edge_info(db: &Database, table: sekejap_core::collections::EdgeTable) -> Result<EdgeTableInfo> {
+    let mut references = Vec::with_capacity(table.references.len());
+    for (column, target) in &table.references {
+        references.push((column.clone(), table_name(db, *target)?));
+    }
+    let end_table = |column: &str| {
+        references
+            .iter()
+            .find(|(c, _)| c == column)
+            .map(|(_, t)| t.clone())
+    };
+    let (source, source_table, destination, destination_table, label, graph) = match &table.binding {
+        None => (None, None, None, None, None, None),
+        Some(binding) => (
+            Some(binding.source.clone()),
+            end_table(&binding.source),
+            Some(binding.destination.clone()),
+            end_table(&binding.destination),
+            Some(db.edge_type_name(binding.edge_type)?),
+            (!binding.graph.is_empty()).then(|| binding.graph.clone()),
+        ),
+    };
+    Ok(EdgeTableInfo {
+        references,
+        key: table.key,
+        source,
+        source_table,
+        destination,
+        destination_table,
+        label,
+        graph,
+    })
 }
 
 fn entity_id(db: &Database, addr: Addr<'_>) -> Result<EntityId> {

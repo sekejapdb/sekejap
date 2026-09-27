@@ -88,8 +88,8 @@ is a much larger thing to get wrong.
 | a scan page | a JSON ARRAY of documents |
 | `sekejap_put_many` rows | a JSON array of `{"key": "...", "doc": { ... }}` |
 | `sekejap_neighbours` | a JSON array of `{"collection": "...", "key": "...", "document": { ... }}`. The collection is named because a neighbour can be in another one |
-| `sekejap_collections` | a JSON array of strings, in key order |
-| `sekejap_describe` | `{"name", "timestamps", "rows", "fields": [...], "indexes": [...]}`. A field is `{"name", "kind", "dimension"?, "declared", "primary_key"}`; an index is `{"name", "field", "family", "unique", "ready"}` |
+| `sekejap_collections` | a JSON array of strings: a `public` table by its name, a table in a named schema as `schema.table` |
+| `sekejap_describe` | `{"name", "schema", "timestamps", "rows", "fields": [...], "indexes": [...], "edge"}`. A field is `{"name", "kind", "dimension"?, "declared", "primary_key"}`; an index is `{"name", "field", "family", "unique", "ready"}`; `edge` is `null` for a table of rows and `{"references": [[column, table], ...], "key", "source", "source_table", "destination", "destination_table", "label", "graph"}` for an edge table (the last six `null` until a property graph declares it). `collection` may be `schema.table` |
 | `sekejap_create_collection` fields | a JSON array of `{"name", "kind", "dimension"?}` |
 | `sekejap_open_with_config` | `{"budget_bytes": n, "io": "buffered"\|"direct", "sync": "full"\|"normal"\|"off"}`, every member optional |
 | `sekejap_storage` | `{"data_bytes", "wal_bytes", "total_bytes"}` |

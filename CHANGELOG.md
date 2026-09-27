@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.18.1
+
+The API's catalog sees what SQL sees. Nothing in the storage format changes.
+
+- `collections()` lists a table in a named schema as `schema.table`; a
+  `public` table keeps its bare name.
+- Every API call that names a collection -- `describe`, `get`, `put`,
+  `count_rows`, `scan`, `create_collection` and the rest -- takes
+  `schema.table`.
+- `describe()` reports the table's `schema`, and for an edge table an `edge`
+  section: its REFERENCES columns and tables, key, source and destination,
+  label and property graph. An edge table's fields no longer include a
+  `_key` it does not have.
+- The C ABI's `sekejap_describe` JSON carries `schema` and `edge`, so every
+  binding sees them; the Dart `CollectionDescription` and the Node
+  `CollectionDescriptor` types have them as fields.
+- Rust: `Collection` gains the `schema` and `edge` fields, which breaks code
+  that builds a `Collection` by hand; code that reads one is unaffected.
+
 ## 0.18.0
 
 0.18.0 opens a 0.17 database as it is, with no migration and no index

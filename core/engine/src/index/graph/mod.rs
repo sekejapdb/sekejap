@@ -3189,6 +3189,11 @@ impl Database {
         Ok((found.into_iter().collect(), truncated))
     }
 
+    /// The name an edge type was interned under: an edge table's label.
+    pub fn edge_type_name(&self, id: EdgeTypeId) -> Result<String> {
+        Ok(read_name(|key| self.store()?.get(key).map_err(Error::from), 0, id.0)?.name)
+    }
+
     /// The name a context was interned under, for a refusal that has to name
     /// it. The base graph has no descriptor and no name.
     pub(crate) fn graph_context_name(&self, id: GraphContextId) -> Result<String> {

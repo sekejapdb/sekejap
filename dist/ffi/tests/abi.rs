@@ -652,6 +652,45 @@ fn describe_answers_the_declared_fields_with_key_first_and_collections_lists_the
     );
 }
 
+/// A table in a named schema is listed and described qualified, and an edge
+/// table is described as one: its ends, label, key and graph, and no `_key`.
+#[test]
+fn the_catalog_names_schemas_and_describes_edge_tables() {
+    let db = Fixture::open();
+    for sql in [
+        "CREATE SCHEMA geo",
+        "CREATE TABLE geo.places (_key TEXT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE artist (_key TEXT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE song (_key TEXT PRIMARY KEY, title TEXT)",
+        "CREATE TABLE wrote (artist_id TEXT REFERENCES artist, song_id TEXT REFERENCES song, PRIMARY KEY (artist_id, song_id))",
+        "CREATE PROPERTY GRAPH music VERTEX TABLES (artist, song) EDGE TABLES (wrote SOURCE KEY (artist_id) REFERENCES artist (_key) DESTINATION KEY (song_id) REFERENCES song (_key))",
+    ] {
+        db.execute(sql, &json!([]));
+    }
+    let names = take_json(unsafe { sekejap_collections(db.db) });
+    assert!(names.as_array().unwrap().contains(&json!("geo.places")), "{names}");
+    let places = take_json(unsafe { sekejap_describe(db.db, c("geo.places").as_ptr()) });
+    assert_eq!(places["schema"], "geo");
+    assert_eq!(places["name"], "places");
+    assert_eq!(places["edge"], Value::Null);
+    let wrote = take_json(unsafe { sekejap_describe(db.db, c("wrote").as_ptr()) });
+    assert_eq!(wrote["schema"], "public");
+    assert_eq!(
+        wrote["edge"],
+        json!({
+            "references": [["artist_id", "artist"], ["song_id", "song"]],
+            "key": ["artist_id", "song_id"],
+            "source": "artist_id",
+            "source_table": "artist",
+            "destination": "song_id",
+            "destination_table": "song",
+            "label": "wrote",
+            "graph": "music",
+        })
+    );
+    assert_eq!(wrote["fields"][0]["name"], "artist_id", "an edge table has no _key");
+}
+
 #[test]
 fn storage_answers_the_two_files_and_their_total_and_a_checkpoint_reports_whether_it_folded() {
     let db = Fixture::open();

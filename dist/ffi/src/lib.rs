@@ -1393,8 +1393,9 @@ pub unsafe extern "C" fn sekejap_drop_collection(
     })
 }
 
-/// Every collection name in the catalog, in key order, as a heap JSON array
-/// of strings. `NULL` on failure.
+/// Every collection name in the catalog, as a heap JSON array of strings:
+/// a `public` table by its name, a table in a named schema as
+/// `schema.table`. `NULL` on failure.
 ///
 /// # Safety
 /// `db` must be a live handle.
@@ -1409,7 +1410,12 @@ pub unsafe extern "C" fn sekejap_collections(db: *mut SekejapDb) -> *mut c_char 
 }
 
 /// The declared shape of one collection, as a heap JSON object:
-/// `{"name", "timestamps", "rows", "fields": [...], "indexes": [...]}`.
+/// `{"name", "schema", "timestamps", "rows", "fields": [...], "indexes":
+/// [...], "edge"}`. `collection` may be `schema.table`. `edge` is `null` for
+/// a table of rows and, for an edge table, `{"references": [[column, table],
+/// ...], "key": [...], "source", "source_table", "destination",
+/// "destination_table", "label", "graph"}` -- the last six `null` until a
+/// property graph declares it (`docs/core/EDGE_TABLES.md`).
 /// `rows` is the LIVE row count or `null` where this database keeps no
 /// record for the collection -- `null` is "no record", not "no rows".
 /// `NULL` with `SekejapStatus_Ok` means there is no such collection.
@@ -1462,12 +1468,27 @@ pub unsafe extern "C" fn sekejap_describe(
                 })
             })
             .collect();
+        let edge = match &found.edge {
+            None => Value::Null,
+            Some(edge) => json!({
+                "references": edge.references.iter().map(|(c, t)| json!([c, t])).collect::<Vec<_>>(),
+                "key": edge.key,
+                "source": edge.source,
+                "source_table": edge.source_table,
+                "destination": edge.destination,
+                "destination_table": edge.destination_table,
+                "label": edge.label,
+                "graph": edge.graph,
+            }),
+        };
         let answer = json!({
             "name": found.name,
+            "schema": found.schema,
             "timestamps": found.timestamps,
             "rows": match found.rows { Some(rows) => Value::from(rows), None => Value::Null },
             "fields": fields,
             "indexes": indexes,
+            "edge": edge,
         });
         encode(&answer)
     })
