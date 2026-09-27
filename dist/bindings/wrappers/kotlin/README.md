@@ -1,6 +1,6 @@
 # sekejap for the JVM — Kotlin and Java
 
-One Maven artifact, **`life.sekejap:sekejap-ffm:0.18.1`**, bound with the
+One Maven artifact, **`life.sekejap:sekejap-ffm:0.18.2`**, bound with the
 **Foreign Function & Memory API** (Panama, `java.lang.foreign`, final in JDK 22)
 over the C ABI `libsekejap` — [`dist/ffi/include/sekejap.h`](../../../ffi/include/sekejap.h),
 contract [`docs/dist/C_ABI.md`](../../../../docs/dist/C_ABI.md). Pure JVM: no JNI
@@ -100,7 +100,7 @@ for; the answer is handed over as the ABI produced it.
 ## Distribution
 
 - **Registry:** [Maven Central](https://central.sonatype.com) —
-  `implementation("life.sekejap:sekejap-ffm:0.18.1")`
+  `implementation("life.sekejap:sekejap-ffm:0.18.2")`
 - **groupId:** `life.sekejap`, the reverse-DNS of `sekejap.life` and the Kotlin
   package.
 - **Publish:** `.github/workflows/release.yml`, job `publish-kotlin`. It stages

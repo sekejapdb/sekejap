@@ -237,6 +237,16 @@ pub(super) enum TextShape {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Predicate {
+    /// `col [NOT] LIKE | ILIKE pattern [ESCAPE c]`: PostgreSQL's pattern
+    /// match. A plain case-sensitive `'abc%'` is a prefix range over the
+    /// column's index; everything else is checked on the row.
+    Like {
+        column: String,
+        pattern: Literal,
+        escape: Option<Literal>,
+        insensitive: bool,
+        negated: bool,
+    },
     Compare {
         column: String,
         op: CmpOp,

@@ -460,6 +460,7 @@ impl Db {
     /// Run one writing statement and commit. Returns the rows it moved; a
     /// statement that only raises a notice returns zero.
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        refuse_transaction_word(sql)?;
         self.in_transaction(|tx| tx.execute(sql, params))
     }
 
@@ -469,6 +470,7 @@ impl Db {
     /// there first, and a hit REBINDS the compiled plan rather than parsing
     /// and compiling it again. `Db::cache_stats` reports what that is doing.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Rows> {
+        refuse_transaction_word(sql)?;
         let params = params_of(params);
         match self.with_cached_plan(sql, &params, |db, prepared| {
             if !(prepared.is_select() || prepared.is_aggregate()) {
@@ -672,12 +674,16 @@ impl Db {
                 fields.push(Field {
                     name: name.clone(),
                     kind: kind.clone(),
+                    // The spelling the table declared, or one derived from the
+                    // stored kind for a table that recorded none (created
+                    // through the API, or before every column was recorded).
                     declared: info
                         .declared
                         .iter()
                         .find(|(f, _)| f == name)
-                        .map(|(_, d)| d.clone()),
-                    primary_key: false,
+                        .map(|(_, d)| d.clone())
+                        .or_else(|| Some(sekejap_lang::catalog::declared_of(kind))),
+                    primary_key: info.key.as_ref().and_then(|k| k.column.as_deref()) == Some(name),
                 });
             }
             let indexes = db
@@ -845,6 +851,7 @@ impl Tx<'_> {
     /// own writes and what its `SET LOCAL` set (`ef_search`). Not cached --
     /// the plan cache serves `Db::query`, which runs outside a transaction.
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
+        refuse_transaction_word(sql)?;
         let params = params_of(params);
         let result = self.database().sql(sql, &params)?;
         expect_rows(result, sql)
@@ -966,6 +973,7 @@ impl Tx<'_> {
     /// also where `BEGIN`, `COMMIT` and `ROLLBACK` as SQL are refused
     /// (`docs/dist/RUST_API.md` §6): the service owns the barrier.
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
+        refuse_transaction_word(sql)?;
         let params = params_of(params);
         let result: SqlResult = match &mut self.inner {
             TxInner::Single(g) => g.sql(sql, &params)?,
@@ -1044,6 +1052,37 @@ fn open_or_create(path: &Path, config: Config) -> Result<Database> {
     } else {
         Ok(Database::create(path, config)?)
     }
+}
+
+/// `BEGIN`, `COMMIT`, `ROLLBACK` and their spellings through a call that is
+/// already one transaction: `Db::execute`/`Db::query` commit on their own, so
+/// the word would answer `Ok` and do nothing, and inside a `Tx` it would end
+/// the transaction the caller holds. Refused by name, naming the call that
+/// does it. `BEGIN BULK` / `END BULK` are the bulk scope, not a transaction
+/// word. The PostgreSQL wire keeps honouring them: a wire session is one.
+fn refuse_transaction_word(sql: &str) -> Result<()> {
+    let words: Vec<String> = sql
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .filter(|w| !w.is_empty())
+        .take(2)
+        .map(str::to_ascii_uppercase)
+        .collect();
+    let first = words.first().map(String::as_str).unwrap_or("");
+    let second = words.get(1).map(String::as_str);
+    let is_word = match first {
+        "BEGIN" | "END" => second != Some("BULK"),
+        "START" => second == Some("TRANSACTION"),
+        "COMMIT" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE" => true,
+        _ => false,
+    };
+    if is_word {
+        return Err(Error::Sql(sekejap_lang::SqlError::Unsupported(format!(
+            "`{}` through Db::execute / Db::query / Tx: each of these is already one transaction, so the word would do nothing or end the caller's; use Db::transaction() and Tx::commit / Tx::rollback (the PostgreSQL wire honours BEGIN/COMMIT/ROLLBACK)",
+            sql.trim()
+        ))));
+    }
+    Ok(())
 }
 
 pub(crate) fn collection_id(db: &Database, name: &str) -> Result<CollectionId> {

@@ -227,6 +227,34 @@ impl Parser {
                 metres: None,
             });
         }
+        // `col [NOT] LIKE | ILIKE pattern [ESCAPE 'c']`, read before the
+        // operator guard so `NOT LIKE` is not taken for a stray `NOT`.
+        if !cast_to_date {
+            let (negated, word_at) = if self.word().as_deref() == Some("NOT") {
+                (true, 1)
+            } else {
+                (false, 0)
+            };
+            if let Some(op @ ("LIKE" | "ILIKE")) = self.word_at(word_at).as_deref() {
+                let insensitive = op == "ILIKE";
+                for _ in 0..=word_at {
+                    self.bump();
+                }
+                let pattern = self.literal()?;
+                let escape = if self.eat_word("ESCAPE") {
+                    Some(self.literal()?)
+                } else {
+                    None
+                };
+                return Ok(Predicate::Like {
+                    column,
+                    pattern,
+                    escape,
+                    insensitive,
+                    negated,
+                });
+            }
+        }
         self.guard_operator()?;
         if cast_to_date {
             let op = self.comparison(&format!("{column}::date"))?;

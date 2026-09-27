@@ -711,7 +711,7 @@ pub fn declared_of(kind: &Kind) -> String {
         Kind::Bool => "BOOLEAN".into(),
         Kind::Json => "JSONB".into(),
         Kind::Geo => "GEOMETRY".into(),
-        Kind::Point => "GEOMETRY(Point, 4326)".into(),
+        Kind::Point => "GEOMETRY(Point,4326)".into(),
         Kind::Vector(n) => format!("VECTOR({n})"),
     }
 }

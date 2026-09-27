@@ -183,11 +183,12 @@ fn walk_token(
     id: IndexId,
     token: &[char],
     complete: bool,
+    typos: bool,
     cap: usize,
     visited: &mut usize,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Best> {
-    let bound = edit_bound(token.len());
+    let bound = if typos { edit_bound(token.len()) } else { 0 };
     let mut best = Best {
         cap,
         kept: Vec::new(),
@@ -303,6 +304,22 @@ fn walk_token(
     Ok(best)
 }
 
+/// The expansion a match mode reads, or `None` for the modes that read the
+/// query's own tokens.
+pub(crate) fn expand_for(
+    db: &Database,
+    id: IndexId,
+    query: &str,
+    matching: super::TextMatch,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<Expansion>> {
+    Ok(match matching {
+        super::TextMatch::Search => Some(expand(db, id, query, cancelled)?),
+        super::TextMatch::Prefix => Some(expand_prefix(db, id, query, cancelled)?),
+        _ => None,
+    })
+}
+
 /// Expand one `search(col, 'query')` against the dictionary of `id`.
 pub(crate) fn expand(
     db: &Database,
@@ -312,7 +329,51 @@ pub(crate) fn expand(
 ) -> Result<Expansion> {
     let analysis = crate::text_analyzer::analyze_phrase_query(query)
         .map_err(crate::collections::invalid)?;
-    let tokens = analysis.sequence;
+    let last = analysis.sequence.len().saturating_sub(1);
+    let tokens: Vec<(String, bool)> = analysis
+        .sequence
+        .into_iter()
+        .enumerate()
+        .map(|(at, token)| (token, at == last))
+        .collect();
+    expand_tokens(db, id, tokens, true, cancelled)
+}
+
+/// Expand a prefix tsquery (`'john:* & doe'`, written here as `john:* doe`)
+/// against the dictionary of `id`: a `:*` token completes, every other token
+/// matches itself, and no token takes a typo.
+pub(crate) fn expand_prefix(
+    db: &Database,
+    id: IndexId,
+    query: &str,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Expansion> {
+    let mut tokens = Vec::new();
+    for raw in query.split_whitespace() {
+        let (word, complete) = match raw.strip_suffix(":*") {
+            Some(word) => (word, true),
+            None => (raw, false),
+        };
+        let analysis = crate::text_analyzer::analyze_phrase_query(word)
+            .map_err(crate::collections::invalid)?;
+        let last = analysis.sequence.len().saturating_sub(1);
+        for (at, token) in analysis.sequence.into_iter().enumerate() {
+            // A prefix written over two tokens (`john-d:*`) completes its
+            // last one only, as PostgreSQL's parser splits it.
+            tokens.push((token, complete && at == last));
+        }
+    }
+    expand_tokens(db, id, tokens, false, cancelled)
+}
+
+fn expand_tokens(
+    db: &Database,
+    id: IndexId,
+    flagged: Vec<(String, bool)>,
+    typos: bool,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Expansion> {
+    let tokens: Vec<String> = flagged.iter().map(|(t, _)| t.clone()).collect();
     let mut expansion = Expansion {
         tokens: tokens.clone(),
         terms: Vec::new(),
@@ -329,15 +390,15 @@ pub(crate) fn expand(
     // because a group with no term admits no document and the answer would be
     // empty rather than short.
     let cap = (MAX_TERMS / tokens.len()).max(1);
-    let last = tokens.len() - 1;
     let mut collected: Vec<Vec<(String, u64, u32, usize, f64)>> = Vec::with_capacity(tokens.len());
-    for (at, token) in tokens.iter().enumerate() {
+    for (token, complete) in &flagged {
         let chars: Vec<char> = token.chars().collect();
         let best = walk_token(
             db,
             id,
             &chars,
-            at == last,
+            *complete,
+            typos,
             cap,
             &mut expansion.visited,
             cancelled,

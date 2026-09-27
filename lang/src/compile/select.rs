@@ -50,6 +50,12 @@ impl Compiler<'_> {
             None => OwnedOrder::Driver,
             Some(key) => self.order(c, key)?,
         };
+        // `ORDER BY _key`: the external-key mapping is stored in key order,
+        // so walking it IS the order -- no index, no sort.
+        let key_order = matches!(
+            &statement.order,
+            Some(OrderKey::Column { column, .. }) if is_key_column(column)
+        );
 
         // The select list. `_id` is free (a row carries its id); a named
         // column is a projected field; an expression is this statement's own
@@ -171,9 +177,10 @@ impl Compiler<'_> {
                 "selecting `{KEY_COLUMN}` costs one `get_by_id` per returned row: a page cannot project the reserved field the external key lives in, so the key is fetched after the walk. `{ID_COLUMN}` is free"
             ));
         }
-        let driver = if filters
-            .iter()
-            .any(|filter| matches!(filter, OwnedFilter::Key { .. }))
+        let driver = if key_order
+            || filters
+                .iter()
+                .any(|filter| matches!(filter, OwnedFilter::Key { .. }))
         {
             // A key filter is meaningful only under the driver that
             // certifies it from the mapping entry itself.
@@ -210,6 +217,14 @@ impl Compiler<'_> {
                         ));
                     }
                     return Ok(OwnedOrder::EntityId);
+                }
+                if is_key_column(column) {
+                    if *descending {
+                        return Err(SqlError::unsupported(
+                            "ORDER BY _key DESC: the key mapping is walked forwards, in ascending key order; there is no reverse walk of it yet",
+                        ));
+                    }
+                    return Ok(OwnedOrder::Driver);
                 }
                 let index = self.index_for(c, column, IndexFamily::Scalar, "a scalar index")?;
                 OwnedOrder::Scalar {

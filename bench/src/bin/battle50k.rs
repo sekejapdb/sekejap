@@ -2124,6 +2124,15 @@ fn e4_bulk_reset(dir: &Path, indexed: bool) -> R<(Database, CollectionId)> {
         Vec::new(),
         CollectionOptions::default(),
     )?;
+    // `key` is the key column, as `key text primary key` declares it in SQL,
+    // so the e4-sql arm's INSERT takes its key from there.
+    db.set_key_spec(
+        collection,
+        sekejap_core::collections::KeySpec {
+            column: Some("key".into()),
+            default: None,
+        },
+    )?;
     db.commit()?;
     if indexed {
         let exact = db.create_exact_vector_index(collection, "bulk_emb_exact", "emb")?;

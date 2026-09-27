@@ -254,6 +254,22 @@ pub struct CollectionInfo {
     /// The schema the collection belongs to: `public` unless it was created
     /// in a named one ([`Database::create_collection_in`]).
     pub schema: String,
+    /// How the table's key is declared: the named PRIMARY KEY column, the
+    /// key's DEFAULT generator, or both. `None` for a table that declares
+    /// neither (`_key TEXT PRIMARY KEY` with no default), which is every
+    /// table created before the record existed.
+    pub key: Option<KeySpec>,
+}
+/// How a table's external key is declared (`CREATE TABLE ... PRIMARY KEY
+/// [DEFAULT ...]`): which column carries it, and what mints it when an INSERT
+/// leaves it out. Recorded behind catalog flag bit 6 ([`CATALOG_KEY`]) and
+/// [`KEY_SPEC_FEATURE`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeySpec {
+    /// The declared column that supplies the key; `None` is `_key` itself.
+    pub column: Option<String>,
+    /// `DEFAULT ulid()` / `uuid4()` / `uuid5(...)` on the key.
+    pub default: Option<DefaultValue>,
 }
 pub trait Clock: Send + Sync {
     fn unix_seconds(&self) -> i64;
@@ -300,6 +316,8 @@ pub(crate) struct Catalog {
     /// its binding. Recorded behind flag bit 5 ([`CATALOG_EDGE`]), behind
     /// `EDGE_TABLE_FEATURE` at admission.
     pub(crate) edge: Option<crate::index::graph::edge_table::EdgeTableRecord>,
+    /// See [`CollectionInfo::key`]. Behind flag bit 6 ([`CATALOG_KEY`]).
+    pub(crate) key: Option<KeySpec>,
     /// `Some` exactly while `begin_drop_collection` has published a DROPPING
     /// mark that `drop_collection_step` has not yet finished. It is the
     /// committed cursor of the drop: the phase it reached and how many
@@ -800,6 +818,15 @@ pub(crate) const CATALOG_SCHEMA: u8 = 16;
 /// tail (`docs/core/EDGE_TABLES.md` §1). The second line behind
 /// `EDGE_TABLE_FEATURE`, for the reason [`CATALOG_SCHEMA`] is.
 pub(crate) const CATALOG_EDGE: u8 = 32;
+/// Bit 6: the record carries a KEY tail ([`KeySpec`]). The second line behind
+/// [`KEY_SPEC_FEATURE`].
+pub(crate) const CATALOG_KEY: u8 = 64;
+/// The logical feature bit that says this file's catalog records at least one
+/// table's key declaration ([`KeySpec`]). Additive and monotone like every
+/// bit before it: a file that never declares a key column or a key default
+/// does not carry it, and a binary that predates it refuses a file that does,
+/// whole, as `Unsupported` (Law 8).
+pub const KEY_SPEC_FEATURE: u64 = 0x100000;
 /// The collection header bit that says this database holds a NAMED SCHEMA:
 /// a schema record, or a catalog record with the [`CATALOG_SCHEMA`] tail.
 ///
@@ -833,14 +860,20 @@ fn catalog_bytes(c: &Catalog) -> Result<Vec<u8>> {
             | if c.declared.is_empty() { 0 } else { CATALOG_DECLARED }
             | if c.rules.is_empty() { 0 } else { CATALOG_RULES }
             | if c.schema.is_none() { 0 } else { CATALOG_SCHEMA }
-            | if c.edge.is_none() { 0 } else { CATALOG_EDGE },
+            | if c.edge.is_none() { 0 } else { CATALOG_EDGE }
+            | if c.key.is_none() { 0 } else { CATALOG_KEY },
     );
     if let Some(d) = c.drop {
         b.push(d.phase.byte());
         b.push(d.mode.byte());
         b.extend_from_slice(&d.removed.to_be_bytes());
     }
-    if c.declared.is_empty() && c.rules.is_empty() && c.schema.is_none() && c.edge.is_none() {
+    if c.declared.is_empty()
+        && c.rules.is_empty()
+        && c.schema.is_none()
+        && c.edge.is_none()
+        && c.key.is_none()
+    {
         b.extend_from_slice(c.name.as_bytes());
     } else {
         // With a tail the name can no longer be "the rest of the packet", so
@@ -882,6 +915,9 @@ fn catalog_bytes(c: &Catalog) -> Result<Vec<u8>> {
         if let Some(edge) = &c.edge {
             edge.encode(&mut b)?;
         }
+        if let Some(key) = &c.key {
+            column_rules::encode_key_spec(&mut b, key)?;
+        }
     }
     packet(CATALOG_MAGIC, &b)
 }
@@ -889,7 +925,13 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
     let b = unpack(b, CATALOG_MAGIC)?;
     if b.len() < 10
         || b[8]
-            & !(1 | CATALOG_DROPPING | CATALOG_DECLARED | CATALOG_RULES | CATALOG_SCHEMA | CATALOG_EDGE)
+            & !(1
+                | CATALOG_DROPPING
+                | CATALOG_DECLARED
+                | CATALOG_RULES
+                | CATALOG_SCHEMA
+                | CATALOG_EDGE
+                | CATALOG_KEY)
             != 0
     {
         return Err(corrupt("catalog fields"));
@@ -914,7 +956,10 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
     let mut rules = Vec::new();
     let mut schema = None;
     let mut edge = None;
-    let name = if b[8] & (CATALOG_DECLARED | CATALOG_RULES | CATALOG_SCHEMA | CATALOG_EDGE) == 0 {
+    let mut key = None;
+    let name = if b[8] & (CATALOG_DECLARED | CATALOG_RULES | CATALOG_SCHEMA | CATALOG_EDGE | CATALOG_KEY)
+        == 0
+    {
         std::str::from_utf8(&b[at..]).map_err(corrupt)?.to_owned()
     } else {
         let mut read = |n: usize| -> Result<&[u8]> {
@@ -954,6 +999,9 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
                 read(n).map(<[u8]>::to_vec)
             })?);
         }
+        if b[8] & CATALOG_KEY != 0 {
+            key = Some(column_rules::decode_key_spec(|n| read(n).map(<[u8]>::to_vec))?);
+        }
         if at != b.len() {
             return Err(corrupt("catalog declared type tail"));
         }
@@ -972,6 +1020,7 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
         rules,
         schema,
         edge,
+        key,
     })
 }
 /// The kernel's own `E4LIMIT1` record: a damaged one is corruption, a valid
@@ -998,7 +1047,8 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
 /// allocator under tag `0x09` ([`crate::index::graph::EDGE_ID_FEATURE`]).
 /// `0x80000` EDGE TABLES -- the catalog's edge tail
 /// ([`crate::index::graph::edge_table::EDGE_TABLE_FEATURE`]).
-/// The mask is therefore `0xfffff`.
+/// `0x100000` KEY declarations -- the catalog's key tail ([`KEY_SPEC_FEATURE`]).
+/// The mask is therefore `0x1fffff`.
 /// Every one is additive: set in the same transaction as the first record
 /// that uses it, never cleared, and a file that declares a bit outside this
 /// mask is refused as `Unsupported` at admission (Law 8).
@@ -1028,6 +1078,7 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | crate::index::graph::endpoints::ENDPOINT_FEATURE
     | crate::index::vector::graph::VAMANA_FEATURE
     | crate::index::graph::edge_table::EDGE_TABLE_FEATURE
+    | KEY_SPEC_FEATURE
     | catalog::JSON_EXPRESSION_FEATURE
     | SCHEMA_FEATURE
     | crate::index::graph::EDGE_ID_FEATURE;
@@ -1841,6 +1892,7 @@ impl Database {
             rules,
             schema,
             edge: None,
+            key: None,
         };
         let result = (|| {
             // The feature bit rides the same transaction as the first record
@@ -2054,7 +2106,42 @@ impl Database {
             declared: c.declared,
             rules: c.rules,
             schema: c.schema.unwrap_or_else(|| PUBLIC_SCHEMA.to_owned()),
+            key: c.key,
         })
+    }
+    /// Record how collection `c`'s key is declared ([`KeySpec`]): the named
+    /// PRIMARY KEY column and/or the key's DEFAULT generator. Sets
+    /// [`KEY_SPEC_FEATURE`] in the same transaction.
+    pub fn set_key_spec(&mut self, c: CollectionId, spec: KeySpec) -> Result<()> {
+        self.user_write()?;
+        let mut catalog = self.catalog(c)?;
+        if let Some(column) = &spec.column {
+            let layout = self.layout(catalog.layout)?;
+            match layout.fields.iter().find(|(n, _)| n == column) {
+                Some((_, Kind::Text)) => {}
+                Some(_) => return Err(invalid(format!("PRIMARY KEY column `{column}` is not TEXT"))),
+                None => return Err(invalid(format!("PRIMARY KEY names `{column}`, a column the table has not got"))),
+            }
+        }
+        if let Some(default) = &spec.default {
+            if matches!(default, DefaultValue::Now) {
+                return Err(invalid("DEFAULT now() on the key: a key is text, and now() is an instant"));
+            }
+        }
+        catalog.key = Some(spec);
+        let result = (|| {
+            self.enable_logical_feature(KEY_SPEC_FEATURE)?;
+            self.persist_catalog(&catalog)
+        })();
+        self.finish(result)
+    }
+    /// A new key for collection `c` from its declared key DEFAULT, or `None`
+    /// when it declares none.
+    pub fn mint_key(&self, c: CollectionId) -> Result<Option<String>> {
+        let Some(default) = self.catalog(c)?.key.and_then(|k| k.default) else {
+            return Ok(None);
+        };
+        column_rules::mint(&default, self.clock.unix_micros()).map(Some)
     }
     pub fn alter_collection(
         &mut self,
@@ -3130,7 +3217,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0xfffff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x1fffff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -3151,7 +3238,7 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0xfffff
+            0x1fffff
         );
         // A bit outside the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
@@ -3159,10 +3246,11 @@ mod tests {
         // graph (`0x8000`) and the JSON-path expression index (`0x10000`)
         // landed together, named schemas took `0x20000` and edge identity
         // `0x40000`, so the mask is contiguous through bit 18 and the first
-        // unclaimed bit is `0x100000` (edge tables took `0x80000`).
+        // unclaimed bit is `0x200000` (edge tables took `0x80000`, key
+        // declarations `0x100000`).
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x100000)),
-            Err(Error::Unsupported(m)) if m.contains("0x1fffff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x200000)),
+            Err(Error::Unsupported(m)) if m.contains("0x3fffff")
         ));
     }
     /// Law 8 for the live row count, the same shape the declared-type bit's
@@ -3193,9 +3281,9 @@ mod tests {
             Err(Error::Unsupported(m)) if m.contains("0x2001")
         ));
         // And a bit past every implemented family is refused by this build
-        // too. `0x80000` is edge tables now, so the probe is `0x100000`.
+        // too. `0x100000` is key declarations now, so the probe is `0x200000`.
         assert!(matches!(
-            admit_features(1 | 0x100000, SUPPORTED_LOGICAL_FEATURES),
+            admit_features(1 | 0x200000, SUPPORTED_LOGICAL_FEATURES),
             Err(Error::Unsupported(_))
         ));
     }
@@ -3288,6 +3376,7 @@ mod tests {
         let record = catalog_bytes(&Catalog {
             schema: None,
             edge: None,
+            key: None,
             id: CollectionId(1),
             name: "t".into(),
             layout: 1,

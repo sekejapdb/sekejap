@@ -8,7 +8,7 @@ It runs inside your application, like SQLite, with no separate server to install
 
 It's available as a Rust/Python/Dart/Kotlin/Swift/Node.js/Go library, and a command-line tool.
 
-📝 **Changelog:** [CHANGELOG.md](CHANGELOG.md) — 0.18.0 makes graph queries ISO GQL inside `GRAPH_TABLE`, writes edges in SQL through edge tables, and adds PostGIS geometry input and output and named schemas. A 0.17 database opens as it is. 0.18.1: the API and every binding list tables in named schemas and describe edge tables.
+📝 **Changelog:** [CHANGELOG.md](CHANGELOG.md) — 0.18.0 makes graph queries ISO GQL inside `GRAPH_TABLE`, writes edges in SQL through edge tables, and adds PostGIS geometry input and output and named schemas. A 0.17 database opens as it is. 0.18.1: the API and every binding list tables in named schemas and describe edge tables. 0.18.2: `LIKE`/`ILIKE` with any pattern and no setup, keys from the declared primary key, `to_tsquery` prefixes.
 
 📖 **Documentation:** [`docs/lang/GQL_PROFILE.md`](docs/lang/GQL_PROFILE.md) (graph queries, with examples), [`docs/lang/QL_CONTRACT.md`](docs/lang/QL_CONTRACT.md) (the query language), [`docs/dist/RUST_API.md`](docs/dist/RUST_API.md) (the Rust surface), and [`docs/core/GRAPH_CONTRACT.md`](docs/core/GRAPH_CONTRACT.md) (edge semantics).
 
@@ -109,7 +109,7 @@ flutter pub add sekejap             # or: dart pub add sekejap
 ```kotlin
 // desktop / server JVM, Kotlin or Java, over JDK FFM downcalls
 dependencies {
-  implementation("life.sekejap:sekejap-ffm:0.18.1")
+  implementation("life.sekejap:sekejap-ffm:0.18.2")
 }
 ```
 
@@ -184,7 +184,8 @@ the true nearest set, a quantized one is an order of magnitude smaller and
 approximate — and nobody can pick for you.
 
 A `WHERE` over a column with no index is still refused rather than answered by
-scanning every row. If you want a wide table to index nothing automatically,
+scanning every row -- except `LIKE` / `ILIKE`, which work on any text column
+with no setup (`WHERE email ILIKE '%doe%'`) by checking each row, and say so. If you want a wide table to index nothing automatically,
 say so once:
 
 ```python

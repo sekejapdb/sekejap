@@ -11,29 +11,35 @@ impl Compiler<'_> {
         on_conflict: Option<ConflictClause>,
     ) -> SqlResult2<WritePlan> {
         let c = collection(self.db, table)?;
+        // Where the key comes from, as the table declares it:
+        // `_key` when the statement names it; else the named PRIMARY KEY
+        // column; else the key's DEFAULT, minted per row when it runs; else
+        // the INSERT has no key, which is PostgreSQL's 23502 -- never a guess
+        // at the first column.
+        let spec = self.db.collection_info(c).map_err(SqlError::from)?.key;
+        let named = spec.as_ref().and_then(|k| k.column.clone());
         let key_at = match columns.iter().position(|name| is_key_column(name)) {
-            Some(at) => at,
-            None => {
-                // With no `_key` column the FIRST column supplies the key,
-                // which is where a `TEXT PRIMARY KEY` is written. It must be
-                // TEXT, because an external key is a string.
-                let first = columns
-                    .first()
-                    .ok_or_else(|| SqlError::syntax("INSERT names no columns", 0))?;
-                if !matches!(self.kind_of(c, first)?, Kind::Text) {
-                    return Err(SqlError::unsupported(format!(
-                        "INSERT INTO {table} names no `{KEY_COLUMN}` and its first column `{first}` is not TEXT: `Database::put` takes a string key, so either name `{KEY_COLUMN}` or put the TEXT PRIMARY KEY first"
-                    )));
+            Some(at) => Some(at),
+            None => match named.as_ref().and_then(|col| columns.iter().position(|n| n == col)) {
+                Some(at) => Some(at),
+                None if spec.as_ref().is_some_and(|k| k.default.is_some()) => None,
+                None => {
+                    let column = named.clone().unwrap_or_else(|| KEY_COLUMN.to_owned());
+                    return Err(SqlError::coded(
+                        "23502",
+                        format!(
+                            "null value in column \"{column}\" of relation \"{table}\" violates not-null constraint: the INSERT names no key; name `{column}`, or declare the key with DEFAULT ulid() / uuid4()"
+                        ),
+                    ));
                 }
-                self.notices.push(format!(
-                    "INSERT INTO {table}: the external key comes from `{first}`, the first column; the value is ALSO stored as that declared field (battle50k deviation 13)"
-                ));
-                0
-            }
+            },
         };
         let mut rows = Vec::with_capacity(values.len());
         for row in values {
-            let key = self.text_of(&row[key_at])?;
+            let key = match key_at {
+                Some(at) => Some(self.text_of(&row[at])?),
+                None => None,
+            };
             let mut document = Map::new();
             for (at, column) in columns.iter().enumerate() {
                 if is_key_column(column) {
@@ -52,13 +58,19 @@ impl Compiler<'_> {
             }
             rows.push((key, Value::Object(document)));
         }
+        let key_column = columns
+            .iter()
+            .find(|n| is_key_column(n))
+            .cloned()
+            .or_else(|| named.clone())
+            .unwrap_or_else(|| KEY_COLUMN.to_owned());
         // `ON CONFLICT (_key)`, or the column that supplies the key: the one
         // key a row has. A conflict on another column would need that
         // column's UNIQUE index to find the row, which is not built.
         let on_conflict = match on_conflict {
             None => None,
             Some(clause) => {
-                let key_column = &columns[key_at];
+                let key_column = &key_column;
                 let targets_key = clause.target.len() == 1
                     && (is_key_column(&clause.target[0]) || clause.target[0] == *key_column);
                 if !targets_key {
@@ -80,6 +92,7 @@ impl Compiler<'_> {
         Ok(WritePlan::Insert {
             collection: c,
             rows,
+            key_column: named,
             on_conflict,
         })
     }

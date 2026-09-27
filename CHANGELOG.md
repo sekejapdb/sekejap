@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.18.2
+
+Fixes from dogfooding sekejap under an application host, and `LIKE` / `ILIKE`
+that work with no setup.
+
+- **`LIKE` and `ILIKE` with any pattern** -- `%doe%`, `j_hn%`, `ESCAPE`,
+  `NOT` -- on any text column, with no index and no extra storage: each row
+  is checked, and `EXPLAIN` says so. PostgreSQL's rules, checked against its
+  answers; `ILIKE` folds case beyond ASCII. A plain `LIKE 'abc%'` still uses
+  the column's index.
+- **`to_tsquery('john:*')`** is a prefix match, as in PostgreSQL. It was read
+  as a weight and refused.
+- **An INSERT's key comes from where the table declares it.** A table
+  records its named `PRIMARY KEY` column and its key `DEFAULT`; an INSERT
+  that gives no key is refused with `23502` instead of taking its first
+  column as the key. **Breaking change:** an INSERT into a table created
+  before 0.18.2 must name `_key`.
+- **`_key TEXT PRIMARY KEY DEFAULT ulid()`** (or `uuid4()`), and the same on a
+  named key column: the key is minted per row when an INSERT leaves it out.
+- **`ORDER BY _key`** needs no index: rows are walked in key order.
+- **`describe()` reports every column's SQL type** (`INT`, `REAL`,
+  `VECTOR(3)`, `GEOMETRY(Point,4326)`, ...), derived from the stored kind for
+  a table that recorded none, and marks a named key column as the primary key.
+- **`BEGIN` / `COMMIT` / `ROLLBACK` through `Db::execute` or `Db::query`**
+  are refused by name. They used to answer OK and do nothing, because each
+  call is already its own transaction; use `Db::transaction`.
+- Storage: tables that declare a key column or a key default carry a new
+  catalog tail behind an additive feature bit; other files are unchanged.
+
 ## 0.18.1
 
 The API's catalog sees what SQL sees. Nothing in the storage format changes.

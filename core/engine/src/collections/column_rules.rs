@@ -285,6 +285,65 @@ fn format_uuid(b: &[u8; 16]) -> String {
     )
 }
 
+/// One value of a DEFAULT generator that makes text: the key of a new row.
+pub(super) fn mint(default: &DefaultValue, now_micros: i64) -> Result<String> {
+    match default {
+        DefaultValue::Uuid4 => uuid4(),
+        DefaultValue::Ulid => ulid(now_micros),
+        DefaultValue::Uuid5 { namespace, name } => Ok(uuid5(namespace, name.as_bytes())),
+        DefaultValue::Now => Err(invalid("DEFAULT now() cannot mint a key")),
+    }
+}
+
+/// The catalog's KEY tail: a version byte, flags (bit 0 a named column, bit
+/// 1 a default), the column, then the default as a column rule of `_key`.
+pub(super) fn encode_key_spec(b: &mut Vec<u8>, key: &super::KeySpec) -> Result<()> {
+    b.push(1);
+    b.push(u8::from(key.column.is_some()) | (u8::from(key.default.is_some()) << 1));
+    if let Some(column) = &key.column {
+        if column.is_empty() || column.len() > 255 {
+            return Err(invalid("a key column name is 1..255 bytes"));
+        }
+        b.push(column.len() as u8);
+        b.extend_from_slice(column.as_bytes());
+    }
+    if let Some(default) = &key.default {
+        encode_rule(
+            b,
+            "_key",
+            &ColumnRule {
+                default: Some(default.clone()),
+                not_null: false,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn decode_key_spec(mut read: impl FnMut(usize) -> Result<Vec<u8>>) -> Result<super::KeySpec> {
+    let version = read(1)?[0];
+    if version != 1 {
+        return Err(Error::Unsupported(format!("key tail version {version}")));
+    }
+    let flags = read(1)?[0];
+    if flags & !3 != 0 || flags == 0 {
+        return Err(super::corrupt("key tail flags"));
+    }
+    let column = if flags & 1 != 0 {
+        let n = read(1)?[0] as usize;
+        Some(String::from_utf8(read(n)?).map_err(super::corrupt)?)
+    } else {
+        None
+    };
+    let default = if flags & 2 != 0 {
+        let (_, rule) = decode_rule(&mut read)?;
+        rule.default
+    } else {
+        None
+    };
+    Ok(super::KeySpec { column, default })
+}
+
 /// Fill `out` with the operating system's randomness, through the same
 /// `getrandom` the page-WAL identity and `uuid4()` use. For the query
 /// layer's pgcrypto functions (`gen_salt`, `gen_random_bytes`).

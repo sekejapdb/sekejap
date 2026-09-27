@@ -827,6 +827,7 @@ impl<'a> Oracle<'a> {
             TextMatch::All => 1,
             TextMatch::Phrase => 2,
             TextMatch::Search => 3,
+            TextMatch::Prefix => 4,
         };
         let key = (query.to_string(), tag);
         if let Some(found) = self.bm25.borrow().get(&key) {

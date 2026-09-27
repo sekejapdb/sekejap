@@ -115,11 +115,32 @@ pub(crate) enum OwnedFilter {
     /// subquery ran while the statement was compiled, so what the prepared
     /// query sees is a set and not a second plan.
     Ids(Vec<EntityId>),
+    /// `[NOT] LIKE | ILIKE`, checked on each row the driver reaches.
+    Like {
+        field: String,
+        pattern: String,
+        escape: Option<char>,
+        insensitive: bool,
+        negated: bool,
+    },
 }
 
 impl OwnedFilter {
     fn borrowed(&self) -> QueryFilter<'_> {
         match self {
+            Self::Like {
+                field,
+                pattern,
+                escape,
+                insensitive,
+                negated,
+            } => QueryFilter::Like {
+                field,
+                pattern,
+                escape: *escape,
+                insensitive: *insensitive,
+                negated: *negated,
+            },
             Self::Scalar {
                 index, predicate, ..
             } => QueryFilter::Scalar {
@@ -669,7 +690,11 @@ pub(crate) enum CompiledAlter {
 pub(crate) enum WritePlan {
     Insert {
         collection: CollectionId,
-        rows: Vec<(String, Value)>,
+        /// Each row's key, or `None` to mint one from the key's DEFAULT when
+        /// the statement runs (never at prepare: one key per execution).
+        rows: Vec<(Option<String>, Value)>,
+        /// The named PRIMARY KEY column, which holds a minted key too.
+        key_column: Option<String>,
         /// `ON CONFLICT (_key)`: `Some(None)` is `DO NOTHING`, `Some(Some(cols))`
         /// is `DO UPDATE SET c = EXCLUDED.c` for each named column. `None` is
         /// a plain INSERT, which refuses a taken key with 23505.
@@ -724,6 +749,9 @@ pub(crate) enum WritePlan {
         /// written order. EMPTY for every `CREATE TABLE` with no `WITH`, and
         /// that statement runs exactly the code it always ran.
         indexes: Vec<(String, CompiledIndex)>,
+        /// How the key is declared: a named PRIMARY KEY column and/or a key
+        /// DEFAULT. `None` records nothing, as before.
+        key: Option<sekejap_core::collections::KeySpec>,
     },
     /// `ALTER TABLE t <action>`: one `alter_collection_rules` commit, or one
     /// `rename_collection` commit. Nothing here is a second rewrite path.
@@ -957,10 +985,23 @@ impl WritePlan {
             Self::Insert {
                 collection,
                 rows,
+                key_column,
                 on_conflict,
             } => {
                 let mut affected = 0u64;
-                for (key, document) in rows {
+                for (key, mut document) in rows {
+                    let key = match key {
+                        Some(key) => key,
+                        None => {
+                            let minted = db.mint_key(collection)?.ok_or_else(|| {
+                                SqlError::coded("23502", "the INSERT names no key and the table declares no key DEFAULT")
+                            })?;
+                            if let (Some(column), Value::Object(fields)) = (&key_column, &mut document) {
+                                fields.insert(column.clone(), Value::String(minted.clone()));
+                            }
+                            minted
+                        }
+                    };
                     match &on_conflict {
                         None => {
                             db.insert(collection, &key, &document)?;
@@ -1112,11 +1153,12 @@ impl WritePlan {
                 declared,
                 rules,
                 indexes,
+                key,
             } => {
                 if indexes.is_empty() {
                     {
                         let (schema, table) = crate::split_table(&name);
-                        db.create_collection_in(
+                        let collection = db.create_collection_in(
                             schema,
                             table,
                             fields,
@@ -1124,6 +1166,9 @@ impl WritePlan {
                             rules,
                             CollectionOptions::default(),
                         )?;
+                        if let Some(key) = key {
+                            db.set_key_spec(collection, key)?;
+                        }
                     }
                     db.commit()?;
                     return Ok(SqlResult::Affected(0));
@@ -1151,6 +1196,9 @@ impl WritePlan {
                     rules,
                     CollectionOptions::default(),
                 )?;
+                if let Some(key) = key {
+                    db.set_key_spec(collection, key)?;
+                }
                 db.commit()?;
                 let mut built = Vec::new();
                 for (index, method) in indexes {
@@ -1656,6 +1704,9 @@ impl OwnedFilter {
             // A semi-join's set was BUILT at compile, so a statement that
             // holds one is never rebindable and this arm is never reached
             // with a changed parameter.
+            // The pattern was folded when the statement compiled, which marks
+            // the statement as compiled again on a bind: there is no slot.
+            Self::Like { .. } => {}
             Self::Ids(_) => {}
         }
         Ok(())

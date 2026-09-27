@@ -781,7 +781,7 @@ impl TextCursor<'_> {
             // landed on satisfies every query TOKEN. A leapfrog like `All`'s
             // is not available: a token is satisfied by ANY of its terms, so
             // no single stream can be seeked to the answer.
-            TextMatch::Search => loop {
+            TextMatch::Search | TextMatch::Prefix => loop {
                 let Some(sequence) = self
                     .streams
                     .iter()

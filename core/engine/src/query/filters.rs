@@ -66,6 +66,14 @@ pub(super) fn batch_filters_match<C: FnMut() -> bool>(
                 meter.note_row_decode();
                 json_filter_matches(selected_field_in(&layout, bytes, field)?, value)?
             }
+            CompiledFilter::Like {
+                field,
+                matcher,
+                negated,
+            } => {
+                meter.note_row_decode();
+                like_matches(selected_field_in(&layout, bytes, field)?, matcher, *negated)
+            }
             CompiledFilter::Point { info, predicate } => match &ranges[position] {
                 MembershipSet::Ids(ids) => ids.binary_search(&id.sequence).is_ok(),
                 MembershipSet::Bitmap(bits) => membership_bitmap_contains(bits, id.sequence),
@@ -329,6 +337,19 @@ fn json_structural_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
+/// `LIKE` over one field value: a text matches or not, and a missing or
+/// NULL value matches neither `LIKE` nor `NOT LIKE`, as SQL's NULL does.
+fn like_matches(
+    value: dense_v3::FieldValue,
+    matcher: &super::like::LikeMatcher,
+    negated: bool,
+) -> bool {
+    match value {
+        dense_v3::FieldValue::Inline(Value::String(text)) => matcher.matches(&text) != negated,
+        _ => false,
+    }
+}
+
 fn json_filter_matches(value: dense_v3::FieldValue, expected: &Value) -> QueryResult<bool> {
     match value {
         dense_v3::FieldValue::Missing => Ok(false),
@@ -435,6 +456,16 @@ pub(super) fn filters_match<'a, C: FnMut() -> bool>(
                 let row = row.as_ref().unwrap();
                 meter.note_row_decode();
                 json_filter_matches(selected_field(row, field)?, value)?
+            }
+            CompiledFilter::Like {
+                field,
+                matcher,
+                negated,
+            } => {
+                ensure_row_seq(db, rows, id, row, encoded, meter)?;
+                let row = row.as_ref().unwrap();
+                meter.note_row_decode();
+                like_matches(selected_field(row, field)?, matcher, *negated)
             }
             CompiledFilter::Graph { position, .. } => graph
                 .get(*position)

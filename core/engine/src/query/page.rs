@@ -538,6 +538,7 @@ impl PreparedQuery<'_> {
                 posting_membership, ..
             } => !*posting_membership,
             CompiledFilter::JsonEq { .. }
+            | CompiledFilter::Like { .. }
             | CompiledFilter::Point { .. }
             | CompiledFilter::Geometry { .. }
             | CompiledFilter::Folded { .. }
@@ -648,7 +649,7 @@ impl PreparedQuery<'_> {
                         MembershipSet::Ids(_) | MembershipSet::Bitmap(_)
                     )
             }
-            CompiledFilter::JsonEq { .. } => true,
+            CompiledFilter::JsonEq { .. } | CompiledFilter::Like { .. } => true,
             // A non-driving point filter whose cover ranges have been walked
             // into a set reads no row either; without one it reads every row.
             CompiledFilter::Point { .. } => !matches!(
@@ -1633,14 +1634,15 @@ fn text_predicate_text(prepared: &PreparedText) -> String {
         TextMatch::All => "all",
         TextMatch::Phrase => "phrase",
         TextMatch::Search => "search",
+        TextMatch::Prefix => "prefix",
     };
-    if prepared.matching == TextMatch::Search {
+    if matches!(prepared.matching, TextMatch::Search | TextMatch::Prefix) {
         // A search predicate's term count is the DICTIONARY's answer, not the
         // query's, so EXPLAIN prints both and says when a bound stopped the
         // walk. A reader who sees only the expanded count cannot tell a
         // three-word query that matched 40 terms from one that was cut off.
         return format!(
-            "search, {} token(s) expanded to {} dictionary term(s){}",
+            "{matching}, {} token(s) expanded to {} dictionary term(s){}",
             prepared.groups.len(),
             prepared.terms.len(),
             if prepared.truncated {
@@ -1860,7 +1862,7 @@ impl PreparedQuery<'_> {
                 }
             }
             CompiledFilter::Graph { .. } => FilterAnswer::GraphFrontier,
-            CompiledFilter::JsonEq { .. } => FilterAnswer::Row,
+            CompiledFilter::JsonEq { .. } | CompiledFilter::Like { .. } => FilterAnswer::Row,
             CompiledFilter::Key { .. } => FilterAnswer::Driver,
             // Only reachable before the first page has run: a boolean
             // filter's set is marked `Unbuilt` at prepare and walked before
@@ -1896,6 +1898,15 @@ impl PreparedQuery<'_> {
                         None,
                         Some(field.clone()),
                         "structural JSON equality".to_owned(),
+                    ),
+                    CompiledFilter::Like { field, negated, .. } => (
+                        "like",
+                        None,
+                        Some(field.clone()),
+                        format!(
+                            "{}LIKE, checked on each row it reaches (no index)",
+                            if *negated { "NOT " } else { "" }
+                        ),
                     ),
                     CompiledFilter::Graph { request, gate, .. } => {
                         let mut detail = format!(

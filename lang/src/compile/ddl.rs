@@ -153,13 +153,23 @@ impl Compiler<'_> {
         // so it is read and dropped here, before the field list and the
         // automatic indexes see it: a second copy of the key is exactly what a
         // user-named PRIMARY KEY column costs, and this spelling asks for none.
+        // `_key TEXT PRIMARY KEY [DEFAULT ulid() | uuid4() | uuid5(...)]`: the
+        // key every table has, optionally with a generator that mints it
+        // when an INSERT leaves it out.
         let names_builtin_key = |column: &ColumnDef| {
             column.name == "_key"
                 && column.primary_key
                 && matches!(column.kind, Kind::Text)
-                && column.rule.is_none()
+                && column.rule.as_ref().is_none_or(|rule| {
+                    rule.default.as_ref().is_some_and(|d| !matches!(d, DefaultValue::Now))
+                })
         };
         let builtin_key = columns.iter().any(names_builtin_key);
+        let key_default = columns
+            .iter()
+            .find(|column| names_builtin_key(column))
+            .and_then(|column| column.rule.as_ref())
+            .and_then(|rule| rule.default.clone());
         let columns: Vec<ColumnDef> = columns
             .into_iter()
             .filter(|column| !names_builtin_key(column))
@@ -187,9 +197,10 @@ impl Compiler<'_> {
                     column.name, column.declared
                 ));
             }
-            if functions::is_time_type(&column.declared) {
-                declared.push((column.name.clone(), column.declared.clone()));
-            }
+            // Every column's declared spelling is recorded, so a
+            // host can regenerate its DDL; the time types also read it to
+            // print an instant back as ISO text.
+            declared.push((column.name.clone(), column.declared.clone()));
             if let Some(rule) = &column.rule {
                 self.note_rule(&column.name, &column.declared, rule);
                 rules.push((column.name.clone(), rule.clone()));
@@ -206,6 +217,22 @@ impl Compiler<'_> {
                 "PRIMARY KEY on `{table}`: the column is stored as a declared field AND supplies the external key `Database::put` maps, so the key is held twice (battle50k deviation 13)"
             ));
         }
+        // The named key column, and the key's default (the built-in key's, or
+        // the named column's own DEFAULT), recorded so an INSERT takes the key
+        // from where the table declares it.
+        let named_key = columns.iter().find(|c| c.primary_key && c.name != "_key");
+        let key = match (named_key, key_default) {
+            (None, None) => None,
+            (named, builtin) => Some(sekejap_core::collections::KeySpec {
+                column: named.map(|c| c.name.clone()),
+                default: builtin.or_else(|| {
+                    named
+                        .and_then(|c| c.rule.as_ref())
+                        .and_then(|r| r.default.clone())
+                        .filter(|d| !matches!(d, DefaultValue::Now))
+                }),
+            }),
+        };
         let declared_indexes = self.with_indexes(&table, &fields, with)?;
         let mut indexes = self.automatic_indexes(&table, &columns, automatic, declared_indexes)?;
         // UNIQUE: the column's scalar index is a UNIQUE one -- the automatic
@@ -250,6 +277,7 @@ impl Compiler<'_> {
             declared,
             rules,
             indexes,
+            key,
         })
     }
 
@@ -578,9 +606,7 @@ impl Compiler<'_> {
                     self.note_rule(&column.name, &column.declared, rule);
                     rules.push((column.name.clone(), rule.clone()));
                 }
-                if functions::is_time_type(&column.declared) {
-                    declared.push((column.name.clone(), column.declared.clone()));
-                }
+                declared.push((column.name.clone(), column.declared.clone()));
                 fields.push((column.name.clone(), column.kind.clone()));
                 self.notices.push(format!(
                     "ADD COLUMN {}: every row written before this commit reads MISSING for it, which is distinct from NULL (QL_CONTRACT §2)",
@@ -722,9 +748,7 @@ impl Compiler<'_> {
                     });
                 }
                 declared.retain(|(n, _)| n != column);
-                if functions::is_time_type(spelling) {
-                    declared.push((column.clone(), spelling.clone()));
-                }
+                declared.push((column.clone(), spelling.clone()));
                 self.notices.push(format!(
                     "ALTER COLUMN {column} TYPE {spelling}: `{was:?}` is unchanged, so no row byte and no index key moves; what changes is the DECLARED spelling in the descriptor"
                 ));

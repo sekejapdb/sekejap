@@ -622,6 +622,8 @@ impl Parser {
                 };
                 return Ok(match declared.to_ascii_uppercase().as_str() {
                     "POINT" => (Kind::Point, "GEOMETRY(Point,4326)".to_owned()),
+                    // A bare `GEOMETRY` is spelled back as it was written.
+                    "GEOMETRY" if declared == "GEOMETRY" => (Kind::Geo, declared),
                     "POLYGON" | "MULTIPOLYGON" | "LINESTRING" | "GEOMETRY" => {
                         (Kind::Geo, format!("GEOMETRY({declared},4326)"))
                     }

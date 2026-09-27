@@ -39,6 +39,7 @@ mod cursors;
 mod drivers;
 mod filters;
 pub mod gql;
+pub(crate) mod like;
 mod membership;
 mod page;
 mod plan;
@@ -128,6 +129,17 @@ pub enum QueryFilter<'a> {
     JsonEq {
         field: &'a str,
         value: &'a Value,
+    },
+    /// `field [NOT] LIKE | ILIKE pattern [ESCAPE c]` over a TEXT field (or
+    /// `_key`), answered from the row with PostgreSQL's pattern rules
+    /// (`like.rs`). A missing or NULL value matches neither form. It has no
+    /// index, so another filter or the entity walk drives it.
+    Like {
+        field: &'a str,
+        pattern: &'a str,
+        escape: Option<char>,
+        insensitive: bool,
+        negated: bool,
     },
     Graph(BfsRequest<'a>),
     Point {

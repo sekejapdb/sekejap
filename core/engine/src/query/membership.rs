@@ -1570,6 +1570,11 @@ impl NodeGate {
                         "a traversal node predicate cannot be a JSON equality: it has no index and is answered from the row",
                     ))
                 }
+                QueryFilter::Like { .. } => {
+                    return Err(invalid_query(
+                        "a traversal node predicate cannot be a LIKE: it has no index and is answered from the row",
+                    ))
+                }
                 QueryFilter::Key { .. } => {
                     return Err(invalid_query(
                         "a traversal node predicate cannot be a key range: the external-key mapping is a driver's keyspace, not a predicate on a node",

@@ -281,7 +281,7 @@ impl<'db> ElementReader<'db> {
 /// its dictionary walk may stop at a bound and say so in a notice
 /// (`QL_CONTRACT` §4.6), and a per-node answer has nowhere to carry it.
 fn per_node(matching: TextMatch) -> QueryResult<()> {
-    if matching == TextMatch::Search {
+    if matches!(matching, TextMatch::Search | TextMatch::Prefix) {
         return Err(invalid_query(
             "the typo-tolerant search() is not read per node: its dictionary walk can stop at a bound with a notice a per-node answer cannot carry",
         ));

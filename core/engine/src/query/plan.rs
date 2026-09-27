@@ -45,6 +45,11 @@ pub(super) enum CompiledFilter {
         field: String,
         value: Value,
     },
+    Like {
+        field: String,
+        matcher: super::like::LikeMatcher,
+        negated: bool,
+    },
     Graph {
         request: OwnedBfsRequest,
         position: usize,
@@ -146,7 +151,7 @@ impl PreparedText {
             TextMatch::All | TextMatch::Phrase => {
                 present.len() == self.terms.len() && present.iter().all(|held| *held)
             }
-            TextMatch::Search => self
+            TextMatch::Search | TextMatch::Prefix => self
                 .groups
                 .iter()
                 .all(|group| group.iter().any(|accepted| present[accepted.term])),
@@ -387,11 +392,7 @@ pub(super) fn prepare_text(
     // walk is the atomic (`core/engine/src/index/text/fuzzy.rs`), and what
     // comes back is already bounded -- at most `fuzzy::MAX_TERMS` terms after
     // at most `fuzzy::MAX_VISITED` dictionary entries.
-    let expanded = if matching == TextMatch::Search {
-        Some(crate::index::text::fuzzy::expand(db, id, query, &mut || false)?)
-    } else {
-        None
-    };
+    let expanded = crate::index::text::fuzzy::expand_for(db, id, query, matching, &mut || false)?;
     let (terms, groups, truncated) = match expanded {
         Some(expansion) => (expansion.terms, expansion.groups, expansion.truncated),
         None => (analysis.terms.into_keys().collect(), Vec::new(), false),
@@ -1244,6 +1245,11 @@ fn compile_set_expr(
                 "a JSON equality cannot be a boolean leaf: it has no index and is answered from the row",
             ))
         }
+        QueryFilter::Like { .. } => {
+            return Err(invalid_query(
+                "a LIKE cannot be a boolean leaf: it has no index and is answered from the row, so there is no set to union or complement",
+            ))
+        }
     })
 }
 
@@ -1345,6 +1351,41 @@ impl Database {
                     CompiledFilter::JsonEq {
                         field: (*field).to_owned(),
                         value: (*value).clone(),
+                    }
+                }
+                QueryFilter::Like {
+                    field,
+                    pattern,
+                    escape,
+                    insensitive,
+                    negated,
+                } => {
+                    let stored = if *field == "_key" {
+                        crate::collections::KEY_FIELD
+                    } else {
+                        field
+                    };
+                    match collection.layout.fields.iter().find(|(name, _)| name == stored) {
+                        // The external key is always text.
+                        _ if *field == "_key" => {}
+                        Some((_, Kind::Text)) => {}
+                        Some((_, other)) => {
+                            return Err(invalid_query(format!(
+                                "LIKE over `{field}`: the field is {other:?}, and LIKE compares text"
+                            )))
+                        }
+                        None => {
+                            return Err(invalid_query(format!(
+                                "LIKE over `{field}`: the collection declares no such field"
+                            )))
+                        }
+                    }
+                    let matcher = super::like::LikeMatcher::compile(pattern, *escape, *insensitive)
+                        .map_err(|e| invalid_query(e.0))?;
+                    CompiledFilter::Like {
+                        field: stored.to_owned(),
+                        matcher,
+                        negated: *negated,
                     }
                 }
                 QueryFilter::Graph(request) => CompiledFilter::Graph {

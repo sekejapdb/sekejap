@@ -462,6 +462,28 @@ pub(crate) fn tsquery_of(text: String, query: &TsQuery) -> SqlResult2<(String, T
         .map(str::trim)
         .filter(|term| !term.is_empty())
         .collect();
+    // `term:*` is PostgreSQL's PREFIX match. Any other `:` is a weight.
+    let prefixed = |term: &str| {
+        term.strip_suffix(":*")
+            .is_some_and(|word| !word.is_empty() && !word.contains(':'))
+    };
+    if terms.iter().any(|term| prefixed(term)) {
+        if terms.iter().any(|term| term.contains(':') && !prefixed(term)) {
+            return Err(SqlError::Refused {
+                keyword: "tsquery weight".into(),
+                tier: Tier::Three,
+                reason: "QL_CONTRACT §4.6: tsvector weights have no atomic; analyzer v1 stores one weight per token.",
+            });
+        }
+        if has_or {
+            return Err(SqlError::Refused {
+                keyword: "tsquery :* inside |".into(),
+                tier: Tier::Two,
+                reason: "QL_CONTRACT §4.6: a prefix term inside an OR is not built; a `:*` term is ANDed with the others (`john:* & doe`), and an OR across predicates is written with SQL's own OR.",
+            });
+        }
+        return Ok((terms.join(" "), TextMatch::Prefix));
+    }
     if terms.iter().any(|term| term.contains(':')) {
         return Err(SqlError::Refused {
             keyword: "tsquery weight".into(),

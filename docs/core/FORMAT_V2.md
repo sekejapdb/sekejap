@@ -540,8 +540,12 @@ these persistent tags blindly.
   the collection each names, the primary key, and once bound the source and
   destination columns, the edge type and the property graph's name. No new
   keyspace: the edges are ordinary `0x71`/`0x72` edges. A file that never
-  declares an edge table carries none of it. The next unclaimed bit is
-  `0x100000`.
+  declares an edge table carries none of it.
+  `KEY_SPEC_FEATURE = 0x100000` (2026-09-28) is KEY DECLARATIONS, and the mask
+  is `0x1fffff`: catalog flag bit 6 (`CATALOG_KEY`) with a versioned key tail
+  -- the named PRIMARY KEY column and/or the key's DEFAULT generator (encoded
+  as a column rule of `_key`). A table that declares neither carries none of
+  it. The next unclaimed bit is `0x200000`.
   Every bit in it is
   additive: set in the same transaction as the first record that needs it,
   never cleared, and a file declaring a bit outside the mask is refused as

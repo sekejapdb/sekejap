@@ -58,6 +58,11 @@ pub enum TextMatch {
     /// keyspace tag and adds no feature bit, because the dictionary it walks
     /// and the postings it hands back are both already on disk.
     Search,
+    /// PostgreSQL's `to_tsquery('john:* & doe')`: every token must be present,
+    /// and a token written with `:*` matches every dictionary term it
+    /// PREFIXES. The same bounded dictionary walk as [`TextMatch::Search`]
+    /// with typos off; the query text keeps the `:*` markers.
+    Prefix,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1975,11 +1980,7 @@ impl Database {
         // The typo-tolerant mode replaces the query's own tokens with the
         // dictionary terms the bounded walk accepted for them, and keeps the
         // groups: a document matches when every token has one of its terms.
-        let expansion = if matching == TextMatch::Search {
-            Some(fuzzy::expand(self, id, query, &mut cancelled)?)
-        } else {
-            None
-        };
+        let expansion = fuzzy::expand_for(self, id, query, matching, &mut cancelled)?;
         if expansion.as_ref().is_some_and(|e| e.terms.is_empty()) {
             return Ok(Vec::new());
         }

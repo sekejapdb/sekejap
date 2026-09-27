@@ -11,7 +11,24 @@ impl Compiler<'_> {
     pub(super) fn where_filter(&mut self, c: CollectionId, expr: &Expr) -> SqlResult2<OwnedFilter> {
         Ok(match expr {
             Expr::Leaf(predicate) => self.filter(c, predicate)?,
-            Expr::Not(inner) => OwnedFilter::Not(Box::new(self.where_filter(c, inner)?)),
+            // `NOT (col LIKE x)` is `col NOT LIKE x`: the row check negates
+            // itself, where a complement of a row check has no set to take.
+            Expr::Not(inner) => match self.where_filter(c, inner)? {
+                OwnedFilter::Like {
+                    field,
+                    pattern,
+                    escape,
+                    insensitive,
+                    negated,
+                } => OwnedFilter::Like {
+                    field,
+                    pattern,
+                    escape,
+                    insensitive,
+                    negated: !negated,
+                },
+                other => OwnedFilter::Not(Box::new(other)),
+            },
             Expr::Or(parts) => OwnedFilter::Any(
                 parts
                     .iter()

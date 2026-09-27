@@ -62,7 +62,7 @@ fn oracle() -> Oracle {
                     ("tags", "JSONB"),
                     ("born", "TIMESTAMPTZ"),
                     ("opened_on", "DATE"),
-                    ("spot", "GEOMETRY(Point, 4326)"),
+                    ("spot", "GEOMETRY(Point,4326)"),
                     ("plot", "GEOMETRY"),  // Kind::Geo
                     ("emb", "VECTOR(4)"),
                 ],

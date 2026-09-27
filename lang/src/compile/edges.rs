@@ -184,9 +184,7 @@ impl Compiler<'_> {
         let mut declared = Vec::new();
         let mut rules = Vec::new();
         for column in &columns {
-            if functions::is_time_type(&column.declared) {
-                declared.push((column.name.clone(), column.declared.clone()));
-            }
+            declared.push((column.name.clone(), column.declared.clone()));
             if let Some(rule) = &column.rule {
                 rules.push((column.name.clone(), rule.clone()));
             }

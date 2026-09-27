@@ -598,13 +598,14 @@ fn a_fold_without_its_expression_index_is_refused_rather_than_scanned() {
         text.contains("expression index") && text.contains("lower(col)"),
         "the refusal must name the index that is missing: {text}"
     );
-    // A non-prefix LIKE names the trigram family instead of taking a scan.
-    let error = f
+    // A non-prefix LIKE is answered by checking each row (0.18.2, owner
+    // decision 2026-09-28): no index, no extra storage. `lang/tests/sql_like.rs`
+    // holds its semantics against PostgreSQL.
+    let answered = f
         .db
         .sql("SELECT k FROM evt WHERE name LIKE '%iga%'", &[])
-        .expect_err("an infix LIKE must be refused");
-    assert_eq!(error.tier(), Some(Tier::Two));
-    assert!(error.to_string().contains("trigram"), "{error}");
+        .expect("an infix LIKE answers");
+    assert!(matches!(answered, sekejap_lang::SqlResult::Rows { .. }));
 }
 
 // ── §4.1 / §4.2 row functions: each equals Rust's own computation ─────────

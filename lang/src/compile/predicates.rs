@@ -298,12 +298,110 @@ impl Compiler<'_> {
             } => self.spatial(c, *predicate, column, argument, metres.as_ref())?,
             Predicate::Time { column, shape } => self.time_filter(c, column, shape)?,
             Predicate::TextFn { column, shape } => self.text_filter(c, column, shape)?,
+            Predicate::Like {
+                column,
+                pattern,
+                escape,
+                insensitive,
+                negated,
+            } => self.like_filter(c, column, pattern, escape.as_ref(), *insensitive, *negated)?,
         })
     }
 
     /// One scalar value AND the slot it came from. The slot is recorded only
     /// when the written literal is a `$n`: a constant of the text cannot
     /// change, so it is not a slot and costs nothing to rebind.
+    /// `col [NOT] LIKE | ILIKE pattern [ESCAPE c]` (PostgreSQL's rules).
+    ///
+    /// A case-sensitive `'abc%'` -- no `_`, no escape, one trailing `%` -- on
+    /// a column with its scalar index stays the text-key prefix range it has
+    /// always been. Every other pattern, `ILIKE` and `NOT LIKE` are checked on
+    /// each row the driver reaches: no index and no extra storage, and a
+    /// notice says so (owner decision 2026-09-28).
+    fn like_filter(
+        &mut self,
+        c: CollectionId,
+        column: &str,
+        pattern: &Literal,
+        escape: Option<&Literal>,
+        insensitive: bool,
+        negated: bool,
+    ) -> SqlResult2<OwnedFilter> {
+        let key = is_key_column(column);
+        if !key {
+            let kind = self.kind_of(c, column)?;
+            if !matches!(kind, Kind::Text) {
+                let op = if insensitive { "~~*" } else { "~~" };
+                return Err(SqlError::coded(
+                    "42883",
+                    format!("operator does not exist: {kind:?} {op} text -- LIKE compares a TEXT column"),
+                ));
+            }
+        }
+        let text = self.text_of(pattern)?;
+        let escape = match escape {
+            None => Some('\\'),
+            Some(literal) => {
+                let e = self.text_of(literal)?;
+                let mut chars = e.chars();
+                match (chars.next(), chars.next()) {
+                    (None, _) => None,
+                    (Some(c), None) => Some(c),
+                    _ => {
+                        return Err(SqlError::coded(
+                            "22019",
+                            "invalid escape string: must be empty or one character",
+                        ))
+                    }
+                }
+            }
+        };
+        let written = format!(
+            "{column} {}{} '{text}'",
+            if negated { "NOT " } else { "" },
+            if insensitive { "ILIKE" } else { "LIKE" }
+        );
+        let plain_prefix = !insensitive
+            && !negated
+            && !key
+            && escape == Some('\\')
+            && !text.contains('_')
+            && !text.contains('\\')
+            && functions::like_prefix(&text).is_some_and(|p| !p.is_empty())
+            && self.scalar_index_opt(c, column)?.is_some();
+        if plain_prefix {
+            return self.text_filter(
+                c,
+                column,
+                &TextShape::Prefix {
+                    value: pattern.clone(),
+                    written: "LIKE",
+                },
+            );
+        }
+        if text.ends_with(escape.unwrap_or('\0')) && escape.is_some() {
+            // Counted properly by the engine's compile; this is the one
+            // shape PostgreSQL names with its own SQLSTATE.
+            let trailing = text.chars().rev().take_while(|c| Some(*c) == escape).count();
+            if trailing % 2 == 1 {
+                return Err(SqlError::coded(
+                    "22025",
+                    "LIKE pattern must not end with escape character",
+                ));
+            }
+        }
+        self.notices.push(format!(
+            "{written}: checked on each row the driver reaches -- no index, no extra storage; a text index makes it faster when one exists (docs/lang/QL_CONTRACT.md §3)"
+        ));
+        Ok(OwnedFilter::Like {
+            field: column.to_owned(),
+            pattern: text,
+            escape,
+            insensitive,
+            negated,
+        })
+    }
+
     pub(super) fn scalar_slot(
         &self,
         kind: &Kind,
