@@ -8,11 +8,11 @@ It runs inside your application, like SQLite, with no separate server to install
 
 It's available as a Rust/Python/Dart/Kotlin/Swift/Node.js/Go library, and a command-line tool.
 
-📝 **Changelog:** [CHANGELOG.md](CHANGELOG.md) — 0.17.0 replaces the engine: a new storage format, a new API, SQL, the PostgreSQL wire protocol, and a C ABI with eight language bindings over it.
+📝 **Changelog:** [CHANGELOG.md](CHANGELOG.md) — 0.18.0 makes graph queries ISO GQL inside `GRAPH_TABLE`, adds PostGIS geometry input and output, and named schemas. The storage format does not change.
 
-📖 **Documentation:** [`docs/lang/QL_CONTRACT.md`](docs/lang/QL_CONTRACT.md) (the query language, including [`GRAPH_TABLE`](docs/lang/QL_CONTRACT.md) graph queries), [`docs/dist/RUST_API.md`](docs/dist/RUST_API.md) (the Rust surface), and [`docs/core/GRAPH_CONTRACT.md`](docs/core/GRAPH_CONTRACT.md) (edge semantics).
+📖 **Documentation:** [`docs/lang/GQL_PROFILE.md`](docs/lang/GQL_PROFILE.md) (graph queries, with examples), [`docs/lang/QL_CONTRACT.md`](docs/lang/QL_CONTRACT.md) (the query language), [`docs/dist/RUST_API.md`](docs/dist/RUST_API.md) (the Rust surface), and [`docs/core/GRAPH_CONTRACT.md`](docs/core/GRAPH_CONTRACT.md) (edge semantics).
 
-📊 **Benchmarks:** 50,000 rows, 43 query cases, against PostgreSQL (with PostGIS and pgvector) and SQLite (with FTS5 and R-tree). Reproduction harnesses and results live in [`bench/`](bench/).
+📊 **Benchmarks:** 50,000 rows, 44 query cases, against PostgreSQL (with PostGIS and pgvector) and SQLite (with FTS5 and R-tree). Reproduction harnesses and results live in [`bench/`](bench/).
 
 ---
 
@@ -109,7 +109,7 @@ flutter pub add sekejap             # or: dart pub add sekejap
 ```kotlin
 // desktop / server JVM, Kotlin or Java, over JDK FFM downcalls
 dependencies {
-  implementation("life.sekejap:sekejap-ffm:0.17.0")
+  implementation("life.sekejap:sekejap-ffm:0.18.0")
 }
 ```
 
@@ -272,6 +272,13 @@ db.query("""
 
 A pattern usually starts at one row, named by its key, and walks out from
 it; with no key predicate it starts by scanning the collection instead.
+
+Graph queries follow ISO GQL: each matching path is one row, so a place
+reached two ways is returned twice, and `RETURN DISTINCT` returns it once.
+A `WHERE` inside a node applies to that node only. The
+[GQL profile](docs/lang/GQL_PROFILE.md) covers the rest: path modes,
+shortest and cheapest paths, `OPTIONAL MATCH`, `EXISTS`, and text, spatial
+and vector search inside a pattern.
 
 ### Location (spatial)
 

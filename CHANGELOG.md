@@ -1,6 +1,46 @@
 # Changelog
 
-## Unreleased
+## 0.18.0
+
+The storage format does not change: 0.18.0 opens a 0.17 database as it is,
+with no migration and no index rebuild.
+
+### Graph queries are ISO GQL
+
+- A `GRAPH_TABLE (...)` body is now written in ISO GQL (ISO/IEC 39075):
+  `MATCH`, `LET`, `FILTER`, `FOR`, `RETURN` and `NEXT`, with quantifiers,
+  path modes (`WALK`, `TRAIL`, `ACYCLIC`), `ANY`, `ANY SHORTEST` and
+  `ANY CHEAPEST`, `OPTIONAL MATCH`, `EXISTS`, `CALL` subqueries and `UNION`.
+  The guide is [`docs/lang/GQL_PROFILE.md`](docs/lang/GQL_PROFILE.md); every
+  construct and the test that pins it is in
+  [`docs/lang/GQL_FEATURES.md`](docs/lang/GQL_FEATURES.md).
+- Text, spatial and vector search work inside a pattern, and a node's
+  predicate can start the walk from an index. `EXPLAIN` shows which.
+- The surrounding `SELECT` filters, groups, orders and pages a graph result
+  like any other table, over SQL, the PostgreSQL wire and the C ABI.
+
+**Breaking changes for graph queries:**
+
+- The SQL/PGQ `COLUMNS (...)` body is removed. End the body with `RETURN`
+  instead: `... RETURN f.airline AS airline)`. A `COLUMNS` body is refused
+  with an error naming `RETURN`.
+- Each matching path is one row. A node reached by two paths is returned
+  twice; `RETURN DISTINCT` returns it once.
+- `{0,n}` includes the starting node, and an unbounded quantifier is no
+  longer capped at 16 steps.
+
+### Vector ordering follows PostgreSQL
+
+- Under a vector `ORDER BY`, a row with no vector (missing, or written
+  `NULL`) is returned last instead of being dropped, as PostgreSQL sorts
+  `NULL`. The cosine distance to an all-zero vector is `NaN`, sorted after
+  every number and before `NULL`, as pgvector answers it.
+- `SET LOCAL ef_search` takes effect when it runs and ends with the
+  transaction, as PostgreSQL scopes it. A prepared statement reads it when
+  it runs.
+- A GQL vector order is exact unless `ef_search` asks for an approximate
+  one, also over a column that has only an approximate index.
+- Rust: `Tx::query` reads inside a transaction.
 
 ### Geometry I/O
 
