@@ -76,3 +76,9 @@ def test_every_python_block_runs_and_prints_what_the_readme_says(tmp_path, monke
         "(t:tourists WHERE t._key = 'chloe')-[:flew_on]->(f:flights) "
         "RETURN f.airline AS airline, f.duration_hours AS hours)"
     ] == [{"airline": "Qantas", "hours": 6}]
+    # The edge written through its edge table, read back by its end.
+    assert answers["SELECT place, rating FROM visited WHERE tourist = 'chloe'"] == [
+        {"place": "warung-sunset", "rating": 4.5}
+    ]
+    # The stored password checks against its own hash.
+    assert answers["SELECT crypt($1, $2) = $2 AS ok"] == [{"ok": True}]

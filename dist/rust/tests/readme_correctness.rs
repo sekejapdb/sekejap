@@ -272,6 +272,9 @@ fn an_edge_table_writes_edges_in_sql() {
         VERTEX TABLES (tourists, restaurants)
         EDGE TABLES (visited SOURCE KEY (tourist) REFERENCES tourists (_key)
                              DESTINATION KEY (place) REFERENCES restaurants (_key))"));
+    // The README creates the restaurant first; this file's fixture already
+    // holds it, with its geometry, so the statement is only checked present.
+    readme("INSERT INTO restaurants (_key, name, area) VALUES ('warung-sunset', 'Warung Sunset', 'Seminyak')");
     run(&db, readme("INSERT INTO visited VALUES ('chloe', 'warung-sunset', 4.5)"));
     let rows = query(&db, readme("SELECT place, rating FROM visited WHERE tourist = 'chloe'"));
     assert_eq!(texts(&rows, "place"), ["warung-sunset"]);

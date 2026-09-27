@@ -311,6 +311,7 @@ db.execute("""
         EDGE TABLES (visited SOURCE KEY (tourist) REFERENCES tourists (_key)
                              DESTINATION KEY (place) REFERENCES restaurants (_key))
 """)
+db.execute("INSERT INTO restaurants (_key, name, area) VALUES ('warung-sunset', 'Warung Sunset', 'Seminyak')")
 db.execute("INSERT INTO visited VALUES ('chloe', 'warung-sunset', 4.5)")
 db.query("SELECT place, rating FROM visited WHERE tourist = 'chloe'")
 # → { place: "warung-sunset", rating: 4.5 }
