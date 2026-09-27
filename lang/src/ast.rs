@@ -707,6 +707,8 @@ pub(super) struct ColumnDef {
     /// (`docs/core/EDGE_TABLES.md`). The optional column is kept so the
     /// compiler can require it to be `_key`.
     pub(super) references: Option<(String, Option<String>)>,
+    /// `UNIQUE` on the column: its scalar index is a unique one.
+    pub(super) unique: bool,
     /// `DEFAULT <generator>` and `NOT NULL`, as the per-field COLUMN RULE
     /// the collection descriptor records (QL_CONTRACT §2). `None` when the
     /// column clauses set neither.
@@ -864,6 +866,12 @@ pub(super) enum Stmt {
         name: String,
         if_exists: bool,
     },
+    /// `ALTER TABLE t ADD [CONSTRAINT name] UNIQUE (col)`: a unique index.
+    AddUnique {
+        table: String,
+        name: Option<String>,
+        columns: Vec<String>,
+    },
     Update {
         table: String,
         assignments: Vec<(String, Literal)>,
@@ -905,6 +913,8 @@ pub(super) enum Stmt {
         columns: Vec<ColumnDef>,
         /// A table-level `PRIMARY KEY (a, b, ...)`: an edge table's key.
         primary_key: Vec<String>,
+        /// Each table-level `UNIQUE (...)`, as written.
+        unique: Vec<Vec<String>>,
         /// `IF NOT EXISTS`: a catalog probe decides, and a table that is
         /// already there raises a NOTICE rather than an error.
         if_not_exists: bool,
@@ -925,6 +935,8 @@ pub(super) enum Stmt {
         name: Option<String>,
         table: String,
         method: IndexMethod,
+        /// `CREATE UNIQUE INDEX`: a btree whose values may not repeat.
+        unique: bool,
     },
     DropTable {
         table: String,

@@ -92,6 +92,17 @@ pub struct IndexTree {
     pub id: u16,
     pub root: u32,
 }
+/// A second equal value under a UNIQUE index: `23505`, naming the index
+/// and its column, as PostgreSQL names the constraint.
+fn unique_violation(i: &IndexInfo) -> Error {
+    Error::Constraint {
+        sqlstate: "23505",
+        message: format!(
+            "duplicate key value violates unique constraint `{}`: Key ({}) already exists",
+            i.name, i.field
+        ),
+    }
+}
 pub(super) const MAX_BATCH: usize = 256;
 pub(crate) const MAX_RESULTS: usize = 65536;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1425,7 +1436,7 @@ impl Database {
                 return Err(corrupt("unique scalar entry"));
             }
             if other != seq {
-                return Err(Error::AlreadyExists);
+                return Err(unique_violation(i));
             }
         }
         Ok(())
@@ -2279,7 +2290,7 @@ impl Database {
                     return Err(e);
                 }
                 if duplicate {
-                    return Err(Error::AlreadyExists);
+                    return Err(unique_violation(&i));
                 }
                 let (root, _rows) = packed?;
                 i.tree = Some(IndexTree { id: t.id, root });
@@ -2343,7 +2354,7 @@ impl Database {
                 let v = self.scalar_value_bytes(&i, &key)?;
                 if v != [0] {
                     if prev_value.as_deref() == Some(v) {
-                        return Err(Error::AlreadyExists);
+                        return Err(unique_violation(&i));
                     }
                     prev_value = Some(v.to_vec());
                 } else {

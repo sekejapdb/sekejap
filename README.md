@@ -206,6 +206,10 @@ db.execute("INSERT INTO flights (_key, airline, duration_hours) VALUES ('qf-mel'
 db.link("tourists", "chloe", "flew_on", "flights", "qf-mel")
 ```
 
+As in PostgreSQL, `INSERT` of a key that already exists is refused
+(`23505`); `INSERT ... ON CONFLICT (_key) DO UPDATE SET col = EXCLUDED.col`
+is the upsert, and a `UNIQUE` column refuses a second equal value.
+
 ### 4. Run a query
 
 Ordinary SQL works as you'd expect:

@@ -239,17 +239,12 @@ impl Compiler<'_> {
                     Plan::Write(self.insert_edges(c, &table, &edge, columns, &rows, on_conflict)?)
                 }
                 None => {
-                    if on_conflict.is_some() {
-                        return Err(SqlError::unsupported(
-                            "INSERT ... ON CONFLICT on a table of rows: `Database::put` replaces the row at a key, and a conditional write has no atomic; ON CONFLICT is an edge table's (docs/core/EDGE_TABLES.md §4.2)",
-                        ));
-                    }
                     if columns.is_empty() {
                         return Err(SqlError::unsupported(format!(
                             "INSERT INTO {table} VALUES with no column list: name the columns, `_key` among them"
                         )));
                     }
-                    Plan::Write(self.insert(&table, &columns, &rows)?)
+                    Plan::Write(self.insert(&table, &columns, &rows, on_conflict)?)
                 }
             },
             Stmt::Update { table, .. } | Stmt::Delete { table, .. }
@@ -284,6 +279,11 @@ impl Compiler<'_> {
             Stmt::DropPropertyGraph { name, if_exists } => {
                 Plan::Write(WritePlan::DropPropertyGraph { name, if_exists })
             }
+            Stmt::AddUnique {
+                table,
+                name,
+                columns,
+            } => Plan::Write(self.add_unique(&table, name, &columns)?),
             Stmt::Update {
                 table,
                 assignments,
@@ -311,15 +311,22 @@ impl Compiler<'_> {
                 table,
                 columns,
                 primary_key,
+                unique,
                 if_not_exists,
                 indexes,
                 ..
             } if !primary_key.is_empty() || columns.iter().any(|c| c.references.is_some()) => {
+                if !unique.is_empty() || columns.iter().any(|c| c.unique) {
+                    return Err(SqlError::unsupported(format!(
+                        "UNIQUE on edge table `{table}`: an edge table's uniqueness is its PRIMARY KEY (docs/core/EDGE_TABLES.md §3)"
+                    )));
+                }
                 Plan::Write(self.create_edge_table(table, columns, primary_key, if_not_exists, &indexes)?)
             }
             Stmt::CreateTable {
                 table,
                 columns,
+                unique,
                 if_not_exists,
                 indexes,
                 automatic,
@@ -327,6 +334,7 @@ impl Compiler<'_> {
             } => Plan::Write(self.create_table(
                 table,
                 columns,
+                unique,
                 if_not_exists,
                 &indexes,
                 &automatic,
@@ -335,7 +343,8 @@ impl Compiler<'_> {
                 name,
                 table,
                 method,
-            } => Plan::Write(self.create_index(name, &table, method)?),
+                unique,
+            } => Plan::Write(self.create_index(name, &table, method, unique)?),
             Stmt::DropTable {
                 table,
                 if_exists,

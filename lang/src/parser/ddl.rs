@@ -56,6 +56,7 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         let mut columns = Vec::new();
         let mut primary_key = Vec::new();
+        let mut unique = Vec::new();
         loop {
             // A TABLE constraint: `PRIMARY KEY (a, b)`, optionally named
             // with `CONSTRAINT name`. Every other table constraint is
@@ -79,9 +80,13 @@ impl Parser {
                     }
                     self.expect(&Tok::RParen)?;
                 }
-                (Some(what @ ("UNIQUE" | "FOREIGN" | "CHECK" | "EXCLUDE")), _) => {
+                (Some("UNIQUE"), _) => {
+                    self.bump();
+                    unique.push(self.column_list()?);
+                }
+                (Some(what @ ("FOREIGN" | "CHECK" | "EXCLUDE")), _) => {
                     return Err(SqlError::unsupported(format!(
-                        "table constraint `{what}`: a table constraint here is `PRIMARY KEY (...)`, an edge table's key (docs/core/EDGE_TABLES.md §3)"
+                        "table constraint `{what}`: a table constraint here is `PRIMARY KEY (...)`, an edge table's key (docs/core/EDGE_TABLES.md §3), or `UNIQUE (column)`"
                     )));
                 }
                 _ => columns.push(self.column_def()?),
@@ -103,6 +108,7 @@ impl Parser {
             table,
             columns,
             primary_key,
+            unique,
             if_not_exists,
             indexes,
             automatic,
@@ -264,6 +270,7 @@ impl Parser {
         let (kind, declared) = self.column_type()?;
         let mut primary_key = false;
         let mut references = None;
+        let mut unique = false;
         let mut rule = ColumnRule::default();
         loop {
             match self.word().as_deref() {
@@ -303,7 +310,11 @@ impl Parser {
                     }
                     references = Some((target, column));
                 }
-                Some("UNIQUE") | Some("CHECK") => {
+                Some("UNIQUE") => {
+                    self.bump();
+                    unique = true;
+                }
+                Some("CHECK") => {
                     return Err(SqlError::unsupported(format!(
                         "column constraint `{}`: the descriptor's per-field slot holds a DEFAULT generator and a NOT NULL flag, and nothing else",
                         self.peek().written()
@@ -325,6 +336,7 @@ impl Parser {
             declared,
             primary_key,
             references,
+            unique,
             rule: (rule != ColumnRule::default()).then_some(rule),
         })
     }
@@ -435,6 +447,29 @@ impl Parser {
             ));
         }
         let table = self.table_name()?;
+        // `ADD [CONSTRAINT name] UNIQUE (col)`: a unique index, its own
+        // statement rather than a descriptor rewrite.
+        let unique_at = match (self.word().as_deref(), self.word_at(1).as_deref(), self.word_at(3).as_deref()) {
+            (Some("ADD"), Some("UNIQUE"), _) => Some(false),
+            (Some("ADD"), Some("CONSTRAINT"), Some("UNIQUE")) => Some(true),
+            _ => None,
+        };
+        if let Some(named) = unique_at {
+            self.bump();
+            let name = if named {
+                self.bump();
+                Some(self.name()?)
+            } else {
+                None
+            };
+            self.expect_word("UNIQUE")?;
+            let columns = self.column_list()?;
+            return Ok(Stmt::AddUnique {
+                table,
+                name,
+                columns,
+            });
+        }
         let action = self.alter_action()?;
         if self.eat(&Tok::Comma) {
             return Err(SqlError::unsupported(
@@ -651,16 +686,16 @@ impl Parser {
             self.expect(&Tok::LParen)?;
             let method = self.index_expression()?;
             self.expect(&Tok::RParen)?;
+            if unique && !matches!(method, IndexMethod::Btree(_)) {
+                return Err(SqlError::unsupported(
+                    "UNIQUE on an expression index: uniqueness over a folded value would refuse two rows that differ, which is not what the statement says",
+                ));
+            }
             return Ok(Stmt::CreateIndex {
                 name,
                 table,
-                method: if unique {
-                    return Err(SqlError::unsupported(
-                        "UNIQUE on an expression index: uniqueness over a folded value would refuse two rows that differ, which is not what the statement says",
-                    ));
-                } else {
-                    method
-                },
+                method,
+                unique,
             });
         }
         let method_at = self.here();
@@ -746,6 +781,7 @@ impl Parser {
             name,
             table,
             method,
+            unique,
         })
     }
 
@@ -1050,6 +1086,20 @@ impl Parser {
                 _ => return Ok(label),
             }
         }
+    }
+
+    /// `(a, b, ...)`: a parenthesised list of column names.
+    fn column_list(&mut self) -> SqlResult2<Vec<String>> {
+        self.expect(&Tok::LParen)?;
+        let mut out = Vec::new();
+        loop {
+            out.push(self.name()?);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        Ok(out)
     }
 
     fn if_exists(&mut self) -> SqlResult2<bool> {

@@ -670,6 +670,10 @@ pub(crate) enum WritePlan {
     Insert {
         collection: CollectionId,
         rows: Vec<(String, Value)>,
+        /// `ON CONFLICT (_key)`: `Some(None)` is `DO NOTHING`, `Some(Some(cols))`
+        /// is `DO UPDATE SET c = EXCLUDED.c` for each named column. `None` is
+        /// a plain INSERT, which refuses a taken key with 23505.
+        on_conflict: Option<Option<Vec<String>>>,
     },
     Update {
         collection: CollectionId,
@@ -950,10 +954,34 @@ impl WritePlan {
             Self::DeleteEdges { collection, filter } => {
                 SqlResult::Affected(db.delete_edge_rows(collection, &filter)? as u64)
             }
-            Self::Insert { collection, rows } => {
+            Self::Insert {
+                collection,
+                rows,
+                on_conflict,
+            } => {
                 let mut affected = 0u64;
                 for (key, document) in rows {
-                    db.put(collection, &key, &document)?;
+                    match &on_conflict {
+                        None => {
+                            db.insert(collection, &key, &document)?;
+                        }
+                        Some(action) => {
+                            if db.get(collection, &key)?.is_none() {
+                                db.insert(collection, &key, &document)?;
+                            } else if let Some(columns) = action {
+                                let mut patch = serde_json::Map::new();
+                                for column in columns {
+                                    patch.insert(
+                                        column.clone(),
+                                        document.get(column).cloned().unwrap_or(Value::Null),
+                                    );
+                                }
+                                db.update(collection, &key, &Value::Object(patch))?;
+                            } else {
+                                continue;
+                            }
+                        }
+                    }
                     affected += 1;
                 }
                 SqlResult::Affected(affected)
@@ -1297,7 +1325,18 @@ fn build_index(
         CompiledIndex::VamanaGraph { field } => db.create_vamana_index(collection, name, field)?,
     };
     db.commit()?;
-    db.build_index_to_ready(id, build_chunk_rows(method))?;
+    if let Err(built) = db.build_index_to_ready(id, build_chunk_rows(method)) {
+        // A UNIQUE index over rows that already break it: nothing it
+        // indexed is kept. The descriptor was committed, so it is dropped
+        // with the ordinary bounded steps before the refusal is raised.
+        if matches!(built, sekejap_core::collections::Error::Constraint { .. }) {
+            db.rollback()?;
+            db.begin_drop_index(id)?;
+            while !db.drop_index_step(id, 256)? {}
+            db.commit()?;
+        }
+        return Err(built.into());
+    }
     db.commit()?;
     Ok(())
 }

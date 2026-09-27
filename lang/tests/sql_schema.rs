@@ -530,7 +530,7 @@ fn an_alter_form_with_no_atomic_is_refused_and_names_what_there_is() {
     run(&mut db, "CREATE TABLE person (id TEXT PRIMARY KEY, n INT)");
     for (statement, wanted) in [
         ("ALTER TABLE person ALTER COLUMN n SET NOT NULL", "SET"),
-        ("ALTER TABLE person ADD CONSTRAINT c UNIQUE (n)", "ADD COLUMN"),
+        ("ALTER TABLE person ADD CONSTRAINT c CHECK (n > 0)", "ADD COLUMN"),
         ("ALTER TABLE person OWNER TO bob", "ADD COLUMN"),
         ("ALTER TABLE IF EXISTS person RENAME TO p", "IF EXISTS"),
         ("ALTER INDEX i RENAME TO j", "ALTER TABLE"),

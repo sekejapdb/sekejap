@@ -8,6 +8,7 @@ impl Compiler<'_> {
         table: &str,
         columns: &[String],
         values: &[Vec<Literal>],
+        on_conflict: Option<ConflictClause>,
     ) -> SqlResult2<WritePlan> {
         let c = collection(self.db, table)?;
         let key_at = match columns.iter().position(|name| is_key_column(name)) {
@@ -51,9 +52,35 @@ impl Compiler<'_> {
             }
             rows.push((key, Value::Object(document)));
         }
+        // `ON CONFLICT (_key)`, or the column that supplies the key: the one
+        // key a row has. A conflict on another column would need that
+        // column's UNIQUE index to find the row, which is not built.
+        let on_conflict = match on_conflict {
+            None => None,
+            Some(clause) => {
+                let key_column = &columns[key_at];
+                let targets_key = clause.target.len() == 1
+                    && (is_key_column(&clause.target[0]) || clause.target[0] == *key_column);
+                if !targets_key {
+                    return Err(SqlError::unsupported(format!(
+                        "ON CONFLICT ({}) on `{table}`: the conflict target of a table of rows is its key, `{KEY_COLUMN}`",
+                        clause.target.join(", ")
+                    )));
+                }
+                if let Some(set) = &clause.update {
+                    if let Some(bad) = set.iter().find(|c| is_key_column(c) || *c == key_column) {
+                        return Err(SqlError::unsupported(format!(
+                            "ON CONFLICT DO UPDATE SET {bad}: the key is the row's identity; a new key is a new row"
+                        )));
+                    }
+                }
+                Some(clause.update)
+            }
+        };
         Ok(WritePlan::Insert {
             collection: c,
             rows,
+            on_conflict,
         })
     }
 

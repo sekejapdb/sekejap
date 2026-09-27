@@ -52,6 +52,20 @@ is refused by 0.17 by name, never misread.
 - Over the PostgreSQL wire, a refused edge write carries PostgreSQL's own
   SQLSTATE.
 
+### Keys and UNIQUE, as PostgreSQL enforces them
+
+**Breaking change:** a plain SQL `INSERT` of a key that already exists is now
+refused with `23505` instead of replacing the row. Write
+`INSERT ... ON CONFLICT (_key) DO UPDATE SET col = EXCLUDED.col` (or
+`DO NOTHING`) for an upsert. The Rust and C `put` calls are unchanged.
+
+- `UNIQUE` on a column, `UNIQUE (col)` as a table constraint and
+  `ALTER TABLE ... ADD [CONSTRAINT name] UNIQUE (col)`: a second equal value
+  is `23505`; NULL values never collide.
+- `CREATE UNIQUE INDEX ... USING btree (col)` built a non-unique index; it is
+  unique now, and `CREATE UNIQUE INDEX ... ON t (col)` is accepted.
+- A unique violation reaches a PostgreSQL client as `23505`, not `42P07`.
+
 ### Vector ordering follows PostgreSQL
 
 - Under a vector `ORDER BY`, a row with no vector (missing, or written

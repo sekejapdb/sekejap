@@ -2298,6 +2298,26 @@ impl Database {
         let old = self.load_entity(c, key, true, false)?;
         self.write_entity(&catalog, key, doc.clone(), old)
     }
+    /// SQL's `INSERT`: [`Database::put`] of a NEW row. A key that is already
+    /// taken is `23505` (unique_violation), raised before anything is
+    /// written, as PostgreSQL raises it; `put` stays the call that writes
+    /// whatever row is at the key.
+    pub fn insert(&mut self, c: CollectionId, key: &str, doc: &Value) -> Result<EntityId> {
+        self.user_write()?;
+        let catalog = self.catalog(c)?;
+        refuse_row_in_edge_table(&catalog)?;
+        self.validate_document(&catalog, key, doc)?;
+        if self.load_entity(c, key, true, false)?.is_some() {
+            return Err(Error::Constraint {
+                sqlstate: "23505",
+                message: format!(
+                    "duplicate key value violates the primary key of `{}`: Key (_key)=({key}) already exists",
+                    catalog.name
+                ),
+            });
+        }
+        self.write_entity(&catalog, key, doc.clone(), None)
+    }
     pub fn update(&mut self, c: CollectionId, key: &str, patch: &Value) -> Result<EntityId> {
         self.user_write()?;
         let catalog = self.catalog(c)?;

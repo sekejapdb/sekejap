@@ -122,6 +122,7 @@ impl Compiler<'_> {
         &mut self,
         table: String,
         columns: Vec<ColumnDef>,
+        unique: Vec<Vec<String>>,
         if_not_exists: bool,
         with: &[WithIndex],
         automatic: &Automatic,
@@ -206,13 +207,87 @@ impl Compiler<'_> {
             ));
         }
         let declared_indexes = self.with_indexes(&table, &fields, with)?;
-        let indexes = self.automatic_indexes(&table, &columns, automatic, declared_indexes)?;
+        let mut indexes = self.automatic_indexes(&table, &columns, automatic, declared_indexes)?;
+        // UNIQUE: the column's scalar index is a UNIQUE one -- the automatic
+        // index made unique when there is one, a unique btree when there is
+        // not (`WITH (index: none)`). One index per column, never two.
+        let mut wanted: Vec<String> = columns.iter().filter(|c| c.unique).map(|c| c.name.clone()).collect();
+        for list in unique {
+            if list.len() != 1 {
+                return Err(SqlError::unsupported(format!(
+                    "UNIQUE ({}): a unique constraint here covers one column, the column a unique index is over",
+                    list.join(", ")
+                )));
+            }
+            wanted.push(list[0].clone());
+        }
+        for column in wanted {
+            let Some((_, kind)) = fields.iter().find(|(n, _)| *n == column) else {
+                return Err(SqlError::coded(
+                    "42703",
+                    format!("UNIQUE ({column}): `{column}` is not a column of `{table}`"),
+                ));
+            };
+            if !matches!(kind, Kind::Text | Kind::Int | Kind::Real | Kind::Bool) {
+                return Err(SqlError::unsupported(format!(
+                    "UNIQUE on `{column}`: a unique index is a scalar btree, and `{column}` is {kind:?}"
+                )));
+            }
+            match indexes.iter_mut().find(|(_, i)| matches!(i, CompiledIndex::Scalar { field, .. } if *field == column)) {
+                Some((_, CompiledIndex::Scalar { unique, .. })) => *unique = true,
+                _ => indexes.push((
+                    format!("{}_{column}_key", crate::index_stem(&table)),
+                    CompiledIndex::Scalar {
+                        field: column.clone(),
+                        unique: true,
+                    },
+                )),
+            }
+        }
         Ok(WritePlan::CreateTable {
             name: table,
             fields,
             declared,
             rules,
             indexes,
+        })
+    }
+
+    /// `ALTER TABLE t ADD [CONSTRAINT name] UNIQUE (col)`: a unique btree
+    /// over `col`, built over the rows already there -- rows that already
+    /// break it refuse the statement with 23505 and leave no index.
+    pub(super) fn add_unique(
+        &mut self,
+        table: &str,
+        name: Option<String>,
+        columns: &[String],
+    ) -> SqlResult2<WritePlan> {
+        let c = collection(self.db, table)?;
+        if self.db.edge_table(c).map_err(SqlError::from)?.is_some() {
+            return Err(SqlError::unsupported(format!(
+                "UNIQUE on edge table `{table}`: an edge table's uniqueness is its PRIMARY KEY (docs/core/EDGE_TABLES.md §3)"
+            )));
+        }
+        if columns.len() != 1 {
+            return Err(SqlError::unsupported(format!(
+                "UNIQUE ({}): a unique constraint here covers one column, the column a unique index is over",
+                columns.join(", ")
+            )));
+        }
+        let column = &columns[0];
+        let kind = self.kind_of(c, column)?;
+        if !matches!(kind, Kind::Text | Kind::Int | Kind::Real | Kind::Bool) {
+            return Err(SqlError::unsupported(format!(
+                "UNIQUE on `{column}`: a unique index is a scalar btree, and `{column}` is {kind:?}"
+            )));
+        }
+        Ok(WritePlan::CreateIndex {
+            collection: c,
+            name: name.unwrap_or_else(|| format!("{}_{column}_key", crate::index_stem(table))),
+            method: CompiledIndex::Scalar {
+                field: column.clone(),
+                unique: true,
+            },
         })
     }
 
@@ -815,6 +890,7 @@ impl Compiler<'_> {
         name: Option<String>,
         table: &str,
         method: IndexMethod,
+        unique: bool,
     ) -> SqlResult2<WritePlan> {
         let c = collection(self.db, table)?;
         if self.db.edge_table(c).map_err(SqlError::from)?.is_some() {
@@ -825,10 +901,7 @@ impl Compiler<'_> {
         let method = match method {
             IndexMethod::Btree(field) => {
                 self.kind_of(c, &field)?;
-                CompiledIndex::Scalar {
-                    field,
-                    unique: false,
-                }
+                CompiledIndex::Scalar { field, unique }
             }
             IndexMethod::LowerBtree(field) => {
                 if !matches!(self.kind_of(c, &field)?, Kind::Text) {
