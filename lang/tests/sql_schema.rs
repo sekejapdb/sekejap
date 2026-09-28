@@ -181,9 +181,10 @@ fn not_null_refuses_a_missing_column_and_an_explicit_null_by_name() {
 #[test]
 fn a_default_outside_the_closed_generator_set_is_refused_by_name() {
     let (_dir, mut db) = open();
+    // A constant (`DEFAULT 'anonymous'`, `DEFAULT 0`) is in the set since
+    // 0.18.2 (`lang/tests/sql_constant_defaults.rs`); a call or an
+    // expression is not.
     for clause in [
-        "DEFAULT 'anonymous'",
-        "DEFAULT 0",
         "DEFAULT random()",
         "DEFAULT (now() + interval '1 day')",
         "DEFAULT nextval('s')",

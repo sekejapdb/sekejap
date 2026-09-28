@@ -545,7 +545,13 @@ these persistent tags blindly.
   is `0x1fffff`: catalog flag bit 6 (`CATALOG_KEY`) with a versioned key tail
   -- the named PRIMARY KEY column and/or the key's DEFAULT generator (encoded
   as a column rule of `_key`). A table that declares neither carries none of
-  it. The next unclaimed bit is `0x200000`.
+  it. `CONSTANT_DEFAULT_FEATURE = 0x200000` (2026-09-28) is CONSTANT column
+  defaults, and the mask is `0x3fffff`: generator byte `5` in a column rule,
+  followed by a tagged value (false, true, i64, f64, text, JSON text; at most
+  4096 bytes). It is set only when a table first records a constant, so a
+  file with none is unchanged; a binary without the bit refuses one at
+  admission rather than reading byte `5` as damage. The next unclaimed bit
+  is `0x400000`.
   Every bit in it is
   additive: set in the same transaction as the first record that needs it,
   never cleared, and a file declaring a bit outside the mask is refused as

@@ -169,7 +169,7 @@ pub use catalog::{
     IndexState, JSON_EXPRESSION_FEATURE,
     IndexTree, ScalarPredicate, MAX_INDEXES,
 };
-pub use column_rules::{ColumnRule, DefaultValue, COLUMN_RULES_FEATURE};
+pub use column_rules::{ColumnRule, DefaultValue, COLUMN_RULES_FEATURE, CONSTANT_DEFAULT_FEATURE};
 pub use drop_collection::{DropMode, DropPhase, DropProgress, DropState, MAX_DROP_BATCH};
 pub use row_count::{RowCountProgress, RowCountRecord, ROW_COUNT_FEATURE};
 pub use write_set::{
@@ -1048,7 +1048,9 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
 /// `0x80000` EDGE TABLES -- the catalog's edge tail
 /// ([`crate::index::graph::edge_table::EDGE_TABLE_FEATURE`]).
 /// `0x100000` KEY declarations -- the catalog's key tail ([`KEY_SPEC_FEATURE`]).
-/// The mask is therefore `0x1fffff`.
+/// `0x200000` CONSTANT column defaults
+/// ([`column_rules::CONSTANT_DEFAULT_FEATURE`]).
+/// The mask is therefore `0x3fffff`.
 /// Every one is additive: set in the same transaction as the first record
 /// that uses it, never cleared, and a file that declares a bit outside this
 /// mask is refused as `Unsupported` at admission (Law 8).
@@ -1079,6 +1081,7 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | crate::index::vector::graph::VAMANA_FEATURE
     | crate::index::graph::edge_table::EDGE_TABLE_FEATURE
     | KEY_SPEC_FEATURE
+    | column_rules::CONSTANT_DEFAULT_FEATURE
     | catalog::JSON_EXPRESSION_FEATURE
     | SCHEMA_FEATURE
     | crate::index::graph::EDGE_ID_FEATURE;
@@ -1904,6 +1907,9 @@ impl Database {
             if !c.rules.is_empty() {
                 self.enable_logical_feature(column_rules::COLUMN_RULES_FEATURE)?;
             }
+            if column_rules::has_constant(&c.rules) {
+                self.enable_logical_feature(column_rules::CONSTANT_DEFAULT_FEATURE)?;
+            }
             self.persist_layout(&layout)?;
             self.persist_catalog(&c)?;
             self.write_sequence(c.id, 1)?;
@@ -2127,6 +2133,11 @@ impl Database {
             if matches!(default, DefaultValue::Now) {
                 return Err(invalid("DEFAULT now() on the key: a key is text, and now() is an instant"));
             }
+            if matches!(default, DefaultValue::Constant(_)) {
+                return Err(invalid(
+                    "a constant DEFAULT on the key: every row would take the same key; use ulid(), uuid4() or uuid5()",
+                ));
+            }
         }
         catalog.key = Some(spec);
         let result = (|| {
@@ -2195,6 +2206,9 @@ impl Database {
             }
             if !c.rules.is_empty() {
                 self.enable_logical_feature(column_rules::COLUMN_RULES_FEATURE)?;
+            }
+            if column_rules::has_constant(&c.rules) {
+                self.enable_logical_feature(column_rules::CONSTANT_DEFAULT_FEATURE)?;
             }
             self.persist_layout(&layout)?;
             self.persist_catalog(&c)?;
@@ -3217,7 +3231,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x1fffff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x3fffff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -3238,7 +3252,7 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0x1fffff
+            0x3fffff
         );
         // A bit outside the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
@@ -3246,11 +3260,11 @@ mod tests {
         // graph (`0x8000`) and the JSON-path expression index (`0x10000`)
         // landed together, named schemas took `0x20000` and edge identity
         // `0x40000`, so the mask is contiguous through bit 18 and the first
-        // unclaimed bit is `0x200000` (edge tables took `0x80000`, key
-        // declarations `0x100000`).
+        // unclaimed bit is `0x400000` (edge tables took `0x80000`, key
+        // declarations `0x100000`, constant defaults `0x200000`).
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x200000)),
-            Err(Error::Unsupported(m)) if m.contains("0x3fffff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x400000)),
+            Err(Error::Unsupported(m)) if m.contains("0x7fffff")
         ));
     }
     /// Law 8 for the live row count, the same shape the declared-type bit's
@@ -3281,9 +3295,9 @@ mod tests {
             Err(Error::Unsupported(m)) if m.contains("0x2001")
         ));
         // And a bit past every implemented family is refused by this build
-        // too. `0x100000` is key declarations now, so the probe is `0x200000`.
+        // too. `0x200000` is constant defaults now, so the probe is `0x400000`.
         assert!(matches!(
-            admit_features(1 | 0x200000, SUPPORTED_LOGICAL_FEATURES),
+            admit_features(1 | 0x400000, SUPPORTED_LOGICAL_FEATURES),
             Err(Error::Unsupported(_))
         ));
     }

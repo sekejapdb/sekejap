@@ -36,6 +36,12 @@ that work with no setup.
   replaying it builds the same table. `Field` gains `not_null` and
   `default`; `Field::primary_key` marks the one column that supplies the
   key.
+- **Constant column defaults**: `DEFAULT 'member'`, `DEFAULT 0`,
+  `DEFAULT true`, filled into a row that leaves the column out and printed
+  back by `SHOW CREATE TABLE`. A table that uses one sets a new additive
+  storage bit. Refused on a PRIMARY KEY, and on `ALTER TABLE ... ADD
+  COLUMN` over a table that has rows (PostgreSQL would show the default on
+  the old rows; here they would read missing).
 - **`BEGIN` / `COMMIT` / `ROLLBACK` through `Db::execute` or `Db::query`**
   are refused by name. They used to answer OK and do nothing, because each
   call is already its own transaction; use `Db::transaction`.

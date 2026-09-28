@@ -291,7 +291,7 @@ impl Parser {
                 }
                 Some("DEFAULT") => {
                     self.bump();
-                    rule.default = Some(self.default_generator()?);
+                    rule.default = self.default_generator()?;
                 }
                 Some("REFERENCES") => {
                     self.bump();
@@ -341,17 +341,61 @@ impl Parser {
         })
     }
 
-    /// The generator a `DEFAULT` names. The set is CLOSED (QL_CONTRACT §2):
-    /// `now()`, `ulid()`, `uuid4()`, `uuid5(namespace, name)` and the Postgres
-    /// spellings of those three. Anything else -- a literal, an arithmetic
-    /// expression, a call this engine does not have -- is refused by name,
-    /// because a default that is an expression is the generated-column row
-    /// of the contract and has no write-path atomic.
-    fn default_generator(&mut self) -> SqlResult2<DefaultValue> {
+    /// What a `DEFAULT` names. The set is CLOSED (QL_CONTRACT §2): a
+    /// constant literal (`'member'`, `0`, `-1.5`, `true`; `NULL` is no
+    /// default), or one of `now()`, `ulid()`, `uuid4()`,
+    /// `uuid5(namespace, name)` and the Postgres spellings of those. Anything
+    /// else -- an arithmetic expression, a call this engine does not have --
+    /// is refused by name, because a default that is an expression is the
+    /// generated-column row of the contract and has no write-path atomic.
+    fn default_generator(&mut self) -> SqlResult2<Option<DefaultValue>> {
         let at = self.here();
+        // A CONSTANT: a literal the compiler reads as the column's type, by
+        // the rules an INSERT's literal follows. `DEFAULT NULL` is no
+        // default at all, as in PostgreSQL.
+        let negative = matches!(self.peek(), Tok::Minus);
+        if negative {
+            self.bump();
+        }
+        match self.peek().clone() {
+            Tok::Num(n, integral) => {
+                self.bump();
+                let n = if negative { -n } else { n };
+                let value = if integral {
+                    serde_json::Value::from(n as i64)
+                } else {
+                    serde_json::Value::from(n)
+                };
+                return Ok(Some(DefaultValue::Constant(value)));
+            }
+            _ if negative => {
+                return Err(SqlError::syntax("DEFAULT -: a minus sign is followed by a number", at))
+            }
+            Tok::Str(text) => {
+                self.bump();
+                return Ok(Some(DefaultValue::Constant(serde_json::Value::String(text))));
+            }
+            _ => {}
+        }
+        match self.word().as_deref() {
+            Some("TRUE") | Some("FALSE") => {
+                let value = self.word().as_deref() == Some("TRUE");
+                self.bump();
+                return Ok(Some(DefaultValue::Constant(serde_json::Value::Bool(value))));
+            }
+            Some("NULL") => {
+                self.bump();
+                return Ok(None);
+            }
+            _ => {}
+        }
+        self.default_call(at).map(Some)
+    }
+
+    fn default_call(&mut self, at: usize) -> SqlResult2<DefaultValue> {
         let Some(word) = self.word() else {
             return Err(SqlError::unsupported(format!(
-                "DEFAULT {}: the generator set is closed -- now(), ulid(), uuid4(), uuid5(namespace, name) -- and an arbitrary expression is the GENERATED ALWAYS row of QL_CONTRACT §2",
+                "DEFAULT {}: the DEFAULT set is closed -- a constant literal, now(), ulid(), uuid4(), uuid5(namespace, name) -- and an arbitrary expression is the GENERATED ALWAYS row of QL_CONTRACT §2",
                 self.peek().written()
             )));
         };
@@ -410,7 +454,7 @@ impl Parser {
                 })
             }
             other => Err(SqlError::unsupported(format!(
-                "DEFAULT {other}: the generator set is closed -- now(), ulid(), uuid4(), uuid5(namespace, name) -- and each member is O(1) per row; an arbitrary expression is the GENERATED ALWAYS row of QL_CONTRACT §2"
+                "DEFAULT {other}: the DEFAULT set is closed -- a constant literal, now(), ulid(), uuid4(), uuid5(namespace, name) -- and each member is O(1) per row; an arbitrary expression is the GENERATED ALWAYS row of QL_CONTRACT §2"
             ))),
         }
     }

@@ -740,6 +740,8 @@ pub fn default_spelling(value: &DefaultValue) -> String {
         DefaultValue::Now => "now()".into(),
         DefaultValue::Uuid4 => "uuid4()".into(),
         DefaultValue::Ulid => "ulid()".into(),
+        DefaultValue::Constant(serde_json::Value::String(text)) => format!("'{}'", text.replace('\'', "''")),
+        DefaultValue::Constant(other) => other.to_string(),
         DefaultValue::Uuid5 { namespace, name } => {
             let hex: String = namespace.iter().map(|b| format!("{b:02x}")).collect();
             format!(

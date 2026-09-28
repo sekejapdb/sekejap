@@ -562,3 +562,93 @@ fn a_column_rules_file_is_unsupported_to_a_binary_that_predates_the_bit() {
         "an intact newer file must be Unsupported and name its feature word: {refused:?}"
     );
 }
+
+/// A CONSTANT default (`DEFAULT 'member'`, `DEFAULT 0`, `DEFAULT true`) is a
+/// value stored in the descriptor and copied into a row that leaves the
+/// field out. It rides its own additive bit, set only when a constant is
+/// first recorded, so a file without one is unchanged and an older binary
+/// refuses a file with one at admission rather than calling it corrupt.
+#[test]
+fn a_constant_default_is_stored_applied_and_behind_its_own_bit() {
+    use sekejap_core::collections::CONSTANT_DEFAULT_FEATURE;
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("db");
+    {
+        let mut db = Database::create(&path, cfg()).unwrap();
+        db.create_collection_rules(
+            "generated",
+            vec![("id".into(), Kind::Text)],
+            Vec::new(),
+            vec![("id".into(), rule(Some(DefaultValue::Uuid4), false))],
+            Default::default(),
+        )
+        .unwrap();
+        db.commit().unwrap();
+        assert_eq!(logical_features(&db) & CONSTANT_DEFAULT_FEATURE, 0, "a generator is not a constant");
+        let c = db
+            .create_collection_rules(
+                "member",
+                vec![
+                    ("role".into(), Kind::Text),
+                    ("points".into(), Kind::Int),
+                    ("ratio".into(), Kind::Real),
+                    ("active".into(), Kind::Bool),
+                    ("meta".into(), Kind::Json),
+                ],
+                Vec::new(),
+                vec![
+                    ("role".into(), rule(Some(DefaultValue::Constant(json!("member"))), true)),
+                    ("points".into(), rule(Some(DefaultValue::Constant(json!(0))), false)),
+                    ("ratio".into(), rule(Some(DefaultValue::Constant(json!(1.5))), false)),
+                    ("active".into(), rule(Some(DefaultValue::Constant(json!(true))), false)),
+                    ("meta".into(), rule(Some(DefaultValue::Constant(json!({"tier": [1, 2]}))), false)),
+                ],
+                Default::default(),
+            )
+            .unwrap();
+        db.insert(c, "m1", &json!({})).unwrap();
+        db.insert(c, "m2", &json!({"role": "admin", "points": 7})).unwrap();
+        db.commit().unwrap();
+        assert_eq!(logical_features(&db) & CONSTANT_DEFAULT_FEATURE, CONSTANT_DEFAULT_FEATURE);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES & CONSTANT_DEFAULT_FEATURE, CONSTANT_DEFAULT_FEATURE);
+        let older = SUPPORTED_LOGICAL_FEATURES & !CONSTANT_DEFAULT_FEATURE;
+        assert!(
+            admit_logical_features(logical_features(&db), older).is_err(),
+            "a binary without the bit refuses the file"
+        );
+    }
+    let db = Database::open(&path, cfg()).unwrap();
+    let c = db.collection("member").unwrap().unwrap();
+    let doc = |key: &str| -> Value { db.get(c, key).unwrap().unwrap().document };
+    let m1 = doc("m1");
+    assert_eq!(m1["role"], json!("member"));
+    assert_eq!(m1["points"], json!(0));
+    assert_eq!(m1["ratio"], json!(1.5));
+    assert_eq!(m1["active"], json!(true));
+    assert_eq!(m1["meta"], json!({"tier": [1, 2]}));
+    let m2 = doc("m2");
+    assert_eq!((m2["role"].clone(), m2["points"].clone()), (json!("admin"), json!(7)), "a written value wins");
+}
+
+/// A constant must be a value its field's kind stores.
+#[test]
+fn a_constant_default_of_the_wrong_kind_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let mut db = Database::create(t.path().join("db"), cfg()).unwrap();
+    for (kind, value) in [
+        (Kind::Int, json!("x")),
+        (Kind::Int, json!(1.5)),
+        (Kind::Text, json!(3)),
+        (Kind::Bool, json!(1)),
+        (Kind::Real, json!("x")),
+    ] {
+        let refused = db.create_collection_rules(
+            "bad",
+            vec![("f".into(), kind.clone())],
+            Vec::new(),
+            vec![("f".into(), rule(Some(DefaultValue::Constant(value.clone())), false))],
+            Default::default(),
+        );
+        assert!(refused.is_err(), "{kind:?} DEFAULT {value}");
+    }
+}

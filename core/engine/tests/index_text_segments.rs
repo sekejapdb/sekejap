@@ -370,12 +370,13 @@ fn the_packed_tier_is_admitted_only_behind_its_own_feature_bit() {
     // quantized, segments, per-index tree, geometry, drop, expression,
     // declared spellings, column rules, live row counts, graph endpoint sets
     // and the VAMANA GRAPH: `SUPPORTED_LOGICAL_FEATURES`), so the unknown-bit
-    // probe is 0x200000 -- it moves with that mask, as it moved to 0x8000 when
+    // probe is 0x400000 -- it moves with that mask, as it moved to 0x8000 when
     // the column rules landed, to 0x10000 when the vamana graph took 0x8000
     // for itself, to 0x40000 when named schemas took 0x20000, to 0x80000
     // when edge identity took 0x40000, to 0x100000 when edge tables took
-    // 0x80000, and to 0x200000 when key declarations took 0x100000.
-    set_features(&older, 0x2051 | 0x200000);
+    // 0x80000, to 0x200000 when key declarations took 0x100000, and to
+    // 0x400000 when constant defaults took 0x200000.
+    set_features(&older, 0x2051 | 0x400000);
     let before = files(&older);
     assert!(matches!(
         Database::open(&older, cfg()),

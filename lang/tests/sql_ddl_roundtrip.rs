@@ -47,6 +47,7 @@ const TABLES: &[&str] = &[
     "CREATE TABLE tags (id TEXT PRIMARY KEY DEFAULT uuid4(), label TEXT)",
     "CREATE TABLE people (id TEXT PRIMARY KEY, name TEXT)",
     "CREATE TABLE slugs (_key TEXT PRIMARY KEY, fixed TEXT DEFAULT uuid5('6ba7b810-9dad-11d1-80b4-00c04fd430c8', 'site-a'))",
+    "CREATE TABLE prefs (_key TEXT PRIMARY KEY, role TEXT DEFAULT 'it''s' NOT NULL, active BOOLEAN DEFAULT false, points INT DEFAULT -3, ratio DOUBLE PRECISION DEFAULT 2.5, joined DATE DEFAULT '2020-01-02')",
 ];
 
 #[test]
@@ -73,7 +74,7 @@ fn show_create_table_replays_to_the_same_table() {
     // Replay every print on a fresh database: the same print comes back.
     let copy_dir = TempDir::new().unwrap();
     let mut copy = Database::create(copy_dir.path().join("b.sekejap"), cfg()).unwrap();
-    for table in ["members", "tags", "people", "slugs"] {
+    for table in ["members", "tags", "people", "slugs", "prefs"] {
         let ddl = show(&mut source, table);
         for statement in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             run(&mut copy, statement);
@@ -85,9 +86,24 @@ fn show_create_table_replays_to_the_same_table() {
     run(&mut copy, "INSERT INTO members (email) VALUES ('ayu@example.com')");
     run(&mut copy, "INSERT INTO tags (label) VALUES ('red')");
     run(&mut copy, "INSERT INTO people (id, name) VALUES ('p1', 'Ayu')");
+    run(&mut copy, "INSERT INTO prefs (_key) VALUES ('x1')");
     run(&mut copy, "COMMIT");
     match run(&mut copy, "SELECT name FROM people WHERE _key = 'p1'") {
         SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("{other:?}"),
+    }
+    match run(&mut copy, "SELECT role, active, points, ratio, joined FROM prefs WHERE _key = 'x1'") {
+        SqlResult::Rows { rows, .. } => assert_eq!(
+            rows[0].values,
+            [
+                SqlValue::Text("it's".into()),
+                SqlValue::Bool(false),
+                SqlValue::Int(-3),
+                SqlValue::Float(2.5),
+                SqlValue::Text("2020-01-02".into()),
+            ],
+            "the constants survive the copy"
+        ),
         other => panic!("{other:?}"),
     }
 }

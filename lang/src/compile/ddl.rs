@@ -164,6 +164,19 @@ impl Compiler<'_> {
                     rule.default.as_ref().is_some_and(|d| !matches!(d, DefaultValue::Now))
                 })
         };
+        // A constant on the key would give every row the same key.
+        if let Some(column) = columns.iter().find(|column| {
+            column.primary_key
+                && column
+                    .rule
+                    .as_ref()
+                    .is_some_and(|rule| matches!(rule.default, Some(DefaultValue::Constant(_))))
+        }) {
+            return Err(SqlError::unsupported(format!(
+                "PRIMARY KEY `{}` with a constant DEFAULT: every row would take the same key; use ulid(), uuid4() or uuid5()",
+                column.name
+            )));
+        }
         let builtin_key = columns.iter().any(names_builtin_key);
         let key_default = columns
             .iter()
@@ -202,8 +215,9 @@ impl Compiler<'_> {
             // print an instant back as ISO text.
             declared.push((column.name.clone(), column.declared.clone()));
             if let Some(rule) = &column.rule {
-                self.note_rule(&column.name, &column.declared, rule);
-                rules.push((column.name.clone(), rule.clone()));
+                let rule = self.typed_rule(column, rule)?;
+                self.note_rule(&column.name, &column.declared, &rule);
+                rules.push((column.name.clone(), rule));
             }
             fields.push((column.name.clone(), column.kind.clone()));
         }
@@ -502,6 +516,36 @@ impl Compiler<'_> {
     }
 
     /// What a COLUMN RULE costs and what it does not say, once per column.
+    /// A column rule with its constant DEFAULT read as the column's type, by
+    /// the same rules an INSERT's literal follows -- so a DEFAULT and an
+    /// INSERT can never disagree about what a literal means. A generator is
+    /// returned as it is.
+    fn typed_rule(&self, column: &ColumnDef, rule: &ColumnRule) -> SqlResult2<ColumnRule> {
+        let Some(DefaultValue::Constant(value)) = &rule.default else {
+            return Ok(rule.clone());
+        };
+        let literal = match value {
+            Value::String(text) => Literal::Str(text.clone()),
+            Value::Bool(b) => Literal::Bool(*b),
+            Value::Number(n) => Literal::Num(n.as_f64().unwrap_or(f64::NAN), n.is_i64()),
+            other => {
+                return Err(SqlError::unsupported(format!(
+                    "DEFAULT {other} on `{}`: a constant is a string, number or boolean literal",
+                    column.name
+                )))
+            }
+        };
+        let typed = if functions::is_time_type(&column.declared) {
+            self.time_document_value(&literal, &column.name, &column.declared)?
+        } else {
+            self.document_value(column.kind.clone(), &literal, &column.name)?
+        };
+        Ok(ColumnRule {
+            default: Some(DefaultValue::Constant(typed)),
+            not_null: rule.not_null,
+        })
+    }
+
     fn note_rule(&mut self, column: &str, declared: &str, rule: &ColumnRule) {
         match &rule.default {
             None => {}
@@ -524,6 +568,7 @@ impl Compiler<'_> {
             Some(DefaultValue::Uuid5 { .. }) => self.notices.push(format!(
                 "DEFAULT uuid5(...) on `{column}`: RFC 4122 version 5 over a FIXED namespace and name, so every row that takes the default takes the SAME uuid -- it is deterministic, not unique"
             )),
+            Some(DefaultValue::Constant(_)) => {}
         }
         if rule.not_null {
             self.notices.push(format!(
@@ -603,8 +648,20 @@ impl Compiler<'_> {
                             reason: "QL_CONTRACT §2: every existing row would read MISSING for the new column, so the constraint is false the moment it is recorded. Add the column with a DEFAULT, or add it nullable and fill it.",
                         });
                     }
-                    self.note_rule(&column.name, &column.declared, rule);
-                    rules.push((column.name.clone(), rule.clone()));
+                    // PostgreSQL shows a constant default on the rows already
+                    // there; here they would read MISSING, which is not the
+                    // same answer, so it is refused while rows exist.
+                    if matches!(rule.default, Some(DefaultValue::Constant(_)))
+                        && self.any_row(collection)?
+                    {
+                        return Err(SqlError::unsupported(format!(
+                            "ADD COLUMN {} ... DEFAULT <constant> on a table with rows: PostgreSQL shows the DEFAULT on every existing row, and here they would read MISSING. Add the column without the DEFAULT and fill it with UPDATE, or add it before the table has rows",
+                            column.name
+                        )));
+                    }
+                    let rule = self.typed_rule(column, rule)?;
+                    self.note_rule(&column.name, &column.declared, &rule);
+                    rules.push((column.name.clone(), rule));
                 }
                 declared.push((column.name.clone(), column.declared.clone()));
                 fields.push((column.name.clone(), column.kind.clone()));

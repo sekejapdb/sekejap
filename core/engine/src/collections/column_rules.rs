@@ -21,13 +21,17 @@ use super::{invalid, Catalog, Database, Error, Result};
 use crate::Kind;
 use serde_json::Value;
 
-/// The generator a `DEFAULT` names. The set is CLOSED: each member is O(1)
-/// per row -- one clock read, sixteen random bytes, one hash over a fixed
-/// namespace and name -- which is what makes the slot a write-path atomic
-/// rather than an expression evaluator. An arbitrary expression is Tier 3
-/// (QL_CONTRACT §2).
+/// What a `DEFAULT` fills in. The set is CLOSED: each member is O(1) per
+/// row -- one clock read, sixteen random bytes, one hash over a fixed
+/// namespace and name, one stored value copied -- which is what makes the
+/// slot a write-path atomic rather than an expression evaluator. An
+/// arbitrary expression is Tier 3 (QL_CONTRACT §2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DefaultValue {
+    /// A CONSTANT (`DEFAULT 'member'`, `DEFAULT 0`, `DEFAULT true`): a value
+    /// of the field's own kind, stored in the descriptor and copied into a
+    /// row that leaves the field out. Behind [`CONSTANT_DEFAULT_FEATURE`].
+    Constant(Value),
     /// `now()`: UTC microseconds since 1970-01-01, the encoding every
     /// declared TIMESTAMPTZ/DATE column uses (QL_CONTRACT §5 deviation 8).
     /// Read ONCE per row, so two `now()` columns of one row agree.
@@ -91,12 +95,97 @@ pub(crate) const CATALOG_RULES: u8 = 8;
 /// `Unsupported` at admission, before a record is read at all.
 pub const COLUMN_RULES_FEATURE: u64 = 0x1000;
 
+/// The collection-header bit that says a column rule carries a CONSTANT
+/// default ([`DefaultValue::Constant`]).
+///
+/// Its own bit, not `COLUMN_RULES_FEATURE`, because a binary that knows the
+/// rules tail but not the constant generator would read the new generator
+/// byte as damage: it must refuse the file as `Unsupported` at admission
+/// instead (Law 8). Set in the same transaction as the first constant, never
+/// cleared; a file with no constant default never carries it.
+pub const CONSTANT_DEFAULT_FEATURE: u64 = 0x200000;
+
+/// True when any rule's default is a constant.
+pub(super) fn has_constant(rules: &[(String, ColumnRule)]) -> bool {
+    rules
+        .iter()
+        .any(|(_, rule)| matches!(rule.default, Some(DefaultValue::Constant(_))))
+}
+
 // ── the descriptor tail ───────────────────────────────────────────────────
 
 const DEFAULT_NOW: u8 = 1;
 const DEFAULT_UUID4: u8 = 2;
 const DEFAULT_UUID5: u8 = 3;
 const DEFAULT_ULID: u8 = 4;
+const DEFAULT_CONSTANT: u8 = 5;
+// A constant's value: one tag byte, then its bytes.
+const CONSTANT_FALSE: u8 = 1;
+const CONSTANT_TRUE: u8 = 2;
+const CONSTANT_INT: u8 = 3;
+const CONSTANT_REAL: u8 = 4;
+const CONSTANT_TEXT: u8 = 5;
+const CONSTANT_JSON: u8 = 6;
+/// The longest constant a descriptor holds, in bytes.
+const CONSTANT_MAX: usize = 4096;
+
+fn encode_constant(out: &mut Vec<u8>, value: &Value) -> Result<()> {
+    let bytes = |out: &mut Vec<u8>, tag: u8, body: &[u8]| -> Result<()> {
+        if body.len() > CONSTANT_MAX {
+            return Err(invalid(format!("a constant DEFAULT is at most {CONSTANT_MAX} bytes")));
+        }
+        out.push(tag);
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(body);
+        Ok(())
+    };
+    match value {
+        Value::Bool(false) => out.push(CONSTANT_FALSE),
+        Value::Bool(true) => out.push(CONSTANT_TRUE),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => {
+                out.push(CONSTANT_INT);
+                out.extend_from_slice(&i.to_be_bytes());
+            }
+            None => {
+                let f = n.as_f64().ok_or_else(|| invalid("a constant DEFAULT number"))?;
+                out.push(CONSTANT_REAL);
+                out.extend_from_slice(&f.to_bits().to_be_bytes());
+            }
+        },
+        Value::String(text) => bytes(out, CONSTANT_TEXT, text.as_bytes())?,
+        Value::Array(_) | Value::Object(_) => {
+            bytes(out, CONSTANT_JSON, value.to_string().as_bytes())?
+        }
+        Value::Null => return Err(invalid("DEFAULT NULL is no default, not a constant")),
+    }
+    Ok(())
+}
+
+fn decode_constant(mut read: impl FnMut(usize) -> Result<Vec<u8>>) -> Result<Value> {
+    let eight = |read: &mut dyn FnMut(usize) -> Result<Vec<u8>>| -> Result<[u8; 8]> {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&read(8)?);
+        Ok(b)
+    };
+    let body = |read: &mut dyn FnMut(usize) -> Result<Vec<u8>>| -> Result<String> {
+        let len = read(2)?;
+        let n = u16::from_be_bytes([len[0], len[1]]) as usize;
+        if n > CONSTANT_MAX {
+            return Err(super::corrupt("catalog constant default length"));
+        }
+        String::from_utf8(read(n)?).map_err(super::corrupt)
+    };
+    Ok(match read(1)?[0] {
+        CONSTANT_FALSE => Value::Bool(false),
+        CONSTANT_TRUE => Value::Bool(true),
+        CONSTANT_INT => Value::from(i64::from_be_bytes(eight(&mut read)?)),
+        CONSTANT_REAL => Value::from(f64::from_bits(u64::from_be_bytes(eight(&mut read)?))),
+        CONSTANT_TEXT => Value::String(body(&mut read)?),
+        CONSTANT_JSON => serde_json::from_str(&body(&mut read)?).map_err(super::corrupt)?,
+        _ => return Err(super::corrupt("catalog constant default")),
+    })
+}
 const RULE_NOT_NULL: u8 = 1;
 const RULE_HAS_DEFAULT: u8 = 2;
 
@@ -134,6 +223,10 @@ pub(super) fn encode_rule(out: &mut Vec<u8>, field: &str, rule: &ColumnRule) -> 
             out.push(name.len() as u8);
             out.extend_from_slice(name.as_bytes());
         }
+        Some(DefaultValue::Constant(value)) => {
+            out.push(DEFAULT_CONSTANT);
+            encode_constant(out, value)?;
+        }
     }
     Ok(())
 }
@@ -155,6 +248,7 @@ pub(super) fn decode_rule(
             DEFAULT_NOW => DefaultValue::Now,
             DEFAULT_UUID4 => DefaultValue::Uuid4,
             DEFAULT_ULID => DefaultValue::Ulid,
+            DEFAULT_CONSTANT => DefaultValue::Constant(decode_constant(&mut read)?),
             DEFAULT_UUID5 => {
                 let mut namespace = [0u8; 16];
                 namespace.copy_from_slice(&read(16)?);
@@ -205,6 +299,21 @@ pub(super) fn check_rules(
                     "DEFAULT uuid4()/uuid5() on `{field}`: a UUID is written as text, and `{field}` is {other:?}"
                 )))
             }
+            (Some(DefaultValue::Constant(value)), kind) => {
+                let fits = match (kind, value) {
+                    (Kind::Text, Value::String(_)) => true,
+                    (Kind::Int, Value::Number(n)) => n.is_i64(),
+                    (Kind::Real, Value::Number(_)) => true,
+                    (Kind::Bool, Value::Bool(_)) => true,
+                    (Kind::Json, value) => !value.is_null(),
+                    _ => false,
+                };
+                if !fits {
+                    return Err(invalid(format!(
+                        "DEFAULT {value} on `{field}`: a constant must be a value `{field}` stores, and `{field}` is {kind:?}"
+                    )));
+                }
+            }
         }
         if rules.iter().filter(|(n, _)| n == field).count() != 1 {
             return Err(invalid(format!("`{field}` carries two column rules")));
@@ -243,6 +352,7 @@ impl Database {
                 DefaultValue::Uuid5 { namespace, name } => {
                     Value::from(uuid5(namespace, name.as_bytes()))
                 }
+                DefaultValue::Constant(value) => value.clone(),
             };
             doc[field.as_str()] = value;
         }
@@ -292,6 +402,9 @@ pub(super) fn mint(default: &DefaultValue, now_micros: i64) -> Result<String> {
         DefaultValue::Ulid => ulid(now_micros),
         DefaultValue::Uuid5 { namespace, name } => Ok(uuid5(namespace, name.as_bytes())),
         DefaultValue::Now => Err(invalid("DEFAULT now() cannot mint a key")),
+        DefaultValue::Constant(_) => Err(invalid(
+            "a constant DEFAULT cannot mint a key: every row would take the same one",
+        )),
     }
 }
 
