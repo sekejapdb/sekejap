@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.18.4
+
+A fix to the full-text index.
+
+- **Fixed: a search could report the database corrupt after an update and a
+  delete.** On a text index built over rows that already existed, updating a
+  row while keeping a word and then deleting the row -- or removing a word,
+  adding it back and removing it again -- made every later search on that word
+  fail with "text posting count exceeds term statistics". The rows were never
+  damaged; the index had resurrected an entry it should have hidden. 0.18.4
+  writes the index correctly from now on. A database already affected is
+  repaired by rebuilding the index: `DROP INDEX` and `CREATE INDEX` again.
+
 ## 0.18.3
 
 ORDER BY as PostgreSQL has it, and "load more" in plain SQL.
