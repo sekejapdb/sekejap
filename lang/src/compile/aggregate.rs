@@ -381,6 +381,11 @@ impl Compiler<'_> {
         }
 
         // ORDER BY: the group key, or one accumulator by its alias.
+        if !statement.then_by.is_empty() {
+            return Err(SqlError::unsupported(
+                "ORDER BY with several keys over GROUP BY or an aggregate: the groups are ordered by one key -- the group key or one accumulator",
+            ));
+        }
         let order = match &statement.order {
             None => GroupOrder::Key,
             Some(OrderKey::Column { column, descending }) => {

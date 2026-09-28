@@ -15,7 +15,7 @@ name = "sekejap_lang"
 path = "src/lib.rs"
 
 [dependencies]
-sekejap-core = { path = "../core/engine", version = "0.18.2" }
+sekejap-core = { path = "../core/engine", version = "0.18.3" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 # pgcrypto-compatible functions (`lang/src/pgcrypto.rs`): the RustCrypto
 # hashes and HMAC, and bcrypt for `crypt(..., '$2a$...')`.
@@ -26,7 +26,7 @@ hmac = "0.12"
 bcrypt = { version = "0.15", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-kernel = { package = "sekejap-kernel", path = "../core/kernel", version = "0.18.2", features = ["test-support"] }
+kernel = { package = "sekejap-kernel", path = "../core/kernel", version = "0.18.3", features = ["test-support"] }
 tempfile = "3"
 
 [features]

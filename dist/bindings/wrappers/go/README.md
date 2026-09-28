@@ -132,10 +132,10 @@ from 0.16 (`github.com/sekejapdb/sekejap/dist/bindings/wrappers/go`), so per Go'
 subdirectory-module convention its tag stays prefixed the same way:
 
 ```
-dist/bindings/wrappers/go/v0.18.2      ← the tag Go reads for this module
+dist/bindings/wrappers/go/v0.18.3      ← the tag Go reads for this module
 ```
 
-not a bare `v0.18.2` (that versions the repo root, which isn't a Go module).
+not a bare `v0.18.3` (that versions the repo root, which isn't a Go module).
 There is no CI release job to publish this module — Go has none to gate: a
 consumer resolves any commit through its tag, and
 [pkg.go.dev](https://pkg.go.dev/github.com/sekejapdb/sekejap/dist/bindings/wrappers/go)

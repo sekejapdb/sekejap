@@ -84,36 +84,103 @@ impl<'a> DriverCursor<'a> {
                 position,
             } => {
                 let prefix = scalar_prefix(info.id);
-                let walk = if descending {
-                    match scalar_reverse_start(info, &prefix, predicate) {
-                        None => ScalarWalk::Nothing,
-                        Some(mut start) => {
-                            if let Some(key) =
-                                resume.and_then(|after| resume_scalar_reverse_key(info, after))
-                            {
-                                start = key;
-                            }
-                            match db.index_range_reverse(info, &start).map_err(QueryError::from)? {
-                                Some(iter) => ScalarWalk::Reverse(iter),
-                                None => ScalarWalk::Nothing,
-                            }
-                        }
-                    }
-                } else if matches!(predicate, EncodedScalarFilter::Empty) {
-                    ScalarWalk::Nothing
-                } else {
+                // Where the walk opens, as it always has: a descending walk
+                // from one past the range's top (or the resumed tie group), an
+                // ascending one at the range's bottom (or the resumed entry).
+                let reverse_start = |resume: Option<&RankKey>| {
+                    scalar_reverse_start(info, &prefix, predicate).map(|start| {
+                        resume
+                            .and_then(|after| resume_scalar_reverse_key(info, after))
+                            .unwrap_or(start)
+                    })
+                };
+                let forward_start = |resume: Option<&RankKey>, floor: &[u8]| {
                     let mut start = prefix.clone();
-                    if let Some(lower) = scalar_lower(predicate) {
-                        start.extend_from_slice(lower);
+                    match scalar_lower(predicate) {
+                        Some(lower) if lower > floor => start.extend_from_slice(lower),
+                        _ => start.extend_from_slice(floor),
                     }
-                    if let Some(key) = resume.and_then(|after| resume_scalar_key(info, predicate, after))
-                    {
-                        start = key;
+                    resume
+                        .and_then(|after| resume_scalar_key(info, predicate, after))
+                        .unwrap_or(start)
+                };
+                let empty = matches!(predicate, EncodedScalarFilter::Empty);
+                // Under a SQL ORDER BY over this index, NULL rows go where
+                // PostgreSQL sorts them: after the values ascending, before
+                // them descending. The index keeps them first (the nullish key
+                // is its smallest), so the walk takes two phases.
+                let nulls_admitted = !empty
+                    && scalar_key_position(predicate, NULLISH_SCALAR_KEY) == Ordering::Equal;
+                let null_start = |resume: Option<&RankKey>| match resume {
+                    // A several-key order re-walks the NULL group from its
+                    // start: its rows are ranked by the later keys, not by id.
+                    Some(after) => crate::collections::catalog::skey(
+                        info,
+                        NULLISH_SCALAR_KEY,
+                        if matches!(after.value, RankValue::Keys(_)) {
+                            0
+                        } else {
+                            after.id.sequence
+                        },
+                    ),
+                    None => {
+                        let mut start = prefix.clone();
+                        start.extend_from_slice(NULLISH_SCALAR_KEY);
+                        start
                     }
-                    match db.index_range(info, &start).map_err(QueryError::from)? {
-                        Some(iter) => ScalarWalk::Forward(iter),
-                        None => ScalarWalk::Nothing,
-                    }
+                };
+                let resumed_null = resume.map(|after| match &after.value {
+                    RankValue::Sorted(v) => v.as_slice() == NULLISH_SCALAR_KEY,
+                    RankValue::Keys(cells) => cells.first().is_some_and(|cell| cell.value.is_none()),
+                    _ => false,
+                });
+                // (first walk: start, reverse, region; then the pending one)
+                let (first, then): (Option<(Vec<u8>, bool, ScalarRegion)>, Option<PendingWalk>) =
+                    if empty {
+                        (None, None)
+                    } else if !needs.null_order {
+                        (
+                            if descending {
+                                reverse_start(resume).map(|s| (s, true, ScalarRegion::All))
+                            } else {
+                                Some((forward_start(resume, &[]), false, ScalarRegion::All))
+                            },
+                            None,
+                        )
+                    } else if !descending {
+                        // Values ascending, then the NULL rows.
+                        let nulls = PendingWalk {
+                            start: null_start(None),
+                            reverse: false,
+                            region: ScalarRegion::Nulls,
+                        };
+                        match resumed_null {
+                            Some(true) => (Some((null_start(resume), false, ScalarRegion::Nulls)), None),
+                            _ => (
+                                Some((forward_start(resume, &[1]), false, ScalarRegion::Values)),
+                                nulls_admitted.then_some(nulls),
+                            ),
+                        }
+                    } else {
+                        // The NULL rows (id ascending, as every tie), then the
+                        // values descending.
+                        let values = reverse_start(None).map(|start| PendingWalk {
+                            start,
+                            reverse: true,
+                            region: ScalarRegion::Values,
+                        });
+                        match resumed_null {
+                            Some(false) => (reverse_start(resume).map(|s| (s, true, ScalarRegion::Values)), None),
+                            Some(true) => (Some((null_start(resume), false, ScalarRegion::Nulls)), values),
+                            None if nulls_admitted => {
+                                (Some((null_start(None), false, ScalarRegion::Nulls)), values)
+                            }
+                            None => (reverse_start(None).map(|s| (s, true, ScalarRegion::Values)), None),
+                        }
+                    };
+                let (walk, region) = match first {
+                    None => (ScalarWalk::Nothing, ScalarRegion::All),
+                    Some((start, reverse, region)) => (open_scalar_walk(db, info, &start, reverse)?, region),
                 };
                 // A posting key IS the predicate's proof: the walk yields an
                 // entry only when `scalar_key_position` puts its value inside
@@ -133,6 +200,9 @@ impl<'a> DriverCursor<'a> {
                 };
                 Ok(Self::Scalar(ScalarCursor {
                     walk,
+                    region,
+                    then,
+                    db,
                     prefix,
                     info: info.clone(),
                     predicate: predicate.clone(),
@@ -599,7 +669,38 @@ impl EntityCursor<'_> {
     }
 }
 
+/// Open one scalar walk at `start`, ascending or descending.
+fn open_scalar_walk<'a>(
+    db: &'a Database,
+    info: &IndexInfo,
+    start: &[u8],
+    reverse: bool,
+) -> QueryResult<ScalarWalk<'a>> {
+    Ok(if reverse {
+        match db.index_range_reverse(info, start).map_err(QueryError::from)? {
+            Some(iter) => ScalarWalk::Reverse(iter),
+            None => ScalarWalk::Nothing,
+        }
+    } else {
+        match db.index_range(info, start).map_err(QueryError::from)? {
+            Some(iter) => ScalarWalk::Forward(iter),
+            None => ScalarWalk::Nothing,
+        }
+    })
+}
+
 impl ScalarCursor<'_> {
+    /// The current walk has ended: open the pending one, or finish.
+    fn next_phase(&mut self) -> QueryResult<bool> {
+        let Some(pending) = self.then.take() else {
+            self.done = true;
+            return Ok(false);
+        };
+        self.walk = open_scalar_walk(self.db, &self.info, &pending.start, pending.reverse)?;
+        self.region = pending.region;
+        Ok(true)
+    }
+
     pub(super) fn next<C: FnMut() -> bool>(
         &mut self,
         meter: &mut WorkMeter<'_, C>,
@@ -607,15 +708,16 @@ impl ScalarCursor<'_> {
         if self.done {
             return Ok(None);
         }
-        // Which side of the predicate the walk has NOT reached yet, and which
-        // side means it is finished. An ascending walk approaches from below;
-        // a descending one approaches from above.
-        let past = if self.walk.descending() {
-            Ordering::Less
-        } else {
-            Ordering::Greater
-        };
         loop {
+            // Which side of the predicate the walk has NOT reached yet, and
+            // which side means it is finished. An ascending walk approaches
+            // from below; a descending one approaches from above. Asked per
+            // step, because the next phase may walk the other way.
+            let past = if self.walk.descending() {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
             meter.charge(WorkResource::ScalarPostings, 1)?;
             // Same pull-cursor shape as the entity walk: peek into the pinned
             // leaf, decide, then step. The key and the (always empty) value of
@@ -627,23 +729,46 @@ impl ScalarCursor<'_> {
                     .map_err(Error::from)
                     .map_err(QueryError::from)?
                 else {
-                    self.done = true;
+                    if self.next_phase()? {
+                        continue;
+                    }
                     return Ok(None);
                 };
-                if !key.starts_with(&self.prefix) {
-                    self.done = true;
+                let suffix = key.strip_prefix(self.prefix.as_slice());
+                let encoded = match suffix {
+                    Some(suffix) => {
+                        let value_len = scalar_key::width(&self.info.kind, suffix)?;
+                        Some((
+                            suffix,
+                            suffix
+                                .get(..value_len)
+                                .ok_or_else(|| corrupt_query("truncated scalar value key"))?,
+                        ))
+                    }
+                    None => None,
+                };
+                // The phase ends outside the index, past the predicate, or at
+                // the edge of its region (the nullish key).
+                let ended = match encoded {
+                    None => true,
+                    Some((_, encoded)) => {
+                        scalar_key_position(&self.predicate, encoded) == past
+                            || match self.region {
+                                ScalarRegion::All => false,
+                                ScalarRegion::Values => encoded == NULLISH_SCALAR_KEY,
+                                ScalarRegion::Nulls => encoded != NULLISH_SCALAR_KEY,
+                            }
+                    }
+                };
+                if ended {
+                    if self.next_phase()? {
+                        continue;
+                    }
                     return Ok(None);
                 }
-                let suffix = &key[self.prefix.len()..];
-                let value_len = scalar_key::width(&self.info.kind, suffix)?;
-                let encoded = suffix
-                    .get(..value_len)
-                    .ok_or_else(|| corrupt_query("truncated scalar value key"))?;
+                let (_, encoded) = encoded.expect("an ended walk returned above");
+                let value_len = encoded.len();
                 let position = scalar_key_position(&self.predicate, encoded);
-                if position == past {
-                    self.done = true;
-                    return Ok(None);
-                }
                 match position {
                     Ordering::Equal => {
                         let mut at = self.prefix.len() + value_len;

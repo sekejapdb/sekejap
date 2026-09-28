@@ -21,11 +21,12 @@ use sekejap_core::collections::{
     Accumulator, AggValue, AggregateFn, AggregateInput, AggregateRequest,
     CandidateDriver, CollectionId, CollectionOptions, Database, Direction, DropMode,
     DropPhase, EntityId, Geom, GeometryFilter, GraphContextId,
-    ColumnRule, DefaultValue, GroupCmp, GroupKey, GroupOrder, GroupPredicate, GroupRow, IndexExpr,
+    Cmp, ColumnRule, DefaultValue, GroupCmp, GroupKey, GroupOrder, GroupPredicate, GroupRow, IndexExpr,
     IndexFamily, IndexId,
     IndexInfo, IndexState, OwnedScalarValue, PointFilter, ProjectedValue, Projection, QueryBudget,
     QueryFilter, QueryOrder, QueryRequest, QueryRow, ScalarFilter, ScalarValue, ScoreExpr,
-    SortDirection, TextMatch, UpdatePatch, VectorMetric, WriteAction, WriteCursor, WriteRequest,
+    SortDirection, SortKey, SortValue, TextMatch, UpdatePatch, VectorMetric, WriteAction,
+    WriteCursor, WriteRequest,
 };
 use sekejap_core::spatial_io;
 use sekejap_core::spatial_math::{Bounds, Point};

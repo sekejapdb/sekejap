@@ -360,19 +360,20 @@ impl Database {
             if !rule.not_null {
                 continue;
             }
-            match doc.get(field) {
-                None => {
-                    return Err(invalid(format!(
-                    "`{field}` is NOT NULL and this row does not carry it; a NOT NULL column refuses a MISSING field and a NULL one alike"
-                )))
-                }
-                Some(Value::Null) => {
-                    return Err(invalid(format!(
-                    "`{field}` is NOT NULL and this row writes NULL; a NOT NULL column refuses a MISSING field and a NULL one alike"
-                )))
-                }
-                Some(_) => {}
-            }
+            // PostgreSQL's 23502 (not_null_violation), in its words, so a
+            // client tells it apart from every other refusal.
+            let why = match doc.get(field) {
+                None => "the row does not carry it",
+                Some(Value::Null) => "the row writes NULL",
+                Some(_) => continue,
+            };
+            return Err(Error::Constraint {
+                sqlstate: "23502",
+                message: format!(
+                    "null value in column \"{field}\" of relation \"{}\" violates not-null constraint: {why}; a NOT NULL column refuses a MISSING field and a NULL one alike",
+                    c.name
+                ),
+            });
         }
         Ok(())
     }

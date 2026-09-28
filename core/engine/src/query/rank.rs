@@ -8,6 +8,12 @@ use super::*;
 pub(super) enum RankValue {
     Entity,
     Scalar(Vec<u8>),
+    /// A SQL `ORDER BY` value: the scalar key of the ordering index, where
+    /// the nullish key (NULL or MISSING) sorts AFTER every value -- so NULL
+    /// is last ascending and first descending, PostgreSQL's NULLS LAST /
+    /// NULLS FIRST defaults. `Scalar` keeps the index's own byte order, where
+    /// the nullish key is first, for the walks that follow the index.
+    Sorted(Vec<u8>),
     Score(u64),
     /// One spatial posting's Hilbert cell. Four bytes in the key, and the
     /// value they hold rather than the bytes: a spatial answer can be
@@ -26,6 +32,84 @@ pub(super) enum RankValue {
     /// It sorts after every score, NaN included, in either direction, as
     /// PostgreSQL sorts NULL after NaN; rows tied here keep id order.
     Missing,
+    /// A several-key order's values, compared left to right, each in its own
+    /// direction ([`QueryOrder::Keys`]).
+    Keys(Vec<SortCell>),
+}
+
+/// One key's value in a several-key rank. `None` is NULL (or MISSING), which
+/// sorts after every value -- last ascending, first descending, as in
+/// PostgreSQL -- and `descending` flips this key alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SortCell {
+    pub(super) value: Option<CellValue>,
+    pub(super) descending: bool,
+}
+
+/// A sort key's value in one comparable form, whatever it was read from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CellValue {
+    /// Bool, Int and Real as their fixed-width scalar keys; Text as its
+    /// UTF-8 bytes, which sort the same way and have no length limit.
+    Bytes(Vec<u8>),
+    Score(u64),
+}
+
+fn compare_cell(a: &SortCell, b: &SortCell) -> Ordering {
+    let order = match (&a.value, &b.value) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(CellValue::Bytes(x)), Some(CellValue::Bytes(y))) => x.cmp(y),
+        (Some(CellValue::Score(x)), Some(CellValue::Score(y))) => {
+            f64::from_bits(*x).total_cmp(&f64::from_bits(*y))
+        }
+        _ => unreachable!("one sort key ranks by one kind of value"),
+    };
+    if a.descending {
+        order.reverse()
+    } else {
+        order
+    }
+}
+
+/// The FIRST key of the rank value alone: what a walk that follows the first
+/// key is monotone in. Any other rank value is compared whole.
+pub(super) fn compare_leading(a: &RankValue, b: &RankValue, descending: bool) -> Ordering {
+    match (a, b) {
+        (RankValue::Keys(a), RankValue::Keys(b)) => match (a.first(), b.first()) {
+            (Some(a), Some(b)) => compare_cell(a, b),
+            _ => Ordering::Equal,
+        },
+        _ => compare_rank_value(a, b, descending),
+    }
+}
+
+/// A field's sort cell from its stored value.
+pub(super) fn field_cell(kind: &Kind, value: dense_v3::FieldValue) -> QueryResult<Option<CellValue>> {
+    Ok(match value {
+        dense_v3::FieldValue::Missing | dense_v3::FieldValue::Null => None,
+        dense_v3::FieldValue::Inline(Value::Null) => None,
+        dense_v3::FieldValue::Inline(Value::String(text)) if matches!(kind, Kind::Text) => {
+            Some(CellValue::Bytes(text.into_bytes()))
+        }
+        dense_v3::FieldValue::Inline(value) => Some(CellValue::Bytes(
+            scalar_key::encode(kind, Some(&value))
+                .map_err(|error| corrupt_query(format!("sort key value: {error}")))?,
+        )),
+        dense_v3::FieldValue::Vector { .. } => {
+            return Err(corrupt_query("a sort key field holds a vector"))
+        }
+    })
+}
+
+/// A field's sort cell from the scalar key an index posting carried.
+fn carried_cell(kind: &Kind, key: &[u8]) -> QueryResult<Option<CellValue>> {
+    if key == super::drivers::NULLISH_SCALAR_KEY {
+        return Ok(None);
+    }
+    let (value, _) = scalar_key::decode(kind, key)?;
+    field_cell(kind, dense_v3::FieldValue::Inline(value))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,6 +322,29 @@ pub(super) fn compare_rank(a: &RankKey, b: &RankKey, descending: bool) -> Orderi
 pub(super) fn compare_rank_value(a: &RankValue, b: &RankValue, descending: bool) -> Ordering {
     match (a, b) {
         (RankValue::Entity, RankValue::Entity) => Ordering::Equal,
+        (RankValue::Keys(a), RankValue::Keys(b)) => {
+            for (a, b) in a.iter().zip(b) {
+                let order = compare_cell(a, b);
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+            Ordering::Equal
+        }
+        (RankValue::Sorted(a), RankValue::Sorted(b)) => {
+            let null = |v: &[u8]| v == super::drivers::NULLISH_SCALAR_KEY;
+            let order = match (null(a), null(b)) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => a.cmp(b),
+            };
+            if descending {
+                order.reverse()
+            } else {
+                order
+            }
+        }
         (RankValue::Scalar(a), RankValue::Scalar(b)) => {
             if descending {
                 b.cmp(a)
@@ -737,7 +844,7 @@ pub(super) fn rank_candidate<'a, C: FnMut() -> bool>(
                         .ok_or_else(|| corrupt_query("missing scalar order key"))?
                 }
             };
-            RankValue::Scalar(key)
+            RankValue::Sorted(key)
         }
         CompiledOrder::ExactVector {
             info,
@@ -824,6 +931,38 @@ pub(super) fn rank_candidate<'a, C: FnMut() -> bool>(
             )?
             .to_bits(),
         ),
+        CompiledOrder::Keys(keys) => {
+            let mut cells = Vec::with_capacity(keys.len());
+            for key in keys {
+                let value = match &key.value {
+                    CompiledSortValue::Field { field, kind, index } => {
+                        match index.as_ref().and_then(|info| candidate.scalar(info.id)) {
+                            // The walk this candidate came from carried it.
+                            Some(carried) => carried_cell(kind, carried)?,
+                            None => {
+                                let fresh = row.is_none();
+                                ensure_row_seq(db, rows, candidate.id, row, encoded, meter)?;
+                                if fresh {
+                                    meter.note_row_decode();
+                                }
+                                field_cell(kind, selected_field(row.as_ref().unwrap(), field)?)?
+                            }
+                        }
+                    }
+                    CompiledSortValue::Score(expr) => {
+                        let score =
+                            eval_score_expr(db, rows, expr, candidate, row, encoded, scratch, meter)?;
+                        // `0 / 0` has no place in the order; it sorts as NULL.
+                        (!score.is_nan()).then(|| CellValue::Score(score.to_bits()))
+                    }
+                };
+                cells.push(SortCell {
+                    value,
+                    descending: key.descending,
+                });
+            }
+            RankValue::Keys(cells)
+        }
     };
     Ok(Some(RankKey {
         value,

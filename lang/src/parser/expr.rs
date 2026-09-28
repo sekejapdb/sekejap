@@ -53,6 +53,14 @@ impl Parser {
         if self.eat_word("NOT") {
             return Ok(Expr::Not(Box::new(self.boolean_unary()?)));
         }
+        // `(a, b) > ($1, $2)`: a row comparison, told apart from a WHERE
+        // group by the comma after the first name.
+        if matches!(self.peek(), Tok::LParen)
+            && matches!(self.peek_at(1), Tok::Word(_) | Tok::Quoted(_))
+            && matches!(self.peek_at(2), Tok::Comma)
+        {
+            return Ok(Expr::Leaf(self.row_comparison()?));
+        }
         if matches!(self.peek(), Tok::LParen) {
             self.bump();
             let inner = self.disjunction()?;
@@ -1420,6 +1428,35 @@ impl Parser {
             CmpOp::Gt => left > right,
             CmpOp::Ge => left >= right,
         })))
+    }
+
+    /// `(a, b, ...) <op> (x, y, ...)`, both lists the same length.
+    fn row_comparison(&mut self) -> SqlResult2<Predicate> {
+        let at = self.here();
+        self.expect(&Tok::LParen)?;
+        let mut columns = vec![self.name()?];
+        while self.eat(&Tok::Comma) {
+            columns.push(self.name()?);
+        }
+        self.expect(&Tok::RParen)?;
+        let op = self.comparison(&format!("({})", columns.join(", ")))?;
+        self.expect(&Tok::LParen)?;
+        let mut values = vec![self.literal()?];
+        while self.eat(&Tok::Comma) {
+            values.push(self.literal()?);
+        }
+        self.expect(&Tok::RParen)?;
+        if values.len() != columns.len() {
+            return Err(SqlError::syntax(
+                format!(
+                    "a row comparison compares {} column(s) with {} value(s); the two lists are the same length",
+                    columns.len(),
+                    values.len()
+                ),
+                at,
+            ));
+        }
+        Ok(Predicate::RowCompare { columns, op, values })
     }
 
     fn comparison(&mut self, what: &str) -> SqlResult2<CmpOp> {

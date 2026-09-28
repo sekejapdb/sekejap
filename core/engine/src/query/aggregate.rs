@@ -1451,7 +1451,12 @@ impl PreparedAggregate<'_> {
         let db = self.query.db;
         let collection = self.query.collection;
         let graph = execute_graph_filters(db, &self.query.filters, false, meter)?;
-        let needs = self.query.cursor_needs();
+        // A grouped walk follows the index's own byte order; the NULL
+        // placement of a SQL ORDER BY is not its concern.
+        let needs = CursorNeeds {
+            null_order: false,
+            ..self.query.cursor_needs()
+        };
         let mut cursor = DriverCursor::new(
             db,
             collection,
@@ -1993,7 +1998,12 @@ impl PreparedAggregate<'_> {
         let db = self.query.db;
         let collection = self.query.collection;
         let graph = execute_graph_filters(db, &self.query.filters, false, meter)?;
-        let needs = self.query.cursor_needs();
+        // A grouped walk follows the index's own byte order; the NULL
+        // placement of a SQL ORDER BY is not its concern.
+        let needs = CursorNeeds {
+            null_order: false,
+            ..self.query.cursor_needs()
+        };
         let resume = self.after.clone();
         let mut cursor = DriverCursor::new(
             db,

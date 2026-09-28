@@ -94,7 +94,9 @@ and rewrites nothing -- a statement goes to `SqlDatabase::sql` as written.
 **A `WHERE` needs an index on the column it filters.** A declared column with
 no index is refused, by name, rather than answered by reading every row: Law 6
 buys no silent scan. A filter on the key needs none -- the key is the tree's
-own order.
+own order. `LIKE` / `ILIKE`, a row comparison `(a, b) > (x, y)` and `ORDER BY`
+need none either: they are checked or ranked on each row the walk reaches, and
+`EXPLAIN` says so.
 
 A table declared through SQL usually has the index already. `CREATE TABLE`
 indexes every ordinary column as it creates it (`docs/lang/INDEX_CONTRACT.md`);

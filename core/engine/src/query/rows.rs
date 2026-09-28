@@ -555,6 +555,9 @@ pub(super) fn checked_output_size(row: &QueryRow) -> QueryResult<u64> {
         // row's key is its id, and a driver-ordered row's place is the
         // candidate stream's, not a value in the row.
         OrderValue::EntityId | OrderValue::Driver => 0,
+        // A several-key order reports nothing of its own: its keys are the
+        // row's fields, charged where they are projected.
+        OrderValue::Keys => 0,
     };
     if order_bytes != 0 {
         size = size

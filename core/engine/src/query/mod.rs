@@ -141,6 +141,18 @@ pub enum QueryFilter<'a> {
         insensitive: bool,
         negated: bool,
     },
+    /// SQL's row comparison `(a, b, ...) <op> (x, y, ...)`, PostgreSQL's
+    /// rules: pairs compared left to right, stopping at the first that
+    /// differs, and a NULL met there makes the comparison NULL (the row is
+    /// not returned); `=` needs every pair equal, `<>` any non-NULL pair
+    /// different. Fields are Bool, Int, Real or Text (`_key` too), compared
+    /// in the order a several-key `ORDER BY` uses. Answered from the row; the
+    /// caller adds the first column's own range when it has an index.
+    RowCompare {
+        fields: &'a [String],
+        values: &'a [Value],
+        op: crate::index::graph::Cmp,
+    },
     Graph(BfsRequest<'a>),
     Point {
         index: IndexId,
@@ -341,6 +353,32 @@ pub enum QueryOrder<'a> {
         expr: &'a ScoreExpr<'a>,
         direction: SortDirection,
     },
+    /// SQL's `ORDER BY k1 [DESC], k2 [DESC], ...`: the keys compared left to
+    /// right, then the entity id, so every row has one place. A key needs no
+    /// index -- it is read from the row when none holds it -- and NULL sorts
+    /// after every value ascending and before them descending, as in
+    /// PostgreSQL. When the first key is a field with a scalar index, or the
+    /// external key, the walk follows it and stops early.
+    Keys(&'a [SortKey<'a>]),
+}
+
+/// One key of [`QueryOrder::Keys`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SortKey<'a> {
+    pub value: SortValue<'a>,
+    pub direction: SortDirection,
+}
+
+/// What one [`SortKey`] ranks by.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SortValue<'a> {
+    /// A declared Bool, Int, Real or Text field, in its scalar-key order
+    /// (text in UTF-8 byte order).
+    Field(&'a str),
+    /// The row's external key.
+    Key,
+    /// A numeric expression, the Score atomic.
+    Score(&'a ScoreExpr<'a>),
 }
 
 /// Arithmetic score expression compiled by Phase-3 SQL `ORDER BY <expr>`.
@@ -355,6 +393,10 @@ pub enum ScoreExpr<'a> {
     /// `f64`; Bool is `0.0`/`1.0`; missing or null is `0.0`. Text scalars are
     /// refused at prepare.
     Scalar { index: IndexId },
+    /// A numeric field read from the row itself, for a field no scalar index
+    /// holds. The same coercion as `Scalar`: Bool is `0.0`/`1.0`, missing or
+    /// null is `0.0`.
+    Field { field: &'a str },
     /// BM25 of `query` over `index`. A candidate that does not match scores
     /// `0.0` rather than dropping out of the ranking.
     Bm25 {
@@ -496,6 +538,9 @@ pub enum OrderValue {
     /// vector order -- and sorts after every row that has one, by id, as
     /// PostgreSQL sorts NULL last.
     Missing,
+    /// A several-key order ([`QueryOrder::Keys`]): the keys are the row's
+    /// own fields and expressions, which the projection reports.
+    Keys,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

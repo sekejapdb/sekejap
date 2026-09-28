@@ -145,13 +145,41 @@ impl PreparedQuery<'_> {
                 SortDirection::Ascending => RankWalk::Exact,
                 SortDirection::Descending => RankWalk::ByValue,
             },
+            // A several-key order walked by its FIRST key. The external key
+            // is unique, so the key walk is the whole rank order. A field's
+            // index gives the first key's order only: rows tied on it are
+            // ranked by the later keys, not by id, so the walk finishes the
+            // boundary value's tie group before it stops.
+            (DriverPlan::Keys { descending, .. }, CompiledOrder::Keys(keys))
+                if keys
+                    .first()
+                    .is_some_and(|first| first.is_external_key() && first.descending == *descending) =>
+            {
+                RankWalk::Exact
+            }
+            (DriverPlan::Scalar { info, .. }, CompiledOrder::Keys(keys))
+                if keys
+                    .first()
+                    .and_then(CompiledSortKey::index)
+                    .is_some_and(|order| order.id == info.id) =>
+            {
+                RankWalk::ByValue
+            }
             _ => RankWalk::No,
         }
     }
     /// True when the scalar driver has to be walked backwards: the order is
     /// descending and it is that order's own index doing the driving.
     fn scalar_driver_descends(&self) -> bool {
-        matches!(self.driver_walks_in_rank_order(), RankWalk::ByValue)
+        match &self.order {
+            // A several-key walk by value runs whichever way its first key
+            // asks.
+            CompiledOrder::Keys(keys) => {
+                matches!(self.driver_walks_in_rank_order(), RankWalk::ByValue)
+                    && keys.first().is_some_and(|first| first.descending)
+            }
+            _ => matches!(self.driver_walks_in_rank_order(), RankWalk::ByValue),
+        }
     }
     /// What the page will actually read off each candidate. A driver holding
     /// borrowed bytes copies them only for something that will be read.
@@ -188,6 +216,9 @@ impl PreparedQuery<'_> {
                 (DriverPlan::Scalar { info, .. }, CompiledOrder::Scalar { info: order, .. }) => {
                     info.id == order.id
                 }
+                (DriverPlan::Scalar { info, .. }, CompiledOrder::Keys(keys)) => keys
+                    .iter()
+                    .any(|key| key.index().is_some_and(|order| order.id == info.id)),
                 // A driver-ordered scalar walk ranks by the very key the
                 // cursor is standing on.
                 (DriverPlan::Scalar { info, .. }, CompiledOrder::Driver(DriverKey::Scalar(order))) => {
@@ -202,6 +233,16 @@ impl PreparedQuery<'_> {
             // ranking over the keys walk itself.
             key: matches!(self.order, CompiledOrder::Driver(DriverKey::Key)),
             edge: self.reads_the_edge(),
+            null_order: match (&self.driver, &self.order) {
+                (DriverPlan::Scalar { info, .. }, CompiledOrder::Scalar { info: order, .. }) => {
+                    info.id == order.id
+                }
+                (DriverPlan::Scalar { info, .. }, CompiledOrder::Keys(keys)) => keys
+                    .first()
+                    .and_then(CompiledSortKey::index)
+                    .is_some_and(|order| order.id == info.id),
+                _ => false,
+            },
         }
     }
     /// True when something in this query reads the edge a traversal crossed
@@ -468,6 +509,9 @@ impl PreparedQuery<'_> {
             CompiledOrder::Scalar { .. } => !self.cursor_needs().scalar_key,
             CompiledOrder::Distance { .. } => self.distance_order_needs_the_row(),
             CompiledOrder::Score { expr, .. } => expr.needs_row(&self.driver),
+            // A single key the driving index carries needs no row; any other
+            // several-key order reads it.
+            CompiledOrder::Keys(keys) => !(keys.len() == 1 && self.cursor_needs().scalar_key),
             CompiledOrder::EntityId
             | CompiledOrder::ExactVector { .. }
             | CompiledOrder::ApproximateVector { .. }
@@ -539,6 +583,7 @@ impl PreparedQuery<'_> {
             } => !*posting_membership,
             CompiledFilter::JsonEq { .. }
             | CompiledFilter::Like { .. }
+            | CompiledFilter::RowCompare { .. }
             | CompiledFilter::Point { .. }
             | CompiledFilter::Geometry { .. }
             | CompiledFilter::Folded { .. }
@@ -649,7 +694,9 @@ impl PreparedQuery<'_> {
                         MembershipSet::Ids(_) | MembershipSet::Bitmap(_)
                     )
             }
-            CompiledFilter::JsonEq { .. } | CompiledFilter::Like { .. } => true,
+            CompiledFilter::JsonEq { .. }
+            | CompiledFilter::Like { .. }
+            | CompiledFilter::RowCompare { .. } => true,
             // A non-driving point filter whose cover ranges have been walked
             // into a set reads no row either; without one it reads every row.
             CompiledFilter::Point { .. } => !matches!(
@@ -817,7 +864,7 @@ impl PreparedQuery<'_> {
         for winner in winners.iter_mut() {
             let order = match (&self.order, &winner.key.value) {
                 (CompiledOrder::EntityId, RankValue::Entity) => OrderValue::EntityId,
-                (CompiledOrder::Scalar { info, .. }, RankValue::Scalar(key)) => {
+                (CompiledOrder::Scalar { info, .. }, RankValue::Sorted(key)) => {
                     OrderValue::Scalar(scalar_order_value(info, key)?)
                 }
                 (CompiledOrder::ExactVector { .. }, RankValue::Score(score)) => {
@@ -843,6 +890,7 @@ impl PreparedQuery<'_> {
                 // answer about the row: a cell number is not a distance and a
                 // sequence is already `id`.
                 (CompiledOrder::Driver(_), _) => OrderValue::Driver,
+                (CompiledOrder::Keys(_), RankValue::Keys(_)) => OrderValue::Keys,
                 _ => unreachable!("prepared order and rank key agree"),
             };
             // Every returned ID must still have an authoritative primary row.
@@ -1427,7 +1475,7 @@ impl PreparedQuery<'_> {
                     if in_rank_order == RankWalk::ByValue
                         && winners.len() >= capacity
                         && winners.worst().is_some_and(|worst| {
-                            compare_rank_value(&key.value, &worst.key.value, descending)
+                            compare_leading(&key.value, &worst.key.value, descending)
                                 == Ordering::Greater
                         })
                     {
@@ -1662,6 +1710,7 @@ fn score_leaves(expr: &CompiledScoreExpr, out: &mut Vec<String>) {
         CompiledScoreExpr::Scalar { info } => {
             out.push(format!("scalar {} ({})", info.name, info.field));
         }
+        CompiledScoreExpr::Field { field } => out.push(format!("field {field} (read from the row)")),
         CompiledScoreExpr::Bm25(prepared) => out.push(format!(
             "bm25 {} ({})",
             prepared.info.name,
@@ -1868,7 +1917,9 @@ impl PreparedQuery<'_> {
                 }
             }
             CompiledFilter::Graph { .. } => FilterAnswer::GraphFrontier,
-            CompiledFilter::JsonEq { .. } | CompiledFilter::Like { .. } => FilterAnswer::Row,
+            CompiledFilter::JsonEq { .. }
+            | CompiledFilter::Like { .. }
+            | CompiledFilter::RowCompare { .. } => FilterAnswer::Row,
             CompiledFilter::Key { .. } => FilterAnswer::Driver,
             // Only reachable before the first page has run: a boolean
             // filter's set is marked `Unbuilt` at prepare and walked before
@@ -1904,6 +1955,24 @@ impl PreparedQuery<'_> {
                         None,
                         Some(field.clone()),
                         "structural JSON equality".to_owned(),
+                    ),
+                    CompiledFilter::RowCompare { fields, op, .. } => (
+                        "row_compare",
+                        None,
+                        Some(
+                            fields
+                                .iter()
+                                .map(|(field, _)| {
+                                    if field == crate::collections::KEY_FIELD {
+                                        "_key".to_owned()
+                                    } else {
+                                        field.clone()
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ),
+                        format!("row comparison {op:?}, checked on each row it reaches"),
                     ),
                     CompiledFilter::Like { field, negated, .. } => (
                         "like",
@@ -2035,6 +2104,29 @@ impl PreparedQuery<'_> {
             CompiledOrder::Score { direction, .. } => {
                 ("score", format!("arithmetic expression {direction:?}"))
             }
+            CompiledOrder::Keys(keys) => (
+                "keys",
+                keys.iter()
+                    .map(|key| {
+                        let what = match &key.value {
+                            CompiledSortValue::Field { field, index, .. } => {
+                                let field = if field == crate::collections::KEY_FIELD {
+                                    "_key"
+                                } else {
+                                    field
+                                };
+                                match index {
+                                    Some(info) => format!("{field} (index {})", info.name),
+                                    None => format!("{field} (read from the row)"),
+                                }
+                            }
+                            CompiledSortValue::Score(_) => "expression".to_owned(),
+                        };
+                        format!("{what} {}", if key.descending { "DESC" } else { "ASC" })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
         };
         let mut leaves = Vec::new();
         if let CompiledOrder::Score { expr, .. } = &self.order {

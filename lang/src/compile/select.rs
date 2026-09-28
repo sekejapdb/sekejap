@@ -44,12 +44,58 @@ impl Compiler<'_> {
         let mut filters: Vec<OwnedFilter> = Vec::new();
         for expr in &statement.predicates {
             filters.push(self.where_filter(c, expr)?);
+            // `(a, b) > (x, y)` implies `a >= x`: when `a` has an index (or
+            // is `_key`), that range narrows the walk to where the answer
+            // starts, and the row comparison decides each row.
+            if let Expr::Leaf(Predicate::RowCompare { columns, op, values }) = expr {
+                let implied = match op {
+                    CmpOp::Gt | CmpOp::Ge => Some(CmpOp::Ge),
+                    CmpOp::Lt | CmpOp::Le => Some(CmpOp::Le),
+                    CmpOp::Eq => Some(CmpOp::Eq),
+                    CmpOp::Ne => None,
+                };
+                let (first, value) = (&columns[0], &values[0]);
+                if let Some(op) = implied {
+                    if is_key_column(first) {
+                        filters.push(self.where_filter(
+                            c,
+                            &Expr::Leaf(Predicate::KeyCompare { op, value: value.clone() }),
+                        )?);
+                    } else if self.plain_scalar_index(c, first)?.is_some() {
+                        filters.push(self.where_filter(
+                            c,
+                            &Expr::Leaf(Predicate::Compare {
+                                column: first.clone(),
+                                op,
+                                value: value.clone(),
+                            }),
+                        )?);
+                    }
+                }
+            }
         }
         super::predicates::merge_key_bounds(&mut filters);
 
+        // One key with an order of its own (an index, `_key`, `_id`, a
+        // ranking) keeps its dedicated walk. Several keys, or one column no
+        // index orders, are a several-key order: read from the row when no
+        // index holds them, NULL last ascending and first descending.
         let order = match &statement.order {
             None => OwnedOrder::Driver,
-            Some(key) => self.order(c, key)?,
+            Some(key) if statement.then_by.is_empty() && !self.one_key_needs_keys(c, key)? => {
+                self.order(c, key)?
+            }
+            Some(first) => {
+                let mut keys = Vec::with_capacity(1 + statement.then_by.len());
+                for key in std::iter::once(first).chain(&statement.then_by) {
+                    keys.push(self.sort_key(c, key)?);
+                }
+                self.notices.push(match keys.iter().find(|key| !matches!(key.value, OwnedSortValue::Key)) {
+                    Some(_) => "ORDER BY: a key no index orders is read from each row the walk reaches, and the rows are ranked with bounded memory; an index on the first key lets the walk stop early".to_owned(),
+                    None => "ORDER BY _key: the key mapping is walked in order".to_owned(),
+                });
+                OwnedOrder::Keys(keys)
+            }
         };
         // `ORDER BY _key`: the external-key mapping is stored in key order,
         // so walking it IS the order -- no index, no sort.
@@ -158,6 +204,11 @@ impl Compiler<'_> {
                             "{what} in a select list: the only expression a row can report here is this statement's own ranking value, and this statement has no ORDER BY"
                         )));
                     }
+                    if matches!(order, OwnedOrder::Keys(_)) {
+                        return Err(SqlError::unsupported(format!(
+                            "{what} in a select list with an ORDER BY of several keys: a row reports one ranking value, and this order has several; select the columns themselves"
+                        )));
+                    }
                     columns.push(alias.clone().unwrap_or_else(|| "score".to_owned()));
                     outputs.push(Output::OrderValue);
                 }
@@ -210,6 +261,90 @@ impl Compiler<'_> {
     }
 
     // ── ORDER BY ─────────────────────────────────────────────────────────
+
+    /// A ready plain (non-expression) scalar index over `column`, if any.
+    pub(super) fn plain_scalar_index(&self, c: CollectionId, column: &str) -> SqlResult2<Option<IndexId>> {
+        Ok(self
+            .db
+            .list_indexes(c)
+            .map_err(SqlError::from)?
+            .into_iter()
+            .find(|info| {
+                info.family == IndexFamily::Scalar
+                    && info.field == column
+                    && info.expression.is_none()
+                    && info.state == IndexState::Ready
+            })
+            .map(|info| info.id))
+    }
+
+    /// True for a lone ORDER BY column that no index orders: it becomes a
+    /// one-key several-key order rather than a refusal.
+    fn one_key_needs_keys(&self, c: CollectionId, key: &OrderKey) -> SqlResult2<bool> {
+        Ok(match key {
+            OrderKey::Column { column, .. } if column != ID_COLUMN && !is_key_column(column) => {
+                self.plain_scalar_index(c, column)?.is_none()
+            }
+            _ => false,
+        })
+    }
+
+    /// One key of a several-key order.
+    fn sort_key(&mut self, c: CollectionId, key: &OrderKey) -> SqlResult2<OwnedSortKey> {
+        let (value, descending) = match key {
+            OrderKey::Column { column, descending } => {
+                if column == ID_COLUMN {
+                    return Err(SqlError::unsupported(
+                        "ORDER BY _id with other keys: order by `_key`, which is unique and has the same place in every key order",
+                    ));
+                }
+                if is_key_column(column) {
+                    (OwnedSortValue::Key, *descending)
+                } else {
+                    match self.kind_of(c, column)? {
+                        Kind::Bool | Kind::Int | Kind::Real | Kind::Text => {}
+                        other => {
+                            return Err(SqlError::unsupported(format!(
+                                "ORDER BY `{column}`: a {other:?} column has no order; order by a text, number or boolean column, or an expression"
+                            )))
+                        }
+                    }
+                    (OwnedSortValue::Field(column.clone()), *descending)
+                }
+            }
+            OrderKey::Score { expr, descending } => (OwnedSortValue::Score(self.score(c, expr)?), *descending),
+            OrderKey::Bm25 {
+                column,
+                query,
+                descending,
+            } => {
+                let index = self.index_for(c, column, IndexFamily::Text, "a text index")?;
+                let (text, matching, fill) = self.tsquery_slot(query)?;
+                (
+                    OwnedSortValue::Score(OwnedScore::Bm25 {
+                        index,
+                        query: text,
+                        matching,
+                        fill,
+                    }),
+                    *descending,
+                )
+            }
+            OrderKey::Distance { .. } | OrderKey::Vector { .. } => {
+                return Err(SqlError::unsupported(
+                    "ORDER BY a distance with other keys: a nearest-first walk ranks by the distance alone; order by it on its own",
+                ))
+            }
+        };
+        Ok(OwnedSortKey {
+            value,
+            direction: if descending {
+                SortDirection::Descending
+            } else {
+                SortDirection::Ascending
+            },
+        })
+    }
 
     fn order(&mut self, c: CollectionId, key: &OrderKey) -> SqlResult2<OwnedOrder> {
         Ok(match key {
@@ -388,8 +523,13 @@ impl Compiler<'_> {
                         "`{column}` is TEXT: a Score leaf is numeric, and a text scalar is refused at prepare (`ScoreExpr::Scalar`, src/query/mod.rs)"
                     )));
                 }
-                OwnedScore::Scalar {
-                    index: self.index_for(c, column, IndexFamily::Scalar, "a scalar index")?,
+                // The column's index when it has one; otherwise the value is
+                // read from the row (`ScoreExpr::Field`).
+                match self.plain_scalar_index(c, column)? {
+                    Some(index) => OwnedScore::Scalar { index },
+                    None => OwnedScore::Field {
+                        field: column.clone(),
+                    },
                 }
             }
             ScoreNode::Bm25 { column, query } => {

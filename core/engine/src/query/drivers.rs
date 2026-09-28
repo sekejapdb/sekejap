@@ -1008,6 +1008,14 @@ impl ScalarWalk<'_> {
 
 pub(super) struct ScalarCursor<'a> {
     pub(super) walk: ScalarWalk<'a>,
+    /// Which postings the current walk hands over.
+    pub(super) region: ScalarRegion,
+    /// The walk that follows when this one ends: the NULL rows after the
+    /// values of an ascending `ORDER BY`, or the values after the NULL rows
+    /// of a descending one. Opened only when it is reached, so the cursor
+    /// never holds two walks at once.
+    pub(super) then: Option<PendingWalk>,
+    pub(super) db: &'a Database,
     pub(super) prefix: Vec<u8>,
     pub(super) info: IndexInfo,
     pub(super) predicate: EncodedScalarFilter,
@@ -1031,12 +1039,33 @@ pub(super) struct CursorNeeds {
     /// The reaching edge of a traversal, read by an `@edge.<name>`
     /// projection or an `@edge` ranking and by nothing else.
     pub(super) edge: bool,
+    /// The scalar walk IS the `ORDER BY`'s own index, so it hands NULL rows
+    /// over where PostgreSQL sorts them: after the values ascending, before
+    /// them descending ([`RankValue::Sorted`]).
+    pub(super) null_order: bool,
 }
 
-/// One mapping-keyspace range, walked ascending. Unlike `ScalarWalk` there is
-/// no reverse variant: `QueryOrder::Driver` has no direction of its own (see
-/// `DriverKey`'s doc), so nothing ever asks this cursor to open backwards --
-/// stated, not implemented, per item KD's scope.
+/// A scalar walk not opened yet: where it starts, which way, and what it
+/// hands over.
+pub(super) struct PendingWalk {
+    pub(super) start: Vec<u8>,
+    pub(super) reverse: bool,
+    pub(super) region: ScalarRegion,
+}
+
+/// Which postings of a scalar index one phase of a walk hands over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScalarRegion {
+    /// Every posting in the walk's range: a filter walk.
+    All,
+    /// Only the values; the phase ends at the nullish key.
+    Values,
+    /// Only the nullish key's postings (NULL and MISSING), id ascending.
+    Nulls,
+}
+
+/// One mapping-keyspace range, walked ascending -- or descending under
+/// `CandidateDriver::KeysDescending` (`ORDER BY _key DESC`).
 pub(super) struct KeysCursor<'a> {
     /// Forward from the predicate's lower bound, or backward from one key
     /// past its upper bound.
@@ -1311,8 +1340,24 @@ pub(super) fn scalar_reverse_start(
 /// emitted so far.
 pub(super) fn resume_scalar_reverse_key(info: &IndexInfo, after: &RankKey) -> Option<Vec<u8>> {
     match &after.value {
-        RankValue::Scalar(value) => Some(past_scalar_value(info, value)),
+        RankValue::Scalar(value) | RankValue::Sorted(value) => Some(past_scalar_value(info, value)),
+        RankValue::Keys(cells) => Some(past_scalar_value(info, &leading_scalar_key(info, cells)?)),
         _ => None,
+    }
+}
+
+/// The scalar key of a several-key rank's FIRST key, as the index that walks
+/// it stores that value: NULL is the nullish key, Text is re-encoded from the
+/// UTF-8 bytes the cell holds, and Bool/Int/Real cells already hold it.
+pub(super) fn leading_scalar_key(info: &IndexInfo, cells: &[super::rank::SortCell]) -> Option<Vec<u8>> {
+    match &cells.first()?.value {
+        None => Some(NULLISH_SCALAR_KEY.to_vec()),
+        Some(super::rank::CellValue::Bytes(bytes)) if matches!(info.kind, Kind::Text) => {
+            let text = String::from_utf8(bytes.clone()).ok()?;
+            scalar_key::encode(&info.kind, Some(&Value::String(text))).ok()
+        }
+        Some(super::rank::CellValue::Bytes(bytes)) => Some(bytes.clone()),
+        Some(super::rank::CellValue::Score(_)) => None,
     }
 }
 
@@ -1327,12 +1372,16 @@ pub(super) fn resume_scalar_key(
     predicate: &EncodedScalarFilter,
     after: &RankKey,
 ) -> Option<Vec<u8>> {
-    let value = match (&after.value, predicate) {
-        (RankValue::Scalar(key), _) => key.as_slice(),
-        (RankValue::Entity, EncodedScalarFilter::Eq(value)) => value.as_slice(),
+    let (value, sequence) = match (&after.value, predicate) {
+        (RankValue::Scalar(key) | RankValue::Sorted(key), _) => (key.clone(), after.id.sequence),
+        // A several-key order ranks the rows tied on this value by its later
+        // keys, not by id, so the page re-walks the whole tie group from its
+        // start; the rows it already emitted are dropped by `after`.
+        (RankValue::Keys(cells), _) => (leading_scalar_key(info, cells)?, 0),
+        (RankValue::Entity, EncodedScalarFilter::Eq(value)) => (value.clone(), after.id.sequence),
         _ => return None,
     };
-    Some(crate::collections::catalog::skey(info, value, after.id.sequence))
+    Some(crate::collections::catalog::skey(info, &value, sequence))
 }
 
 /// The mapping key a resumed keys walk should open at: the previous page's
@@ -1342,14 +1391,18 @@ pub(super) fn resume_scalar_key(
 /// because a mapping entry is unique per key: there is no tie group whose
 /// still-owed members lie on the far side of it.
 pub(super) fn resume_key_walk(prefix: &[u8], after: &RankKey) -> Option<Vec<u8>> {
-    match &after.value {
-        RankValue::Key(key) => {
-            let mut start = prefix.to_vec();
-            start.extend_from_slice(key);
-            Some(start)
-        }
-        _ => None,
-    }
+    let key = match &after.value {
+        RankValue::Key(key) => key,
+        // A several-key order led by `_key`: its first cell is the raw key.
+        RankValue::Keys(cells) => match &cells.first()?.value {
+            Some(super::rank::CellValue::Bytes(key)) => key,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut start = prefix.to_vec();
+    start.extend_from_slice(key);
+    Some(start)
 }
 
 /// The nullish scalar key. A NULL field and a MISSING one share it, so a

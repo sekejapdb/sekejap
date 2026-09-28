@@ -9,6 +9,10 @@ pub(super) enum CompiledScoreExpr {
     Scalar {
         info: IndexInfo,
     },
+    /// A numeric field read from the row: a field no scalar index holds.
+    Field {
+        field: String,
+    },
     Bm25(PreparedText),
     /// `search_score()`: the same `PreparedText` a `TextMatch::Search`
     /// predicate prepares, scored by its own [0,1] formula rather than BM25.
@@ -52,6 +56,7 @@ impl CompiledScoreExpr {
     pub(super) fn needs_row(&self, driver: &DriverPlan) -> bool {
         match self {
             Self::Lit(_) | Self::VectorSimilarity { .. } => false,
+            Self::Field { .. } => true,
             Self::Bm25(prepared) => prepared.phrase.is_some(),
             // A search score is the automaton's own numbers over the
             // postings: no row, ever.
@@ -125,6 +130,26 @@ pub(super) fn compile_score_expr(
                 ));
             }
             Ok(CompiledScoreExpr::Scalar { info })
+        }
+        ScoreExpr::Field { field } => {
+            leaf(leaves)?;
+            let info = db.collection_info(collection)?;
+            match info.layout.fields.iter().find(|(name, _)| name == field) {
+                Some((_, Kind::Int | Kind::Real | Kind::Bool)) => {}
+                Some((_, other)) => {
+                    return Err(invalid_query(format!(
+                        "score field `{field}` is {other:?}; an expression takes Int, Real or Bool"
+                    )))
+                }
+                None => {
+                    return Err(invalid_query(format!(
+                        "score field `{field}`: the collection declares no such field"
+                    )))
+                }
+            }
+            Ok(CompiledScoreExpr::Field {
+                field: (*field).to_owned(),
+            })
         }
         ScoreExpr::Bm25 {
             index,
@@ -233,6 +258,19 @@ pub(super) fn eval_score_expr<'a, C: FnMut() -> bool>(
                 Some(key) => scalar_key_to_score(info, &key),
                 None => Ok(0.0),
             }
+        }
+        CompiledScoreExpr::Field { field } => {
+            let fresh = row.is_none();
+            ensure_row_seq(db, rows, candidate.id, row, encoded, meter)?;
+            if fresh {
+                meter.note_row_decode();
+            }
+            // The Scalar leaf's coercion: Bool is 0/1, NULL or MISSING 0.
+            Ok(match selected_field(row.as_ref().unwrap(), field)? {
+                dense_v3::FieldValue::Inline(Value::Bool(b)) => f64::from(u8::from(b)),
+                dense_v3::FieldValue::Inline(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            })
         }
         CompiledScoreExpr::Bm25(prepared) => Ok(text_score(
             db,

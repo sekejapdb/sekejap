@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.18.3
+
+ORDER BY as PostgreSQL has it, and "load more" in plain SQL.
+
+- **Several ORDER BY keys**: `ORDER BY city, name DESC, _key`, up to eight,
+  over text, number and boolean columns, `_key`, arithmetic expressions and
+  `bm25(...)`. Rows tied after the last key keep row-id order.
+- **ORDER BY needs no index**: a column with no index is ranked from the
+  row, with memory bounded by the page, instead of being refused. With an
+  index on the first key the walk follows it and stops early. `EXPLAIN` says
+  which.
+- **NULL sorts where PostgreSQL puts it**: after every value ascending,
+  before them descending. **Behaviour change:** before 0.18.3 an indexed
+  `ORDER BY col` put NULL first ascending and last descending.
+- **Row comparison** `WHERE (a, b) > (x, y)` (and `=`, `<>`, `<`, `<=`,
+  `>=`), PostgreSQL's rules. With `ORDER BY a, b` it is keyset paging that
+  skips no row tied on `a`: `WHERE (name, _key) > ($1, $2) ORDER BY name, _key
+  LIMIT 20`.
+- **A NOT NULL violation is SQLSTATE `23502`**, in PostgreSQL's words, like
+  the missing key already was.
+
 ## 0.18.2
 
 Fixes from dogfooding sekejap under an application host, and `LIKE` / `ILIKE`

@@ -50,6 +50,13 @@ pub(super) enum CompiledFilter {
         matcher: super::like::LikeMatcher,
         negated: bool,
     },
+    RowCompare {
+        /// Each field as stored (`_key` is `KEY_FIELD`) and its kind.
+        fields: Vec<(String, Kind)>,
+        /// Each value as a sort cell; `None` is a NULL.
+        values: Vec<Option<super::rank::CellValue>>,
+        op: crate::index::graph::Cmp,
+    },
     Graph {
         request: OwnedBfsRequest,
         position: usize,
@@ -311,6 +318,47 @@ pub(super) enum CompiledOrder {
         property: String,
         direction: SortDirection,
     },
+    /// SQL's several-key ORDER BY ([`QueryOrder::Keys`]).
+    Keys(Vec<CompiledSortKey>),
+}
+
+/// The most keys one ORDER BY takes.
+pub(super) const MAX_SORT_KEYS: usize = 8;
+
+/// One compiled key of a several-key order.
+#[derive(Clone, Debug)]
+pub(super) struct CompiledSortKey {
+    pub(super) value: CompiledSortValue,
+    pub(super) descending: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum CompiledSortValue {
+    /// A stored field -- the external key is `KEY_FIELD` -- ranked by its
+    /// scalar key. `index` is a ready plain scalar index over it, when one
+    /// exists: the walk can follow it, and a candidate it drives carries the
+    /// key, so the row is not read for it.
+    Field {
+        field: String,
+        kind: Kind,
+        index: Option<IndexInfo>,
+    },
+    Score(CompiledScoreExpr),
+}
+
+impl CompiledSortKey {
+    /// The index the first key can be walked by, when it is a field with one.
+    pub(super) fn index(&self) -> Option<&IndexInfo> {
+        match &self.value {
+            CompiledSortValue::Field { index, .. } => index.as_ref(),
+            CompiledSortValue::Score(_) => None,
+        }
+    }
+
+    /// True for the external key, which the mapping keyspace walks in order.
+    pub(super) fn is_external_key(&self) -> bool {
+        matches!(&self.value, CompiledSortValue::Field { field, .. } if field == crate::collections::KEY_FIELD)
+    }
 }
 
 /// One slot of a query's projection, in the order the caller asked for it.
@@ -1250,6 +1298,11 @@ fn compile_set_expr(
                 "a LIKE cannot be a boolean leaf: it has no index and is answered from the row, so there is no set to union or complement",
             ))
         }
+        QueryFilter::RowCompare { .. } => {
+            return Err(invalid_query(
+                "a row comparison cannot be a boolean leaf: it is answered from the row, so there is no set to union or complement",
+            ))
+        }
     })
 }
 
@@ -1386,6 +1439,58 @@ impl Database {
                         field: stored.to_owned(),
                         matcher,
                         negated: *negated,
+                    }
+                }
+                QueryFilter::RowCompare { fields, values, op } => {
+                    if fields.len() != values.len() || fields.len() < 2 || fields.len() > MAX_SORT_KEYS {
+                        return Err(invalid_query(format!(
+                            "a row comparison compares 2..{MAX_SORT_KEYS} columns with as many values"
+                        )));
+                    }
+                    let mut compiled_fields = Vec::with_capacity(fields.len());
+                    let mut cells = Vec::with_capacity(values.len());
+                    for (field, value) in fields.iter().zip(values.iter()) {
+                        let (stored, kind) = if field == "_key" {
+                            (crate::collections::KEY_FIELD.to_owned(), Kind::Text)
+                        } else {
+                            match collection.layout.fields.iter().find(|(name, _)| name == field) {
+                                Some((_, kind @ (Kind::Bool | Kind::Int | Kind::Real | Kind::Text))) => {
+                                    (field.clone(), kind.clone())
+                                }
+                                Some((_, other)) => {
+                                    return Err(invalid_query(format!(
+                                        "row comparison over `{field}`: a {other:?} field has no order"
+                                    )))
+                                }
+                                None => {
+                                    return Err(invalid_query(format!(
+                                        "row comparison over `{field}`: the collection declares no such field"
+                                    )))
+                                }
+                            }
+                        };
+                        let fits = match (&kind, value) {
+                            (_, Value::Null) => true,
+                            (Kind::Text, Value::String(_)) | (Kind::Bool, Value::Bool(_)) => true,
+                            (Kind::Int, Value::Number(n)) => n.is_i64(),
+                            (Kind::Real, Value::Number(_)) => true,
+                            _ => false,
+                        };
+                        if !fits {
+                            return Err(invalid_query(format!(
+                                "row comparison: `{field}` is {kind:?} and the value is {value}"
+                            )));
+                        }
+                        cells.push(super::rank::field_cell(
+                            &kind,
+                            dense_v3::FieldValue::Inline(value.clone()),
+                        )?);
+                        compiled_fields.push((stored, kind));
+                    }
+                    CompiledFilter::RowCompare {
+                        fields: compiled_fields,
+                        values: cells,
+                        op: *op,
                     }
                 }
                 QueryFilter::Graph(request) => CompiledFilter::Graph {
@@ -1581,6 +1686,71 @@ impl Database {
                     direction,
                 }
             }
+            QueryOrder::Keys(keys) => {
+                if keys.is_empty() || keys.len() > MAX_SORT_KEYS {
+                    return Err(invalid_query(format!(
+                        "an ORDER BY takes 1..{MAX_SORT_KEYS} keys"
+                    )));
+                }
+                let layout = self.collection_info(request.collection)?.layout;
+                let indexes = self.list_indexes(request.collection)?;
+                let mut compiled = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let value = match key.value {
+                        SortValue::Key | SortValue::Field("_key") => CompiledSortValue::Field {
+                            field: crate::collections::KEY_FIELD.to_owned(),
+                            kind: Kind::Text,
+                            index: None,
+                        },
+                        SortValue::Field(name) => {
+                            let kind = match layout.fields.iter().find(|(field, _)| field == name) {
+                                Some((_, kind @ (Kind::Bool | Kind::Int | Kind::Real | Kind::Text))) => {
+                                    kind.clone()
+                                }
+                                Some((_, other)) => {
+                                    return Err(invalid_query(format!(
+                                        "ORDER BY `{name}`: a {other:?} field has no order; order by a Bool, Int, Real or Text field, or an expression"
+                                    )))
+                                }
+                                None => {
+                                    return Err(invalid_query(format!(
+                                        "ORDER BY `{name}`: the collection declares no such field"
+                                    )))
+                                }
+                            };
+                            let index = indexes
+                                .iter()
+                                .find(|info| {
+                                    info.family == IndexFamily::Scalar
+                                        && info.field == name
+                                        && info.expression.is_none()
+                                        && info.state == IndexState::Ready
+                                })
+                                .cloned();
+                            CompiledSortValue::Field {
+                                field: name.to_owned(),
+                                kind,
+                                index,
+                            }
+                        }
+                        SortValue::Score(expr) => {
+                            let mut leaves = 0usize;
+                            CompiledSortValue::Score(compile_score_expr(
+                                self,
+                                request.collection,
+                                expr,
+                                1,
+                                &mut leaves,
+                            )?)
+                        }
+                    };
+                    compiled.push(CompiledSortKey {
+                        value,
+                        descending: matches!(key.direction, SortDirection::Descending),
+                    });
+                }
+                CompiledOrder::Keys(compiled)
+            }
         };
 
         let (fields, slots) = match request.projection {
@@ -1728,6 +1898,32 @@ impl Database {
                 // own order is the answer's. This is also what a driver-
                 // ordered query with no filter at all lands on.
                 CompiledOrder::Driver(_) => Ok(DriverPlan::Entities),
+                // A several-key order walks its FIRST key where that key has
+                // a walk of its own -- the key mapping, or the field's scalar
+                // index -- and the page stops once nothing ahead can place;
+                // with neither, every row is read once and ranked.
+                CompiledOrder::Keys(keys) => Ok(match keys.first() {
+                    Some(first) if first.is_external_key() => DriverPlan::Keys {
+                        predicate: EncodedScalarFilter::Range {
+                            lower: EncodedBound::Unbounded,
+                            upper: EncodedBound::Unbounded,
+                        },
+                        position: None,
+                        descending: first.descending,
+                    },
+                    Some(first) => match first.index() {
+                        Some(info) => DriverPlan::Scalar {
+                            info: info.clone(),
+                            predicate: EncodedScalarFilter::Range {
+                                lower: EncodedBound::Unbounded,
+                                upper: EncodedBound::Unbounded,
+                            },
+                            position: None,
+                        },
+                        None => DriverPlan::Entities,
+                    },
+                    None => DriverPlan::Entities,
+                }),
                 CompiledOrder::Distance { info, center } => {
                     Ok(nearest_plan(info, *center, &filters))
                 }

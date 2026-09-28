@@ -252,6 +252,13 @@ pub(super) enum Predicate {
         op: CmpOp,
         value: Literal,
     },
+    /// `(a, b, ...) <op> (x, y, ...)`: PostgreSQL's row comparison, the pairs
+    /// compared left to right (keyset paging over a column with ties).
+    RowCompare {
+        columns: Vec<String>,
+        op: CmpOp,
+        values: Vec<Literal>,
+    },
     Between {
         column: String,
         lower: Literal,
@@ -704,6 +711,9 @@ pub(super) struct SelectStmt {
     pub(super) group: Option<GroupExpr>,
     pub(super) having: Vec<HavingPredicate>,
     pub(super) order: Option<OrderKey>,
+    /// The ORDER BY keys after the first, in order: `ORDER BY a, b DESC`
+    /// has `b DESC` here. Empty for a one-key order.
+    pub(super) then_by: Vec<OrderKey>,
     pub(super) limit: Option<usize>,
 }
 

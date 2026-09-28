@@ -123,6 +123,11 @@ pub(crate) enum OwnedFilter {
         insensitive: bool,
         negated: bool,
     },
+    RowCompare {
+        fields: Vec<String>,
+        values: Vec<Value>,
+        op: sekejap_core::collections::Cmp,
+    },
 }
 
 impl OwnedFilter {
@@ -140,6 +145,11 @@ impl OwnedFilter {
                 escape: *escape,
                 insensitive: *insensitive,
                 negated: *negated,
+            },
+            Self::RowCompare { fields, values, op } => QueryFilter::RowCompare {
+                fields,
+                values,
+                op: *op,
             },
             Self::Scalar {
                 index, predicate, ..
@@ -332,6 +342,10 @@ pub(crate) enum OwnedScore {
     Scalar {
         index: IndexId,
     },
+    /// A numeric column no scalar index holds, read from the row.
+    Field {
+        field: String,
+    },
     Bm25 {
         index: IndexId,
         query: String,
@@ -379,6 +393,7 @@ fn with_score<R>(node: &OwnedScore, k: &mut dyn FnMut(&ScoreExpr<'_>) -> R) -> R
     match node {
         OwnedScore::Lit(value) => k(&ScoreExpr::Lit(*value)),
         OwnedScore::Scalar { index } => k(&ScoreExpr::Scalar { index: *index }),
+        OwnedScore::Field { field } => k(&ScoreExpr::Field { field }),
         OwnedScore::Bm25 {
             index,
             query,
@@ -470,6 +485,62 @@ pub(crate) enum OwnedOrder {
         expr: OwnedScore,
         direction: SortDirection,
     },
+    /// Several keys, or one key no index orders (`QueryOrder::Keys`).
+    Keys(Vec<OwnedSortKey>),
+}
+
+/// One key of a several-key ORDER BY.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OwnedSortKey {
+    pub(crate) value: OwnedSortValue,
+    pub(crate) direction: SortDirection,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum OwnedSortValue {
+    Field(String),
+    Key,
+    Score(OwnedScore),
+}
+
+/// Lower several sort keys to the engine's borrowed `SortKey`s. Each
+/// expression is borrowed inside `with_score`'s callback, so the keys are
+/// built one level of callback per expression and handed to `k` whole.
+fn with_sort_keys<R>(
+    keys: &[OwnedSortKey],
+    prefix: &[SortKey<'_>],
+    k: &mut dyn FnMut(&[SortKey<'_>]) -> R,
+) -> R {
+    let Some((first, rest)) = keys.split_first() else {
+        return k(prefix);
+    };
+    let direction = first.direction;
+    match &first.value {
+        OwnedSortValue::Field(name) => {
+            let mut built = prefix.to_vec();
+            built.push(SortKey {
+                value: SortValue::Field(name),
+                direction,
+            });
+            with_sort_keys(rest, &built, k)
+        }
+        OwnedSortValue::Key => {
+            let mut built = prefix.to_vec();
+            built.push(SortKey {
+                value: SortValue::Key,
+                direction,
+            });
+            with_sort_keys(rest, &built, k)
+        }
+        OwnedSortValue::Score(expr) => with_score(expr, &mut |compiled| {
+            let mut built = prefix.to_vec();
+            built.push(SortKey {
+                value: SortValue::Score(compiled),
+                direction,
+            });
+            with_sort_keys(rest, &built, k)
+        }),
+    }
 }
 
 /// How one output column is filled from a returned row.
@@ -644,6 +715,7 @@ impl SelectPlan {
                     direction: *direction,
                 })
             }),
+            OwnedOrder::Keys(keys) => with_sort_keys(keys, &[], &mut |built| run(QueryOrder::Keys(built))),
         }
         })
     }
@@ -1772,6 +1844,9 @@ impl OwnedFilter {
             // The pattern was folded when the statement compiled, which marks
             // the statement as compiled again on a bind: there is no slot.
             Self::Like { .. } => {}
+            // The values were read when the statement compiled, which marks
+            // it as compiled again on a bind.
+            Self::RowCompare { .. } => {}
             Self::Ids(_) => {}
         }
         Ok(())
@@ -1811,7 +1886,7 @@ impl OwnedScore {
             // A `search()` with a `$n` is folded at prepare, so a statement
             // that reaches a rebind has a CONSTANT search query and this leaf
             // has nothing to refill.
-            Self::Lit(_) | Self::Scalar { .. } | Self::SearchScore { .. } => {}
+            Self::Lit(_) | Self::Scalar { .. } | Self::Field { .. } | Self::SearchScore { .. } => {}
         }
         Ok(())
     }
@@ -1843,6 +1918,13 @@ impl OwnedOrder {
                 }
             }
             Self::Score { expr, .. } => expr.rebind(binder)?,
+            Self::Keys(keys) => {
+                for key in keys {
+                    if let OwnedSortValue::Score(expr) = &mut key.value {
+                        expr.rebind(binder)?;
+                    }
+                }
+            }
             Self::Driver | Self::EntityId | Self::Scalar { .. } => {}
         }
         Ok(())

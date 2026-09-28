@@ -335,6 +335,27 @@ impl Compiler<'_> {
                 insensitive,
                 negated,
             } => self.like_filter(c, column, pattern, escape.as_ref(), *insensitive, *negated)?,
+            Predicate::RowCompare { columns, op, values } => {
+                let mut read = Vec::with_capacity(values.len());
+                for (column, value) in columns.iter().zip(values) {
+                    if !is_key_column(column) {
+                        self.kind_of(c, column)?;
+                    }
+                    read.push(self.value_of(value)?);
+                }
+                OwnedFilter::RowCompare {
+                    fields: columns.clone(),
+                    values: read,
+                    op: match op {
+                        CmpOp::Eq => Cmp::Eq,
+                        CmpOp::Ne => Cmp::Ne,
+                        CmpOp::Lt => Cmp::Lt,
+                        CmpOp::Le => Cmp::Le,
+                        CmpOp::Gt => Cmp::Gt,
+                        CmpOp::Ge => Cmp::Ge,
+                    },
+                }
+            }
         })
     }
 

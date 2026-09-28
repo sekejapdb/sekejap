@@ -76,8 +76,8 @@ and sekejap's contract does not mention it at any tier (none remain).
 | 26 | `OR` | sql.rs:2513-2520 | DONE — `core/engine/src/query/membership.rs`; `lang/tests/sql_tier1.rs` `a_disjunction_of_equalities_is_one_membership_set`, `a_disjunction_across_two_families_unions_two_sets` | union of ranges as one membership set |
 | 27 | `IN (list)` / `NOT IN` | sql.rs:2647-2663 | DONE — `lang/tests/sql_tier1.rs` `in_a_list_is_the_same_union_written_shorter`, `not_in_a_list_is_the_complement_of_the_union` | same membership-set atomic |
 | 28 | `NOT <cond>` | sql.rs:2726 | DONE — `lang/tests/sql_tier1.rs` `not_before_a_group_is_de_morgan`, `is_not_null_is_the_complement_of_the_nullish_key`, `a_null_value_is_in_neither_half_of_a_complement`; `core/engine/tests/query_boolean.rs` `a_complement_is_bounded_by_a_named_resource` | complement over a membership set, always a bitmap, bounded by `WorkResource::MembershipBytes` |
-| 29 | `LIKE 'pat'` | sql.rs:2676 | DONE for the PREFIX form — `lang/src/compile/functions.rs`, `functions::prefix_successor`; `lang/tests/sql_functions.rs` `a_prefix_pattern_is_a_text_key_range_and_equals_the_filter`. Every other pattern DONE in 0.18.2 as a row check -- `core/engine/src/query/like.rs`, `lang/tests/sql_like.rs` | prefix range `[abc, abd)` on the column's own scalar index; any other pattern checked on each row with no index; a trigram index to make infix fast is later work |
-| 30 | `ILIKE '%x%'` via gin trigram | sql.rs:2681, db.rs:7381 | DONE in 0.18.2 as a row check -- `lang/tests/sql_like.rs` | the trigram index family (a feature bit) remains later work, for speed |
+| 29 | `LIKE 'pat'` | sql.rs:2676 | DONE for the PREFIX form — `lang/src/compile/functions.rs`, `functions::prefix_successor`; `lang/tests/sql_functions.rs` `a_prefix_pattern_is_a_text_key_range_and_equals_the_filter`. Every other pattern DONE in 0.18.3 as a row check -- `core/engine/src/query/like.rs`, `lang/tests/sql_like.rs` | prefix range `[abc, abd)` on the column's own scalar index; any other pattern checked on each row with no index; a trigram index to make infix fast is later work |
+| 30 | `ILIKE '%x%'` via gin trigram | sql.rs:2681, db.rs:7381 | DONE in 0.18.3 as a row check -- `lang/tests/sql_like.rs` | the trigram index family (a feature bit) remains later work, for speed |
 | 31 | `CASE WHEN … THEN … ELSE … END` | sql.rs:2192, 2431-2447 | CONTRACT-T2 — QL §4.1 | a row expression: one row in, one value out. In ORDER BY it is one key; in WHERE it is row-bound and EXPLAIN labels it so |
 | 32 | `AGE_DAYS(f)` / `AGE_HOURS(f)` | sql.rs:6870, 1713 | DONE under the Postgres spelling — `age(t)` in `lang/src/functions.rs`; `lang/tests/sql_functions.rs` `age_and_interval_arithmetic_are_microseconds_over_one_folded_clock`, `age_lies_between_two_clock_reads_this_test_made`. The prior engine's two names are not adopted | `age` and every interval are microseconds over one folded clock (§5 deviation 8); a caller divides |
 | 33 | `NOW()` in SELECT list | sql.rs:93 | DONE — `lang/tests/sql_functions.rs` `a_clock_relative_predicate_is_folded_at_prepare_and_is_one_range`, `projected_date_functions_equal_rusts_own_computation` | constant folded ONCE at prepare, so every row of one answer sees one instant |
@@ -216,7 +216,7 @@ Still CONTRACT-T2, grouped by what they wait on:
   which is the one place the "refused by name" rule is not yet kept.
 - **the geometry I/O surface (4):** 55, 57, and the I/O half of 53-54.
 - **graph T2 (8):** 60-64, 66, 67 (T3), 68.
-- **the trigram family (2):** 30 `ILIKE`, the infix half of 29 -- answered by a row check since 0.18.2; the index is what remains.
+- **the trigram family (2):** 30 `ILIKE`, the infix half of 29 -- answered by a row check since 0.18.3; the index is what remains.
 - **the typo-tolerant text family (4):** 39, 40, 42, 43, 44.
 - **statements with a named atomic and no surface (8):** 7, 10, 15, 16, 18,
   20, 38, 72.

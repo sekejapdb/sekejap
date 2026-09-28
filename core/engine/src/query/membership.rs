@@ -1276,6 +1276,7 @@ fn build_text_set<C: FnMut() -> bool>(
         scalar_key: false,
         key: false,
         edge: false,
+        null_order: false,
     };
     let mut cursor = DriverCursor::new(
         db,
@@ -1573,6 +1574,11 @@ impl NodeGate {
                 QueryFilter::Like { .. } => {
                     return Err(invalid_query(
                         "a traversal node predicate cannot be a LIKE: it has no index and is answered from the row",
+                    ))
+                }
+                QueryFilter::RowCompare { .. } => {
+                    return Err(invalid_query(
+                        "a traversal node predicate cannot be a row comparison: it is answered from the row",
                     ))
                 }
                 QueryFilter::Key { .. } => {

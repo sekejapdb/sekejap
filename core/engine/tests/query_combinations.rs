@@ -952,10 +952,12 @@ impl<'a> Oracle<'a> {
             OwnedOrder::EntityId => rows.sort_by_key(|r| r.id),
             OwnedOrder::BornAsc => rows.sort_by(|a, b| a.born.cmp(&b.born).then(a.id.cmp(&b.id))),
             OwnedOrder::BornDesc => rows.sort_by(|a, b| b.born.cmp(&a.born).then(a.id.cmp(&b.id))),
+            // PostgreSQL's NULLS LAST for an ascending order (0.18.3): a row
+            // whose `kind` is NULL or MISSING comes after every value.
             OwnedOrder::KindAsc => rows.sort_by(|a, b| match (&a.kind, &b.kind) {
                 (None, None) => a.id.cmp(&b.id),
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (Some(_), None) => std::cmp::Ordering::Greater,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
                 (Some(x), Some(y)) => x.cmp(y).then(a.id.cmp(&b.id)),
             }),
             OwnedOrder::Driver => {}
@@ -1658,7 +1660,7 @@ fn hypothesis_for(combo: &Combo) -> &'static str {
         return "src/query.rs:2599 Key filter / DriverPlan::Keys";
     }
     if matches!(combo.order, OwnedOrder::KindAsc) {
-        return "src/scalar_key.rs:2 text UTF-8 order; nullish key [0] sorts first";
+        return "src/scalar_key.rs:2 text UTF-8 order; NULL/MISSING sorts last ascending (PostgreSQL's NULLS LAST)";
     }
     if matches!(combo.order, OwnedOrder::ExactVector(_)) {
         return "src/vector_indexes.rs:215 score_f32_pre; locator ordinal after alter_collection (query.rs:980)";

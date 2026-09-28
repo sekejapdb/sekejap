@@ -162,7 +162,7 @@ pub use crate::query::{
     OrderValue, OwnedScalarValue, PointFilter, PreparedQuery, ProjectedValue, Projection,
     QueryBudget, QueryDriver, QueryError, QueryFilter, QueryOrder, QueryPage, QueryPlanDescription,
     QueryRequest, QueryResult, QueryRow, QueryWork, ScalarFilter, ScalarValue, ScoreExpr,
-    SortDirection, WorkResource,
+    SortDirection, SortKey, SortValue, WorkResource,
 };
 pub use catalog::{
     create_index_trees, set_create_index_trees, IndexExpr, IndexFamily, IndexId, IndexInfo,

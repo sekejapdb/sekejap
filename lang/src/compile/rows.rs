@@ -426,6 +426,11 @@ impl Compiler<'_> {
 
         // ── ORDER BY ─────────────────────────────────────────────────────
         let mut order = None;
+        if !select.then_by.is_empty() {
+            return Err(SqlError::unsupported(
+                "ORDER BY with several keys over a catalog view: a view is ordered by one of its columns",
+            ));
+        }
         if let Some(key) = &select.order {
             let OrderKey::Column { column, descending } = key else {
                 return Err(SqlError::unsupported(format!(

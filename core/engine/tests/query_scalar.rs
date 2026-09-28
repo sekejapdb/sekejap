@@ -193,10 +193,12 @@ fn scalar_json_filters_keep_exact_numbers_null_missing_and_page_order() {
 
         // Null and missing share one persisted scalar key, so a non-driving
         // predicate must still read the authoritative rows to distinguish
-        // them. The rank index drives three rows plus its terminal probe, and
-        // each of the three candidates is read once. The winner is NOT read a
-        // fourth time: the walk already read that row, which is the existence
-        // the re-fetch was asking about.
+        // them. The rank index drives three rows plus two terminal probes --
+        // the values phase's end, and the NULL phase's, which an ascending
+        // SQL order walks after the values (PostgreSQL's NULLS LAST, 0.18.3)
+        // -- and each of the three candidates is read once. The winner is NOT
+        // read a fourth time: the walk already read that row, which is the
+        // existence the re-fetch was asking about.
         let fallback = db
             .prepare_query(QueryRequest {
                 collection,
@@ -216,7 +218,7 @@ fn scalar_json_filters_keep_exact_numbers_null_missing_and_page_order() {
             fallback.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
             [expected]
         );
-        assert_eq!(fallback.work.scalar_postings, 4);
+        assert_eq!(fallback.work.scalar_postings, 5);
         assert_eq!(fallback.work.primary_reads, 3);
     }
 

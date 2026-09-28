@@ -598,7 +598,7 @@ fn a_fold_without_its_expression_index_is_refused_rather_than_scanned() {
         text.contains("expression index") && text.contains("lower(col)"),
         "the refusal must name the index that is missing: {text}"
     );
-    // A non-prefix LIKE is answered by checking each row (0.18.2, owner
+    // A non-prefix LIKE is answered by checking each row (0.18.3, owner
     // decision 2026-09-28): no index, no extra storage. `lang/tests/sql_like.rs`
     // holds its semantics against PostgreSQL.
     let answered = f

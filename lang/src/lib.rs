@@ -1122,6 +1122,9 @@ pub(crate) fn projected(value: &ProjectedValue) -> SqlValue {
 pub(crate) fn order_value(value: &OrderValue) -> SqlValue {
     match value {
         OrderValue::EntityId | OrderValue::Driver | OrderValue::Missing => SqlValue::Null,
+        // A several-key order has no single ranking value; the compiler
+        // refuses to project one (`Output::OrderValue`).
+        OrderValue::Keys => SqlValue::Null,
         OrderValue::Scalar(scalar) => match scalar {
             sekejap_core::collections::OwnedScalarValue::Nullish => SqlValue::Null,
             sekejap_core::collections::OwnedScalarValue::Bool(b) => SqlValue::Bool(*b),

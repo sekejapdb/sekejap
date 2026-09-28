@@ -499,6 +499,11 @@ impl Compiler<'_> {
                 }
             }
         }
+        if !select.then_by.is_empty() {
+            return Err(SqlError::unsupported(
+                "ORDER BY with several keys over an edge table: one end's edges are ordered by one column",
+            ));
+        }
         let order = match &select.order {
             None => None,
             Some(OrderKey::Column { column, descending }) => Some((at(column)?, *descending)),

@@ -2675,7 +2675,7 @@ fn a_multi_range_rewrite_is_refused_and_a_missing_expression_index_too() {
         format!("{error}").contains("expression index"),
         "the refusal names the index that is missing: {error}"
     );
-    // An infix LIKE is answered by checking each row (0.18.2); its semantics
+    // An infix LIKE is answered by checking each row (0.18.3); its semantics
     // against PostgreSQL are `lang/tests/sql_like.rs`'s.
     assert!(f
         .db

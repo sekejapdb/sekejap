@@ -115,15 +115,12 @@ impl Parser {
         } else {
             Vec::new()
         };
+        let mut then_by = Vec::new();
         let order = if self.eat_word("ORDER") {
             self.expect_word("BY")?;
             let key = self.order_key()?;
-            if matches!(self.peek(), Tok::Comma) {
-                return Err(SqlError::Refused {
-                    keyword: "ORDER BY <two keys>".into(),
-                    tier: super::Tier::Three,
-                    reason: "QL_CONTRACT §5 deviation 3: ORDER BY takes ONE key; an expression is one key (the Score atomic). Two keys are a refusal because there is no second-key atomic: a page ranks by one RankKey.",
-                });
+            while self.eat(&Tok::Comma) {
+                then_by.push(self.order_key()?);
             }
             Some(key)
         } else {
@@ -156,6 +153,7 @@ impl Parser {
             group,
             having,
             order,
+            then_by,
             limit,
         })
     }

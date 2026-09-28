@@ -118,17 +118,15 @@ fn refused(f: &mut fixture::Fixture, statement: &str, params: &[Param]) -> (Stri
 }
 
 #[test]
-fn two_order_by_keys_are_deviation_three() {
+fn two_order_by_keys_answer_since_0_18_3() {
+    // Deviation 3 was "ORDER BY takes ONE key" until 0.18.3; several keys now
+    // answer (`sql_order_by.rs` pins them against PostgreSQL). What stays
+    // refused by name is a key that has no order: a JSON or vector column.
     let (_dir, mut f) = open();
-    let (keyword, tier, reason) = refused(
-        &mut f,
-        "SELECT _id FROM place WHERE kind = 'park' ORDER BY born ASC, kind DESC",
-        &[],
-    );
-    assert_eq!(keyword, "ORDER BY <two keys>");
-    assert_eq!(tier, 3);
-    assert!(reason.contains("deviation 3"), "{reason}");
-    assert!(reason.contains("ONE key"), "{reason}");
+    assert!(f
+        .db
+        .sql("SELECT _id FROM place WHERE kind = 'park' ORDER BY born ASC, kind DESC", &[])
+        .is_ok());
 }
 
 #[test]

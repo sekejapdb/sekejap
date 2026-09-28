@@ -74,6 +74,10 @@ pub(super) fn batch_filters_match<C: FnMut() -> bool>(
                 meter.note_row_decode();
                 like_matches(selected_field_in(&layout, bytes, field)?, matcher, *negated)
             }
+            CompiledFilter::RowCompare { fields, values, op } => {
+                meter.note_row_decode();
+                row_compare_matches(fields, values, *op, |field| selected_field_in(&layout, bytes, field))?
+            }
             CompiledFilter::Point { info, predicate } => match &ranges[position] {
                 MembershipSet::Ids(ids) => ids.binary_search(&id.sequence).is_ok(),
                 MembershipSet::Bitmap(bits) => membership_bitmap_contains(bits, id.sequence),
@@ -337,6 +341,54 @@ fn json_structural_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
+/// A row comparison over one row, PostgreSQL's rules (see
+/// `QueryFilter::RowCompare`).
+fn row_compare_matches(
+    fields: &[(String, Kind)],
+    values: &[Option<super::rank::CellValue>],
+    op: crate::index::graph::Cmp,
+    mut read: impl FnMut(&str) -> QueryResult<dense_v3::FieldValue>,
+) -> QueryResult<bool> {
+    use crate::index::graph::Cmp;
+    use super::rank::CellValue;
+    let order = |a: &CellValue, b: &CellValue| match (a, b) {
+        (CellValue::Bytes(x), CellValue::Bytes(y)) => x.cmp(y),
+        (CellValue::Score(x), CellValue::Score(y)) => f64::from_bits(*x).total_cmp(&f64::from_bits(*y)),
+        _ => Ordering::Equal,
+    };
+    let mut any_null = false;
+    for ((field, kind), value) in fields.iter().zip(values) {
+        let cell = super::rank::field_cell(kind, read(field)?)?;
+        let (Some(have), Some(want)) = (cell.as_ref(), value.as_ref()) else {
+            // A NULL pair: it decides `<`, `>`, `<=`, `>=` (as NULL, so the
+            // row is not returned), and `=` and `<>` go on to the rest.
+            if matches!(op, Cmp::Eq | Cmp::Ne) {
+                any_null = true;
+                continue;
+            }
+            return Ok(false);
+        };
+        match order(have, want) {
+            Ordering::Equal => continue,
+            different => {
+                return Ok(match op {
+                    Cmp::Eq => false,
+                    Cmp::Ne => true,
+                    Cmp::Lt | Cmp::Le => different == Ordering::Less,
+                    Cmp::Gt | Cmp::Ge => different == Ordering::Greater,
+                })
+            }
+        }
+    }
+    // Every non-NULL pair was equal.
+    Ok(match op {
+        Cmp::Eq => !any_null,
+        Cmp::Ne => false,
+        Cmp::Le | Cmp::Ge => true,
+        Cmp::Lt | Cmp::Gt => false,
+    })
+}
+
 /// `LIKE` over one field value: a text matches or not, and a missing or
 /// NULL value matches neither `LIKE` nor `NOT LIKE`, as SQL's NULL does.
 fn like_matches(
@@ -466,6 +518,12 @@ pub(super) fn filters_match<'a, C: FnMut() -> bool>(
                 let row = row.as_ref().unwrap();
                 meter.note_row_decode();
                 like_matches(selected_field(row, field)?, matcher, *negated)
+            }
+            CompiledFilter::RowCompare { fields, values, op } => {
+                ensure_row_seq(db, rows, id, row, encoded, meter)?;
+                let row = row.as_ref().unwrap();
+                meter.note_row_decode();
+                row_compare_matches(fields, values, *op, |field| selected_field(row, field))?
             }
             CompiledFilter::Graph { position, .. } => graph
                 .get(*position)
