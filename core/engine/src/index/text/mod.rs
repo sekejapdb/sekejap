@@ -927,6 +927,21 @@ pub(crate) fn point_posting(
     scratch.posting(db, id, term, sequence)
 }
 
+/// Could a packed segment of `term` hold document `sequence`? Segments are
+/// keyed by the LAST sequence they hold and cover disjoint ascending ranges,
+/// so the one seek to the first segment whose last sequence is at least
+/// `sequence` answers it without decoding anything: no such segment, and no
+/// segment can. `true` may be a document that falls in a gap between two
+/// segments; the tombstone written for it then reads as the absence it is.
+fn packed_may_hold(db: &Database, id: IndexId, term: &str, sequence: u64) -> Result<bool> {
+    let prefix = segments::segment_prefix(id, term);
+    let mut range = db.store()?.range(&segments::segment_key(id, term, sequence))?;
+    Ok(match range.peek_ref()? {
+        Some((key, _)) => key.starts_with(&prefix),
+        None => false,
+    })
+}
+
 fn checked_add(value: u64, amount: u64, what: &'static str) -> Result<u64> {
     value.checked_add(amount).ok_or_else(|| corrupt(what))
 }
@@ -1010,14 +1025,19 @@ fn apply_transition(
         if old_tf != new_tf {
             match new_tf {
                 Some(tf) => db.writer()?.put(&key, &tf.to_be_bytes())?,
-                // A head row is this write's own earlier posting: remove it.
+                // A packed segment may hold this document's posting: whatever
+                // the head holds -- nothing, or a later write's frequency
+                // OVERRIDING that posting -- the absence must be recorded at
+                // the head. Deleting a head row that was overriding a packed
+                // posting made the posting live again (finding v019-f2).
+                None if segments_on && packed_may_hold(db, index.id, term, entity.sequence)? => {
+                    db.writer()?.put(&key, &0u32.to_be_bytes())?
+                }
+                // Nothing packed can hold it: the head row, if any, is the
+                // only posting there is, and it goes.
                 None if head.is_some() => {
                     db.writer()?.delete(&key)?;
                 }
-                // Nothing at the head and the file has folded: the posting is
-                // packed inside a segment. Retire it by recording its absence
-                // at the head, which overrides the segment from now on.
-                None if segments_on => db.writer()?.put(&key, &0u32.to_be_bytes())?,
                 None => {}
             }
         }
