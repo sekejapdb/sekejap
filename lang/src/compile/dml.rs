@@ -147,6 +147,7 @@ impl Compiler<'_> {
         key: &Literal,
     ) -> SqlResult2<WritePlan> {
         let c = collection(self.db, table)?;
+        let declared_key = self.declared_key_column(c)?;
         let mut patch = Map::new();
         for (column, literal) in assignments {
             if is_key_column(column) {
@@ -154,6 +155,7 @@ impl Compiler<'_> {
                     "UPDATE ... SET _key = ...: the external key is the row's identity; a new key is a new row (INSERT) and the old one is a DELETE",
                 ));
             }
+            refuse_key_assignment(column, declared_key.as_deref())?;
             let kind = self.kind_of(c, column)?;
             let value = match self.time_column(c, column)? {
                 Some(declared) => self.time_document_value(literal, column, &declared)?,
@@ -301,6 +303,7 @@ impl Compiler<'_> {
         predicates: &[Expr],
     ) -> SqlResult2<WritePlan> {
         let c = collection(self.db, table)?;
+        let declared_key = self.declared_key_column(c)?;
         let mut fields: Vec<String> = Vec::new();
         let mut sets = Vec::with_capacity(assignments.len());
         for (column, value) in assignments {
@@ -309,6 +312,7 @@ impl Compiler<'_> {
                     "UPDATE ... SET _key = ...: the external key is the row's identity; a new key is a new row (INSERT) and the old one is a DELETE",
                 ));
             }
+            refuse_key_assignment(column, declared_key.as_deref())?;
             let kind = self.kind_of(c, column)?;
             let compiled = match value {
                 SetValue::Lit(literal) => CompiledSet::Lit(match self.time_column(c, column)? {
@@ -453,4 +457,28 @@ impl Compiler<'_> {
         out.push_str("note:  this plan was PREPARED, not run: an EXPLAIN that executed a destructive statement would be the statement\n");
         Ok(out)
     }
+}
+
+impl Compiler<'_> {
+    /// The column a `PRIMARY KEY` declaration made the row's key, if one did.
+    fn declared_key_column(&self, c: CollectionId) -> SqlResult2<Option<String>> {
+        Ok(self
+            .db
+            .collection_info(c)
+            .map_err(SqlError::from)?
+            .key
+            .and_then(|k| k.column))
+    }
+}
+
+/// A declared PRIMARY KEY column supplies the row's key: assigning it would
+/// leave the row under its old key with a different or NULL declared one
+/// (finding vuln-a08). Refused as `_key` is.
+fn refuse_key_assignment(column: &str, declared_key: Option<&str>) -> SqlResult2<()> {
+    if declared_key == Some(column) {
+        return Err(SqlError::unsupported(format!(
+            "UPDATE ... SET {column} = ...: `{column}` is this table's PRIMARY KEY, the row's identity; a new key is a new row (INSERT) and the old one is a DELETE"
+        )));
+    }
+    Ok(())
 }
