@@ -389,6 +389,13 @@ impl<'a> Read<'a> {
         Ok(())
     }
 }
+/// An object's entries in ascending key order, whichever order the map
+/// iterates in (see `json_write`).
+pub(crate) fn sorted_entries(o: &Map<String, Value>) -> Vec<(&String, &Value)> {
+    let mut entries: Vec<(&String, &Value)> = o.iter().collect();
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    entries
+}
 fn json_write(v: &Value, out: &mut Vec<u8>, depth: usize) -> Result<()> {
     if depth > 64 {
         return Err("nesting limit".into());
@@ -423,7 +430,11 @@ fn json_write(v: &Value, out: &mut Vec<u8>, depth: usize) -> Result<()> {
         Value::Object(o) => {
             out.push(8);
             uv(o.len() as u64, out);
-            for (k, v) in o {
+            // Keys in sorted order, whatever order the map iterates in:
+            // `serde_json::Map` keeps INSERTION order when any crate in the
+            // host's build enables `serde_json/preserve_order`, which Cargo
+            // unifies across the whole build.
+            for (k, v) in sorted_entries(o) {
                 blob(k.as_bytes(), out);
                 json_write(v, out, depth + 1)?;
             }
@@ -454,14 +465,14 @@ fn json_read(r: &mut Read<'_>, depth: usize) -> Result<Value> {
         8 => {
             let n = r.count()?;
             let mut o = Map::new();
-            let mut previous: Option<String> = None;
             for _ in 0..n {
                 let k = r.text()?;
-                if previous.as_ref().is_some_and(|p| p >= &k) {
-                    return Err("unordered/duplicate object key".into());
+                // Any order: 0.18.x wrote a host's insertion order when the
+                // host enabled `preserve_order`. A repeated key is still refused.
+                let value = json_read(r, depth + 1)?;
+                if o.insert(k, value).is_some() {
+                    return Err("duplicate object key".into());
                 }
-                previous = Some(k.clone());
-                o.insert(k, json_read(r, depth + 1)?);
             }
             Value::Object(o)
         }
@@ -879,13 +890,13 @@ fn json_skip(r: &mut Read<'_>, depth: usize) -> Result<()> {
         }
         8 => {
             let n = r.count()?;
-            let mut last: Option<&str> = None;
+            let mut seen = std::collections::BTreeSet::new();
             for _ in 0..n {
                 let k = std::str::from_utf8(r.blob()?)?;
-                if last.is_some_and(|p| p >= k) {
-                    return Err("unordered object".into());
+                // Any order (see `json_read`); a repeated key is refused.
+                if !seen.insert(k) {
+                    return Err("duplicate object key".into());
                 }
-                last = Some(k);
                 json_skip(r, depth + 1)?;
             }
         }
@@ -907,13 +918,13 @@ fn json_path(r: &mut Read<'_>, path: &[&str], depth: usize) -> Result<Option<Val
     r.byte()?;
     let n = r.count()?;
     let mut out = None;
-    let mut last: Option<&str> = None;
+    let mut seen = std::collections::BTreeSet::new();
     for _ in 0..n {
         let k = std::str::from_utf8(r.blob()?)?;
-        if last.is_some_and(|p| p >= k) {
-            return Err("unordered object".into());
+        // Any order (see `json_read`); a repeated key is refused.
+        if !seen.insert(k) {
+            return Err("duplicate object key".into());
         }
-        last = Some(k);
         if k == path[0] {
             out = json_path(r, &path[1..], depth + 1)?;
         } else {
