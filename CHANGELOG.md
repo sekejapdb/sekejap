@@ -20,6 +20,26 @@ ORDER BY as PostgreSQL has it, and "load more" in plain SQL.
   LIMIT 20`.
 - **A NOT NULL violation is SQLSTATE `23502`**, in PostgreSQL's words, like
   the missing key already was.
+- **Property graphs are views, and `base` is the default graph.** Two names
+  exist from the start: the schema `public` and the graph `base`, which
+  holds every table and edge in every schema.
+  - An edge table's direction is fixed once, by `CREATE PROPERTY GRAPH` or
+    by `ALTER PROPERTY GRAPH base ADD EDGE TABLES (...)` with no named graph
+    at all; later graphs name the table as it is.
+  - A named graph is a stored definition: `AS` aliases (`usa.city AS
+    usa_city`), several labels, `DEFAULT LABEL`, labels shared across
+    schemas, `CREATE OR REPLACE`, `ALTER ... ADD/DROP VERTEX|EDGE TABLES`,
+    `ALTER ... ALTER VERTEX|EDGE TABLE e ADD/DROP LABEL l`. Any number of
+    graphs may show the same tables; none stores or deletes an edge.
+  - Labels resolve through the graph: in a named graph through its
+    definition, in `base` as a table name in any schema (ambiguous names
+    refused, `"schema.table"` picks one). This fixes vertex labels for
+    tables outside `public`.
+  - Storage: a new catalog tail behind an additive feature bit; a file with
+    a graph from 0.18.0-0.18.2 opens with that graph intact.
+  - **Behaviour change:** in a named graph an unlabeled pattern covers only
+    that graph's tables, and a label outside the graph is refused (it used
+    to read the whole base graph with a notice).
 
 ## 0.18.2
 

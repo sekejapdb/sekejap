@@ -307,9 +307,12 @@ impl Database {
         if source == destination {
             return Err(invalid("SOURCE KEY and DESTINATION KEY name one column: an edge has two ends"));
         }
-        if graph.is_empty() || graph.len() > 255 || graph.eq_ignore_ascii_case("base") {
+        // An empty `graph` is a direction that belongs to no graph: the base
+        // graph's, which is how 0.18.3 fixes one. A name is the pre-0.18.3
+        // record of the graph that declared it (`property_graph.rs`).
+        if graph.len() > 255 || graph.eq_ignore_ascii_case("base") {
             return Err(invalid(format!(
-                "`{graph}` cannot name a property graph: a name is 1..255 bytes and `base` is the default graph's"
+                "`{graph}` cannot name a property graph: a name is at most 255 bytes and `base` is the default graph's"
             )));
         }
         for end in [source, destination] {
@@ -502,44 +505,6 @@ impl Database {
             });
         }
         Ok(out)
-    }
-
-    /// The edge tables property graph `graph` declared, in catalog order:
-    /// empty when no such graph exists.
-    pub fn property_graph_tables(&self, graph: &str) -> Result<Vec<CollectionId>> {
-        let mut out = Vec::new();
-        for (t, c) in self.bound_types()? {
-            let _ = t;
-            if self
-                .catalog(c)?
-                .edge
-                .and_then(|e| e.binding)
-                .is_some_and(|b| b.graph == graph)
-            {
-                out.push(c);
-            }
-        }
-        out.sort();
-        Ok(out)
-    }
-
-    /// `DROP PROPERTY GRAPH`: forget `graph`'s name on every edge table it
-    /// declared. No edge, and no binding, changes (§2.3). Returns how many
-    /// tables it had declared.
-    pub fn drop_property_graph(&mut self, graph: &str) -> Result<usize> {
-        self.user_write()?;
-        let tables = self.property_graph_tables(graph)?;
-        let result = (|| {
-            for c in &tables {
-                let mut catalog = self.catalog(*c)?;
-                if let Some(binding) = catalog.edge.as_mut().and_then(|e| e.binding.as_mut()) {
-                    binding.graph.clear();
-                }
-                self.save_catalog(&catalog)?;
-            }
-            Ok(tables.len())
-        })();
-        self.finish(result)
     }
 
     // ── internals ──────────────────────────────────────────────────────

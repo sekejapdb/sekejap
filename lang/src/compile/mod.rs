@@ -279,10 +279,11 @@ impl Compiler<'_> {
             }
             Stmt::PropertyGraph {
                 name,
-                alter,
+                mode,
                 vertex_tables,
                 edge_tables,
-            } => Plan::Write(self.property_graph(name, alter, vertex_tables, edge_tables)?),
+                alters,
+            } => Plan::Write(self.property_graph(name, mode, vertex_tables, edge_tables, alters)?),
             Stmt::DropPropertyGraph { name, if_exists } => {
                 Plan::Write(WritePlan::DropPropertyGraph { name, if_exists })
             }

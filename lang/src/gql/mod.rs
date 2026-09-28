@@ -51,6 +51,7 @@ mod parse;
 mod registry;
 pub(crate) mod plan;
 mod scalar;
+pub(crate) mod scope;
 pub(crate) mod schema;
 mod stage;
 mod subquery;

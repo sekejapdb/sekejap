@@ -404,12 +404,14 @@ fn the_declaration_persists_and_is_additive() {
     let binding = spec.binding.unwrap();
     assert_eq!((binding.source.as_str(), binding.destination.as_str()), ("a", "s"));
     assert_eq!(db.edge_rows(wrote, &json!({"a": "dhani"}), 256).unwrap().len(), 1);
-    // The graph that declared it is recorded; dropping the graph forgets the
-    // name and keeps the binding and every edge.
-    assert_eq!(db.property_graph_tables("music").unwrap(), [wrote]);
-    assert_eq!(db.drop_property_graph("music").unwrap(), 1);
+    // The graph that declared it is recorded (here the pre-0.18.3 way, as a
+    // name on the edge table); dropping the graph forgets it and keeps the
+    // binding and every edge.
+    let elements = db.property_graph("music").unwrap();
+    assert!(elements.iter().any(|e| e.edge && e.table == wrote), "{elements:?}");
+    db.set_property_graph("music", &[]).unwrap();
     db.commit().unwrap();
-    assert!(db.property_graph_tables("music").unwrap().is_empty());
+    assert!(db.property_graph("music").unwrap().is_empty());
     assert!(db.edge_table(wrote).unwrap().unwrap().binding.is_some());
     assert_eq!(db.edge_rows(wrote, &json!({"a": "dhani"}), 256).unwrap().len(), 1);
 }

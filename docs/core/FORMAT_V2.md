@@ -550,8 +550,14 @@ these persistent tags blindly.
   followed by a tagged value (false, true, i64, f64, text, JSON text; at most
   4096 bytes). It is set only when a table first records a constant, so a
   file with none is unchanged; a binary without the bit refuses one at
-  admission rather than reading byte `5` as damage. The next unclaimed bit
-  is `0x400000`.
+  admission rather than reading byte `5` as damage.
+  `PROPERTY_GRAPH_FEATURE = 0x400000` (2026-09-28) is PROPERTY GRAPH
+  definitions, and the mask is `0x7fffff`: catalog flag bit 7
+  (`CATALOG_GRAPHS`, the flags byte's last free bit) with a versioned
+  MEMBERSHIPS tail -- per table, the graphs it is an element of, its element
+  name, vertex or edge, and its labels (`core/engine/src/index/graph/property_graph.rs`).
+  Set only when a definition is first stored, so a file without one is
+  unchanged. The next unclaimed bit is `0x800000`.
   Every bit in it is
   additive: set in the same transaction as the first record that needs it,
   never cleared, and a file declaring a bit outside the mask is refused as

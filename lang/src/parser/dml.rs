@@ -8,7 +8,7 @@ impl Parser {
             return Err(SqlError::Refused {
                 keyword: "INSERT INTO GRAPH".into(),
                 tier: super::Tier::Two,
-                reason: "QL_CONTRACT §2: an edge is written through its EDGE TABLE, `INSERT INTO t VALUES (...)`, the PostgreSQL 19 / Oracle 23ai / Spanner spelling (docs/core/EDGE_TABLES.md); `INSERT INTO GRAPH` is not adopted.",
+                reason: "QL_CONTRACT §2: an edge is written through its EDGE TABLE, `INSERT INTO t VALUES (...)`, the ISO SQL/PGQ spelling Oracle 23ai and Spanner use (docs/core/EDGE_TABLES.md); `INSERT INTO GRAPH` is not adopted.",
             });
         }
         let table = self.table_name()?;

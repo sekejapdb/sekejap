@@ -27,7 +27,18 @@ impl Parser {
             }
             Some("VIEW") | Some("MATERIALIZED") => Err(refuse::refuse("CREATE VIEW")),
             Some("TRIGGER") => Err(refuse::refuse("CREATE TRIGGER")),
-            Some("PROPERTY") => self.property_graph(false),
+            Some("PROPERTY") => self.property_graph(GraphMode::Create),
+            Some("OR") => {
+                self.bump();
+                self.expect_word("REPLACE")?;
+                match self.word().as_deref() {
+                    Some("PROPERTY") => self.property_graph(GraphMode::CreateOrReplace),
+                    _ => Err(SqlError::unsupported(format!(
+                        "CREATE OR REPLACE {}: OR REPLACE is taken by PROPERTY GRAPH, whose definition holds no data",
+                        self.peek().written()
+                    ))),
+                }
+            }
             Some("TABLE") => self.create_table(),
             Some("INDEX") | Some("UNIQUE") => self.create_index(),
             _ => Err(SqlError::syntax(
@@ -465,7 +476,7 @@ impl Parser {
         self.expect_word("ALTER")?;
         match self.word().as_deref() {
             Some("TABLE") => {}
-            Some("PROPERTY") => return self.property_graph(true),
+            Some("PROPERTY") => return self.property_graph(GraphMode::Alter),
             Some(other) => {
                 return Err(SqlError::unsupported(format!(
                     "ALTER {other}: ALTER TABLE is the catalog's own; there is no other alterable object"
@@ -986,27 +997,90 @@ impl Parser {
         }
     }
 
-    /// `CREATE PROPERTY GRAPH g [VERTEX|NODE TABLES (...)] [EDGE TABLES
-    /// (...)]`, or with `alter` set `ALTER PROPERTY GRAPH g ADD
-    /// {VERTEX|NODE|EDGE} TABLES (...)` (`docs/core/EDGE_TABLES.md` §2). The
-    /// PostgreSQL 19 / Oracle 23ai / Spanner spelling; the clauses that have
-    /// no mapping onto native edges are refused by name.
-    fn property_graph(&mut self, alter: bool) -> SqlResult2<Stmt> {
+    /// `CREATE [OR REPLACE] PROPERTY GRAPH g [VERTEX|NODE TABLES (...)] [EDGE
+    /// TABLES (...)]`, and `ALTER PROPERTY GRAPH g` followed by any of `ADD
+    /// VERTEX|NODE|EDGE TABLES (...)`, `DROP VERTEX|NODE|EDGE TABLES (e, ...)`
+    /// and `ALTER VERTEX|NODE|EDGE TABLE e ADD|DROP LABEL l`
+    /// (`docs/core/EDGE_TABLES.md`). ISO SQL/PGQ as Oracle 23ai and Spanner
+    /// write it; the clauses with no mapping onto native edges are refused by
+    /// name.
+    fn property_graph(&mut self, mode: GraphMode) -> SqlResult2<Stmt> {
         self.expect_word("PROPERTY")?;
         self.expect_word("GRAPH")?;
         let name = self.name()?;
         let mut vertex_tables = Vec::new();
         let mut edge_tables = Vec::new();
+        let mut alters = Vec::new();
+        let edge_word = |p: &mut Self| -> SqlResult2<bool> {
+            match p.word().as_deref() {
+                Some("VERTEX" | "NODE") => {
+                    p.bump();
+                    Ok(false)
+                }
+                Some("EDGE" | "RELATIONSHIP") => {
+                    p.bump();
+                    Ok(true)
+                }
+                _ => Err(SqlError::syntax(
+                    format!("expected VERTEX or EDGE, found `{}`", p.peek().written()),
+                    p.here(),
+                )),
+            }
+        };
         loop {
-            if alter {
+            if mode == GraphMode::Alter {
                 match self.word().as_deref() {
                     Some("ADD") => {
                         self.bump();
                     }
-                    Some(other @ ("DROP" | "ALTER")) => {
-                        return Err(SqlError::unsupported(format!(
-                            "ALTER PROPERTY GRAPH ... {other}: an edge table stays bound to its label once declared (docs/core/EDGE_TABLES.md §2.3); ADD is the form"
-                        )))
+                    Some("DROP") => {
+                        self.bump();
+                        let edge = edge_word(self)?;
+                        self.expect_word("TABLES")?;
+                        self.expect(&Tok::LParen)?;
+                        let mut elements = vec![self.name()?];
+                        while self.eat(&Tok::Comma) {
+                            elements.push(self.name()?);
+                        }
+                        self.expect(&Tok::RParen)?;
+                        if matches!(self.word().as_deref(), Some("CASCADE")) {
+                            return Err(SqlError::unsupported(
+                                "ALTER PROPERTY GRAPH ... DROP ... CASCADE: removing a table from a graph deletes nothing; to delete an edge table's edges use DELETE FROM it",
+                            ));
+                        }
+                        alters.push(GraphAlter::Drop { edge, elements });
+                        continue;
+                    }
+                    Some("ALTER") => {
+                        self.bump();
+                        let edge = edge_word(self)?;
+                        self.expect_word("TABLE")?;
+                        let element = self.graph_element_name()?;
+                        let add = match self.word().as_deref() {
+                            Some("ADD") => true,
+                            Some("DROP") => false,
+                            _ => {
+                                return Err(SqlError::syntax(
+                                    format!("expected ADD LABEL or DROP LABEL, found `{}`", self.peek().written()),
+                                    self.here(),
+                                ))
+                            }
+                        };
+                        self.bump();
+                        self.expect_word("LABEL")?;
+                        let label = self.name()?;
+                        if matches!(self.word().as_deref(), Some("PROPERTIES" | "NO")) {
+                            return Err(SqlError::unsupported(
+                                "a label's PROPERTIES clause: a label shows the table's columns (docs/core/EDGE_TABLES.md §6)",
+                            ));
+                        }
+                        alters.push(GraphAlter::Label {
+                            edge,
+                            element,
+                            label,
+                            add,
+                        });
+                        continue;
                     }
                     _ => break,
                 }
@@ -1017,8 +1091,7 @@ impl Parser {
                     self.expect_word("TABLES")?;
                     self.expect(&Tok::LParen)?;
                     loop {
-                        vertex_tables.push(self.table_name()?);
-                        self.graph_element_tail(false)?;
+                        vertex_tables.push(self.element_decl(false)?);
                         if !self.eat(&Tok::Comma) {
                             break;
                         }
@@ -1030,7 +1103,7 @@ impl Parser {
                     self.expect_word("TABLES")?;
                     self.expect(&Tok::LParen)?;
                     loop {
-                        edge_tables.push(self.edge_table_decl()?);
+                        edge_tables.push(self.element_decl(true)?);
                         if !self.eat(&Tok::Comma) {
                             break;
                         }
@@ -1039,8 +1112,11 @@ impl Parser {
                 }
                 _ => break,
             }
+            if mode != GraphMode::Alter {
+                continue;
+            }
         }
-        if vertex_tables.is_empty() && edge_tables.is_empty() {
+        if vertex_tables.is_empty() && edge_tables.is_empty() && alters.is_empty() {
             return Err(SqlError::syntax(
                 format!(
                     "expected VERTEX TABLES or EDGE TABLES, found `{}`",
@@ -1051,87 +1127,112 @@ impl Parser {
         }
         Ok(Stmt::PropertyGraph {
             name,
-            alter,
+            mode,
             vertex_tables,
             edge_tables,
+            alters,
         })
     }
 
-    /// One edge table: `t [AS a] SOURCE KEY (c) REFERENCES v [(k)]
-    /// DESTINATION KEY (c) REFERENCES v [(k)] [LABEL l]`.
-    fn edge_table_decl(&mut self) -> SqlResult2<EdgeTableDecl> {
+    /// An element's name in an ALTER: its alias, or a table name as written
+    /// (`usa.city`) for an element whose name is the table's.
+    fn graph_element_name(&mut self) -> SqlResult2<String> {
+        let name = self.table_name()?;
+        Ok(name)
+    }
+
+    /// One element table: `t [AS a] [KEY (...)] [SOURCE KEY (c) REFERENCES v
+    /// [(k)] DESTINATION KEY (c) REFERENCES v [(k)]] [LABEL l | DEFAULT
+    /// LABEL] ... [PROPERTIES ARE ALL COLUMNS]`. The ends are an edge
+    /// table's only.
+    fn element_decl(&mut self, edge: bool) -> SqlResult2<ElementDecl> {
         let table = self.table_name()?;
-        self.refuse_element_clause()?;
-        let mut end = |p: &mut Self, word: &str| -> SqlResult2<(String, String)> {
-            p.expect_word(word)?;
-            p.expect_word("KEY")?;
-            p.expect(&Tok::LParen)?;
-            let column = p.name()?;
-            if p.eat(&Tok::Comma) {
-                return Err(SqlError::unsupported(format!(
-                    "{word} KEY with two columns: an end names one row, by its key"
-                )));
-            }
-            p.expect(&Tok::RParen)?;
-            p.expect_word("REFERENCES")?;
-            let target = p.table_name()?;
-            if p.eat(&Tok::LParen) {
-                let key = p.name()?;
-                p.expect(&Tok::RParen)?;
-                if key != "_key" {
+        let alias = if self.eat_word("AS") {
+            Some(self.name()?)
+        } else {
+            None
+        };
+        if self.word().as_deref() == Some("KEY") {
+            return Err(SqlError::unsupported(
+                "KEY (...) on an element table: the table's own key is the element key (docs/core/EDGE_TABLES.md §3)",
+            ));
+        }
+        let ends = if edge && self.word().as_deref() == Some("SOURCE") {
+            let end = |p: &mut Self, word: &str| -> SqlResult2<(String, String)> {
+                p.expect_word(word)?;
+                p.expect_word("KEY")?;
+                p.expect(&Tok::LParen)?;
+                let column = p.name()?;
+                if p.eat(&Tok::Comma) {
                     return Err(SqlError::unsupported(format!(
-                        "{word} KEY ... REFERENCES {target} ({key}): an end names a row by its key, `_key`"
+                        "{word} KEY with two columns: an end names one row, by its key"
                     )));
                 }
-            }
-            Ok((column, target))
+                p.expect(&Tok::RParen)?;
+                p.expect_word("REFERENCES")?;
+                let target = p.table_name()?;
+                if p.eat(&Tok::LParen) {
+                    let key = p.name()?;
+                    p.expect(&Tok::RParen)?;
+                    if key != "_key" {
+                        return Err(SqlError::unsupported(format!(
+                            "{word} KEY ... REFERENCES {target} ({key}): an end names a row by its key, `_key`"
+                        )));
+                    }
+                }
+                Ok((column, target))
+            };
+            let (source, source_table) = end(self, "SOURCE")?;
+            let (destination, destination_table) = end(self, "DESTINATION")?;
+            Some(EdgeEnds {
+                source,
+                source_table,
+                destination,
+                destination_table,
+            })
+        } else {
+            None
         };
-        let (source, source_table) = end(self, "SOURCE")?;
-        let (destination, destination_table) = end(self, "DESTINATION")?;
-        let label = self.graph_element_tail(true)?;
-        Ok(EdgeTableDecl {
-            table,
-            source,
-            source_table,
-            destination,
-            destination_table,
-            label,
-        })
-    }
-
-    /// `AS alias` and `KEY (...)` before an element's ends, refused by name.
-    fn refuse_element_clause(&mut self) -> SqlResult2<()> {
-        match self.word().as_deref() {
-            Some("AS") => Err(SqlError::unsupported(
-                "an element table's alias: a table is its own element here, named by its own name",
-            )),
-            Some("KEY") => Err(SqlError::unsupported(
-                "KEY (...) on an element table: the table's PRIMARY KEY is the element key (docs/core/EDGE_TABLES.md §3)",
-            )),
-            _ => Ok(()),
-        }
-    }
-
-    /// What may follow an element table: one `LABEL l` on an edge table.
-    /// `PROPERTIES`, `NO PROPERTIES`, `DEFAULT LABEL` and a second label are
-    /// refused by name; a vertex table takes none of them.
-    fn graph_element_tail(&mut self, edge: bool) -> SqlResult2<Option<String>> {
-        self.refuse_element_clause()?;
-        let mut label = None;
+        let mut labels = Vec::new();
         loop {
             match self.word().as_deref() {
-                Some("LABEL") if edge && label.is_none() => {
+                Some("LABEL") => {
                     self.bump();
-                    label = Some(self.name()?);
+                    labels.push(LabelDecl::Named(self.name()?));
                 }
-                Some(what @ ("LABEL" | "PROPERTIES" | "NO" | "DEFAULT")) => {
+                Some("DEFAULT") => {
+                    self.bump();
+                    self.expect_word("LABEL")?;
+                    labels.push(LabelDecl::Default);
+                }
+                // Every column is a property already; saying so is accepted.
+                Some("PROPERTIES")
+                    if matches!(self.peek_at(1), Tok::Word(w) if w.eq_ignore_ascii_case("ARE")) =>
+                {
+                    self.bump();
+                    self.bump();
+                    self.expect_word("ALL")?;
+                    self.expect_word("COLUMNS")?;
+                }
+                Some(what @ ("PROPERTIES" | "NO")) => {
                     return Err(SqlError::unsupported(format!(
-                        "`{what}` on a property graph element: the label of an edge table is its own name or one LABEL, the label of a vertex table is its name, and the properties are the table's columns (docs/core/EDGE_TABLES.md §6)"
+                        "`{what}` on a property graph element: a label shows every column of its table (docs/core/EDGE_TABLES.md §6)"
                     )))
                 }
-                _ => return Ok(label),
+                Some("SOURCE" | "DESTINATION") if !edge => {
+                    return Err(SqlError::unsupported(
+                        "SOURCE KEY / DESTINATION KEY on a vertex table: the ends are an edge table's",
+                    ))
+                }
+                _ => break,
             }
         }
+        Ok(ElementDecl {
+            table,
+            alias,
+            ends,
+            labels,
+        })
     }
 
     /// `(a, b, ...)`: a parenthesised list of column names.

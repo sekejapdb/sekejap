@@ -264,22 +264,16 @@ impl GqlPlan {
             floor: 0,
             marks: 0,
         };
+        // The graph this statement names decides what its labels mean
+        // (`scope.rs`), for as long as the body binds.
+        let _scope = super::scope::enter(db, &graph.graph)?;
         let output = planner.pipeline(&graph.body, graph.outer.as_ref(), notices)?;
         reach::choose(&mut planner.ops, &planner.program, &planner.stages);
         let reads_graph = planner.has_edges;
-        // A PROPERTY GRAPH's name reads the base graph: its edge tables write
-        // there (`docs/core/EDGE_TABLES.md` §5.2).
-        let property_graph = !graph.graph.eq_ignore_ascii_case("base")
-            && !db
-                .property_graph_tables(&graph.graph)
-                .map_err(SqlError::from)?
-                .is_empty();
-        if property_graph {
-            notices.push(format!(
-                "property graph `{}` is read as the base graph: a label outside its tables is not refused (docs/core/EDGE_TABLES.md §5.2)",
-                graph.graph
-            ));
-        }
+        // A PROPERTY GRAPH is a view over the base graph: its edge tables
+        // write there (`docs/core/EDGE_TABLES.md` §5.2), and its definition
+        // decided the labels while the body bound.
+        let property_graph = super::scope::named_graph().is_some();
         let context = if graph.graph.eq_ignore_ascii_case("base") || property_graph || !reads_graph {
             ContextRef::Id(GraphContextId::BASE)
         } else {
@@ -935,6 +929,10 @@ impl Planner<'_> {
     fn labels_or_all(&mut self, labels: Option<Box<[CollectionId]>>) -> SqlResult2<Box<[CollectionId]>> {
         if let Some(labels) = labels {
             return Ok(labels);
+        }
+        // An unlabeled node of a named graph is one of its vertex tables.
+        if let Some(vertices) = super::scope::named_vertices() {
+            return Ok(vertices);
         }
         if self.everything.is_none() {
             let mut all = Vec::new();

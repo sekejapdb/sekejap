@@ -1,4 +1,4 @@
-//! EDGE TABLES in SQL (`docs/core/EDGE_TABLES.md`): the PostgreSQL 19,
+//! EDGE TABLES in SQL (`docs/core/EDGE_TABLES.md`): the ISO SQL/PGQ,
 //! Oracle 23ai and Spanner statements for a property graph's edges, each
 //! compiled to one engine call over native edges.
 //!
@@ -15,7 +15,7 @@
 //! Whatever has no such call is refused by name, never emulated.
 
 use super::*;
-use sekejap_core::collections::{EdgeTable, OnConflict};
+use sekejap_core::collections::{EdgeTable, GraphElement, OnConflict, BASE_GRAPH};
 
 /// The most edges one `SELECT` over an edge table reads: one node's edges
 /// of one type. More is an error, never a silent cut.
@@ -200,97 +200,407 @@ impl Compiler<'_> {
         })
     }
 
-    /// `CREATE PROPERTY GRAPH` and `ALTER PROPERTY GRAPH ... ADD` (§2.2).
+    /// `CREATE [OR REPLACE] PROPERTY GRAPH` and `ALTER PROPERTY GRAPH`
+    /// (`docs/core/EDGE_TABLES.md` §2). The statement is applied to the
+    /// graph's current definition in memory and checked whole; what runs is
+    /// the edge tables whose direction is fixed or taken back, and the one
+    /// definition write.
     pub(super) fn property_graph(
         &mut self,
         name: String,
-        alter: bool,
-        vertex_tables: Vec<String>,
-        edge_tables: Vec<EdgeTableDecl>,
+        mode: GraphMode,
+        vertex_tables: Vec<ElementDecl>,
+        edge_tables: Vec<ElementDecl>,
+        alters: Vec<GraphAlter>,
     ) -> SqlResult2<WritePlan> {
-        let exists = !self
-            .db
-            .property_graph_tables(&name)
-            .map_err(SqlError::from)?
-            .is_empty();
-        if alter && !exists {
-            return Err(SqlError::coded(
-                "42704",
-                format!("property graph `{name}` does not exist"),
+        let base = name.eq_ignore_ascii_case(BASE_GRAPH);
+        if base && mode != GraphMode::Alter {
+            return Err(SqlError::unsupported(
+                "`base` is the default graph: it always exists and holds every table and every edge, so it is not created or replaced; change it with ALTER PROPERTY GRAPH base",
             ));
         }
-        if !alter && exists {
-            return Err(SqlError::coded(
-                "42P07",
-                format!("property graph `{name}` already exists"),
-            ));
+        let name = if base { BASE_GRAPH.to_owned() } else { name };
+        let current = self.db.property_graph(&name).map_err(SqlError::from)?;
+        let exists = base || !current.is_empty();
+        match mode {
+            GraphMode::Alter if !exists => {
+                return Err(SqlError::coded("42704", format!("property graph `{name}` does not exist")))
+            }
+            GraphMode::Create if exists => {
+                return Err(SqlError::coded("42P07", format!("property graph `{name}` already exists")))
+            }
+            _ => {}
         }
-        if !alter && edge_tables.is_empty() {
+        if !exists && crate::gql::scope::context_named(self.db, &name)? {
             return Err(SqlError::unsupported(format!(
-                "CREATE PROPERTY GRAPH {name} with no EDGE TABLES: a property graph here is recorded by the edge tables it declares, over the base graph, so one with none has nothing to hold it"
+                "`{name}` already names a graph context, the partition edges are written into through the API; a property graph needs another name"
             )));
         }
-        for vertex in &vertex_tables {
-            let Some(c) = crate::find(self.db, vertex)? else {
-                return Err(SqlError::engine(format!("no table named `{vertex}`")));
-            };
-            if self.db.edge_table(c).map_err(SqlError::from)?.is_some() {
+        let mut elements = if mode == GraphMode::CreateOrReplace { Vec::new() } else { current };
+        let mut binds: Vec<(CollectionId, String, String, String)> = Vec::new();
+        let mut unbinds: Vec<CollectionId> = Vec::new();
+        let mut notices: Vec<String> = Vec::new();
+        for (decl, edge) in vertex_tables
+            .into_iter()
+            .map(|d| (d, false))
+            .chain(edge_tables.into_iter().map(|d| (d, true)))
+        {
+            let (element, bind) = self.graph_element(&decl, edge, base)?;
+            if let Some(bind) = bind {
+                if binds.iter().any(|(c, ..)| *c == element.table) {
+                    return Err(SqlError::unsupported(format!(
+                        "`{}` is named twice in one statement",
+                        decl.table
+                    )));
+                }
+                binds.push(bind);
+            }
+            if base {
+                // Every table is in `base` already: what a statement adds
+                // there is a direction or a label.
+                let named: Vec<String> = decl
+                    .labels
+                    .iter()
+                    .filter_map(|l| match l {
+                        LabelDecl::Named(l) => Some(l.clone()),
+                        LabelDecl::Default => None,
+                    })
+                    .collect();
+                if named.is_empty() {
+                    if !edge {
+                        notices.push(format!(
+                            "ALTER PROPERTY GRAPH base ADD VERTEX TABLES ({}): every table is in the base graph already",
+                            crate::shown_table(&decl.table)
+                        ));
+                    }
+                    continue;
+                }
+                base_labels(&mut elements, element.table, &crate::shown_table(&decl.table), edge, &named, true);
+                continue;
+            }
+            elements.push(element);
+        }
+        for alter in alters {
+            match alter {
+                GraphAlter::Drop { edge, elements: names } => {
+                    for written in names {
+                        if base {
+                            if !edge {
+                                return Err(SqlError::unsupported(
+                                    "a table cannot leave the base graph: `base` holds every table",
+                                ));
+                            }
+                            let Some((c, _)) = self.edge_table_of(&written)? else {
+                                return Err(SqlError::engine(format!(
+                                    "`{}` is not an edge table",
+                                    crate::shown_table(&written)
+                                )));
+                            };
+                            unbinds.push(c);
+                            elements.retain(|e| e.table != c);
+                            continue;
+                        }
+                        let at = self.element_at(&elements, &written, edge, &name)?;
+                        elements.remove(at);
+                    }
+                }
+                GraphAlter::Label {
+                    edge,
+                    element,
+                    label,
+                    add,
+                } => {
+                    if base {
+                        let c = crate::find(self.db, &element)?.ok_or_else(|| {
+                            SqlError::engine(format!("no table named `{}`", crate::shown_table(&element)))
+                        })?;
+                        if !base_labels(&mut elements, c, &crate::shown_table(&element), edge, &[label.clone()], add)
+                            && !add
+                        {
+                            return Err(SqlError::unsupported(format!(
+                                "`{}` has no label `{label}` in the base graph",
+                                crate::shown_table(&element)
+                            )));
+                        }
+                        continue;
+                    }
+                    let at = self.element_at(&elements, &element, edge, &name)?;
+                    let labels = &mut elements[at].labels;
+                    if add {
+                        if !labels.contains(&label) {
+                            labels.push(label);
+                        }
+                    } else {
+                        let before = labels.len();
+                        labels.retain(|l| *l != label);
+                        if labels.len() == before {
+                            return Err(SqlError::unsupported(format!(
+                                "element `{element}` of graph `{name}` has no label `{label}`"
+                            )));
+                        }
+                        if labels.is_empty() {
+                            return Err(SqlError::unsupported(format!(
+                                "DROP LABEL {label}: element `{element}` keeps at least one label; add another first"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        if !base {
+            if elements.is_empty() {
                 return Err(SqlError::unsupported(format!(
-                    "`{vertex}` is an edge table: list it under EDGE TABLES"
+                    "graph `{name}` would have no element left: remove the graph with DROP PROPERTY GRAPH {name}"
+                )));
+            }
+            self.check_graph(&name, &elements, &binds)?;
+        }
+        for notice in notices {
+            self.notices.push(notice);
+        }
+        Ok(WritePlan::PropertyGraph {
+            graph: name,
+            binds,
+            unbinds,
+            elements,
+        })
+    }
+
+    /// One element a statement names: its table, its element name, its
+    /// labels -- and, for an edge table whose direction is not fixed yet, the
+    /// binding to fix. `base` takes an edge table's ends and labels only.
+    fn graph_element(
+        &self,
+        decl: &ElementDecl,
+        edge: bool,
+        base: bool,
+    ) -> SqlResult2<(GraphElement, Option<(CollectionId, String, String, String)>)> {
+        let shown = crate::shown_table(&decl.table);
+        let Some(c) = crate::find(self.db, &decl.table)? else {
+            return Err(SqlError::engine(format!("no table named `{shown}`")));
+        };
+        let edge_table = self.db.edge_table(c).map_err(SqlError::from)?;
+        match (edge, &edge_table) {
+            (false, Some(_)) => {
+                return Err(SqlError::unsupported(format!(
+                    "`{shown}` is an edge table: list it under EDGE TABLES"
+                )))
+            }
+            (true, None) => {
+                return Err(SqlError::unsupported(format!(
+                    "`{shown}` is not an edge table: an edge table is a table whose REFERENCES columns name the rows its edges join"
+                )))
+            }
+            _ => {}
+        }
+        if base && decl.alias.is_some() {
+            return Err(SqlError::unsupported(
+                "AS in the base graph: a table's name there is its own name; a named graph gives it another",
+            ));
+        }
+        let alias = decl
+            .alias
+            .clone()
+            .unwrap_or_else(|| crate::split_table(&decl.table).1.to_owned());
+        let mut labels = Vec::new();
+        for label in &decl.labels {
+            let label = match label {
+                LabelDecl::Default => alias.clone(),
+                LabelDecl::Named(l) => l.clone(),
+            };
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+        if labels.is_empty() {
+            labels.push(alias.clone());
+        }
+        let mut bind = None;
+        if let Some(table) = &edge_table {
+            let reference = |column: &str| table.references.iter().find(|(r, _)| r == column).map(|(_, c)| *c);
+            match (&table.binding, &decl.ends) {
+                (Some(binding), Some(ends)) => {
+                    let matches = binding.source == ends.source
+                        && binding.destination == ends.destination
+                        && reference(&ends.source) == crate::find(self.db, &ends.source_table)?
+                        && reference(&ends.destination) == crate::find(self.db, &ends.destination_table)?;
+                    if !matches {
+                        let name_of = |column: &str| -> SqlResult2<String> {
+                            Ok(match reference(column) {
+                                Some(t) => crate::table_name_of(self.db, t)?,
+                                None => "?".to_owned(),
+                            })
+                        };
+                        return Err(SqlError::unsupported(format!(
+                            "`{shown}`'s direction is fixed: source `{}` ({}), destination `{}` ({}); a graph names it as it is, or without SOURCE KEY and DESTINATION KEY",
+                            binding.source,
+                            name_of(&binding.source)?,
+                            binding.destination,
+                            name_of(&binding.destination)?
+                        )));
+                    }
+                }
+                (Some(_), None) => {}
+                (None, None) => {
+                    return Err(SqlError::unsupported(format!(
+                        "`{shown}` has no direction yet: name its SOURCE KEY and DESTINATION KEY the first time a graph declares it"
+                    )))
+                }
+                (None, Some(ends)) => {
+                    for (column, target, word) in [
+                        (&ends.source, &ends.source_table, "SOURCE"),
+                        (&ends.destination, &ends.destination_table, "DESTINATION"),
+                    ] {
+                        let named = crate::find(self.db, target)?.ok_or_else(|| {
+                            SqlError::engine(format!("no table named `{}`", crate::shown_table(target)))
+                        })?;
+                        match reference(column) {
+                            Some(r) if r == named => {}
+                            Some(_) => {
+                                return Err(SqlError::unsupported(format!(
+                                    "{word} KEY ({column}) REFERENCES {}: `{shown}`.`{column}` references another table",
+                                    crate::shown_table(target)
+                                )))
+                            }
+                            None => {
+                                return Err(SqlError::unsupported(format!(
+                                    "{word} KEY ({column}): `{shown}` declares no REFERENCES on `{column}`, so it names no row"
+                                )))
+                            }
+                        }
+                    }
+                    // The stored edge type: the first label, else the table's
+                    // name, with its schema when it has one, so two schemas'
+                    // same-named edge tables never share a type.
+                    let first = decl.labels.iter().find_map(|l| match l {
+                        LabelDecl::Named(l) => Some(l.clone()),
+                        LabelDecl::Default => None,
+                    });
+                    let bare = first.unwrap_or_else(|| crate::split_table(&decl.table).1.to_owned());
+                    let (schema, _) = crate::split_table(&decl.table);
+                    let edge_type = if schema == sekejap_core::collections::PUBLIC_SCHEMA {
+                        bare
+                    } else {
+                        format!("{schema}.{bare}")
+                    };
+                    bind = Some((c, ends.source.clone(), ends.destination.clone(), edge_type));
+                }
+            }
+        }
+        Ok((
+            GraphElement {
+                table: c,
+                alias,
+                edge,
+                labels,
+            },
+            bind,
+        ))
+    }
+
+    /// The element an ALTER names: by its element name, or by the table it
+    /// shows when that is unambiguous.
+    fn element_at(&self, elements: &[GraphElement], written: &str, edge: bool, graph: &str) -> SqlResult2<usize> {
+        let kind = if edge { "edge" } else { "vertex" };
+        if let Some(at) = elements.iter().position(|e| e.edge == edge && e.alias == written) {
+            return Ok(at);
+        }
+        if let Some(c) = crate::find(self.db, written)? {
+            let found: Vec<usize> = elements
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.edge == edge && e.table == c)
+                .map(|(at, _)| at)
+                .collect();
+            if found.len() == 1 {
+                return Ok(found[0]);
+            }
+        }
+        Err(SqlError::unsupported(format!(
+            "graph `{graph}` has no {kind} table `{}`",
+            crate::shown_table(written)
+        )))
+    }
+
+    /// A named graph's definition, checked whole: element names unique, an
+    /// edge's ends among the graph's vertex tables, and a label shared by
+    /// several tables showing the same properties on each.
+    fn check_graph(
+        &self,
+        graph: &str,
+        elements: &[GraphElement],
+        binds: &[(CollectionId, String, String, String)],
+    ) -> SqlResult2<()> {
+        let shown = |c: CollectionId| crate::table_name_of(self.db, c);
+        for (at, element) in elements.iter().enumerate() {
+            if let Some(other) = elements[..at].iter().find(|o| o.alias == element.alias) {
+                return Err(SqlError::unsupported(format!(
+                    "graph `{graph}` has two elements named `{}` ({} and {}): give one of them another name with AS",
+                    element.alias,
+                    shown(other.table)?,
+                    shown(element.table)?
                 )));
             }
         }
-        let mut binds = Vec::with_capacity(edge_tables.len());
-        for edge in edge_tables {
-            let Some((c, table)) = self.edge_table_of(&edge.table)? else {
-                return Err(SqlError::unsupported(format!(
-                    "`{}` is not an edge table: an edge table is a table whose REFERENCES columns name the rows its edges join",
-                    edge.table
-                )));
+        // An edge's ends must be vertex tables of the same graph.
+        for element in elements.iter().filter(|e| e.edge) {
+            let table = self.db.edge_table(element.table).map_err(SqlError::from)?.expect("an edge element");
+            let (source, destination) = match (&table.binding, binds.iter().find(|b| b.0 == element.table)) {
+                (Some(binding), _) => (binding.source.clone(), binding.destination.clone()),
+                (None, Some((_, s, d, _))) => (s.clone(), d.clone()),
+                (None, None) => continue,
             };
-            if table.binding.is_some() {
-                return Err(SqlError::unsupported(format!(
-                    "`{}` is already declared by a property graph: an edge table has one label, for good (docs/core/EDGE_TABLES.md §2.3)",
-                    edge.table
-                )));
-            }
-            for (column, target, word) in [
-                (&edge.source, &edge.source_table, "SOURCE"),
-                (&edge.destination, &edge.destination_table, "DESTINATION"),
-            ] {
-                let named = crate::find(self.db, target)?
-                    .ok_or_else(|| SqlError::engine(format!("no table named `{target}`")))?;
-                match table.references.iter().find(|(r, _)| r == column) {
-                    Some((_, c)) if *c == named => {}
-                    Some(_) => {
-                        return Err(SqlError::unsupported(format!(
-                            "{word} KEY ({column}) REFERENCES {target}: `{}`.`{column}` references another table",
-                            edge.table
-                        )))
-                    }
-                    None => {
-                        return Err(SqlError::unsupported(format!(
-                            "{word} KEY ({column}): `{}` declares no REFERENCES on `{column}`, so it names no row",
-                            edge.table
-                        )))
-                    }
-                }
-                if !alter && !vertex_tables.iter().any(|v| v == target) {
+            for end in [source, destination] {
+                let Some((_, target)) = table.references.iter().find(|(r, _)| *r == end) else {
+                    continue;
+                };
+                if !elements.iter().any(|e| !e.edge && e.table == *target) {
                     return Err(SqlError::unsupported(format!(
-                        "{word} KEY ... REFERENCES {target}: `{target}` is not among the graph's VERTEX TABLES"
+                        "edge table `{}` reaches `{}`, which is not among graph `{graph}`'s VERTEX TABLES: list it, or remove `{}` from the graph",
+                        element.alias,
+                        shown(*target)?,
+                        element.alias
                     )));
                 }
             }
-            let label = edge
-                .label
-                .clone()
-                .unwrap_or_else(|| crate::split_table(&edge.table).1.to_owned());
-            binds.push((c, edge.source, edge.destination, label));
         }
-        self.notices.push(format!(
-            "property graph `{name}` is a definition over the base graph: GRAPH_TABLE ({name} ...) walks the base graph, and a label outside the graph's tables is not refused (docs/core/EDGE_TABLES.md §5.2)"
-        ));
-        Ok(WritePlan::BindEdgeTables { graph: name, binds })
+        // A shared label shows the same properties on every table.
+        let properties = |element: &GraphElement| -> SqlResult2<Vec<String>> {
+            let info = self.db.collection_info(element.table).map_err(SqlError::from)?;
+            let mut out: Vec<String> = info.layout.fields.iter().map(|(n, _)| n.clone()).collect();
+            if element.edge {
+                if let Some(table) = self.db.edge_table(element.table).map_err(SqlError::from)? {
+                    out.retain(|n| !table.references.iter().any(|(r, _)| r == n));
+                }
+            }
+            out.sort();
+            Ok(out)
+        };
+        for (at, element) in elements.iter().enumerate() {
+            for label in &element.labels {
+                for other in elements[..at].iter().filter(|o| o.edge == element.edge && o.labels.contains(label)) {
+                    let (mine, theirs) = (properties(element)?, properties(other)?);
+                    if mine != theirs {
+                        let odd = mine
+                            .iter()
+                            .find(|p| !theirs.contains(p))
+                            .map(|p| (p.clone(), element.alias.clone(), other.alias.clone()))
+                            .or_else(|| {
+                                theirs
+                                    .iter()
+                                    .find(|p| !mine.contains(p))
+                                    .map(|p| (p.clone(), other.alias.clone(), element.alias.clone()))
+                            })
+                            .unwrap_or_default();
+                        return Err(SqlError::unsupported(format!(
+                            "label `{label}` would show `{}` on `{}` and not on `{}`: a label shared by several tables shows the same properties on each",
+                            odd.0, odd.1, odd.2
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `INSERT INTO <edge table>` (§4.1, §4.2).
@@ -524,4 +834,46 @@ impl Compiler<'_> {
             limit: select.limit,
         })
     }
+}
+
+/// Add or remove base-graph labels on table `c`; its element there holds
+/// only the labels a statement gave it (its own name is always a label).
+/// Returns whether anything changed.
+fn base_labels(
+    elements: &mut Vec<GraphElement>,
+    c: CollectionId,
+    shown: &str,
+    edge: bool,
+    labels: &[String],
+    add: bool,
+) -> bool {
+    let at = match elements.iter().position(|e| e.table == c) {
+        Some(at) => at,
+        None if add => {
+            elements.push(GraphElement {
+                table: c,
+                alias: shown.to_owned(),
+                edge,
+                labels: Vec::new(),
+            });
+            elements.len() - 1
+        }
+        None => return false,
+    };
+    let held = &mut elements[at].labels;
+    let before = held.clone();
+    for label in labels {
+        if add {
+            if !held.contains(label) {
+                held.push(label.clone());
+            }
+        } else {
+            held.retain(|l| l != label);
+        }
+    }
+    let changed = *held != before;
+    if elements[at].labels.is_empty() {
+        elements.remove(at);
+    }
+    changed
 }

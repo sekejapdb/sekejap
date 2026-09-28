@@ -127,6 +127,9 @@ pub use crate::index::graph::{
     EdgeShape, EdgeTypeId, GraphContextId, NeighborRequest, NewEdge, TraversalNode,
     TraversalResult, EDGE_ID_FEATURE,
 };
+pub use crate::index::graph::property_graph::{
+    GraphElement, GraphMembership, BASE_GRAPH, PROPERTY_GRAPH_FEATURE,
+};
 pub use crate::index::graph::edge_table::{
     EdgeBinding, EdgeTable, EdgeTableRow, OnConflict, EDGE_TABLE_FEATURE, FOREIGN_KEY_VIOLATION,
     NOT_NULL_VIOLATION, UNIQUE_VIOLATION,
@@ -297,7 +300,7 @@ impl Clock for SystemClock {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Catalog {
-    id: CollectionId,
+    pub(crate) id: CollectionId,
     pub(crate) name: String,
     pub(crate) layout: u32,
     timestamps: bool,
@@ -318,6 +321,10 @@ pub(crate) struct Catalog {
     pub(crate) edge: Option<crate::index::graph::edge_table::EdgeTableRecord>,
     /// See [`CollectionInfo::key`]. Behind flag bit 6 ([`CATALOG_KEY`]).
     pub(crate) key: Option<KeySpec>,
+    /// The property graphs this table is an element of
+    /// (`index/graph/property_graph.rs`). Behind flag bit 7
+    /// ([`CATALOG_GRAPHS`]), behind `PROPERTY_GRAPH_FEATURE` at admission.
+    pub(crate) graphs: Vec<crate::index::graph::property_graph::GraphMembership>,
     /// `Some` exactly while `begin_drop_collection` has published a DROPPING
     /// mark that `drop_collection_step` has not yet finished. It is the
     /// committed cursor of the drop: the phase it reached and how many
@@ -821,6 +828,9 @@ pub(crate) const CATALOG_EDGE: u8 = 32;
 /// Bit 6: the record carries a KEY tail ([`KeySpec`]). The second line behind
 /// [`KEY_SPEC_FEATURE`].
 pub(crate) const CATALOG_KEY: u8 = 64;
+/// Bit 7 of the frozen flags byte, its last: the record carries a GRAPH
+/// MEMBERSHIPS tail. Behind [`crate::index::graph::property_graph::PROPERTY_GRAPH_FEATURE`].
+pub(crate) const CATALOG_GRAPHS: u8 = 128;
 /// The logical feature bit that says this file's catalog records at least one
 /// table's key declaration ([`KeySpec`]). Additive and monotone like every
 /// bit before it: a file that never declares a key column or a key default
@@ -861,7 +871,8 @@ fn catalog_bytes(c: &Catalog) -> Result<Vec<u8>> {
             | if c.rules.is_empty() { 0 } else { CATALOG_RULES }
             | if c.schema.is_none() { 0 } else { CATALOG_SCHEMA }
             | if c.edge.is_none() { 0 } else { CATALOG_EDGE }
-            | if c.key.is_none() { 0 } else { CATALOG_KEY },
+            | if c.key.is_none() { 0 } else { CATALOG_KEY }
+            | if c.graphs.is_empty() { 0 } else { CATALOG_GRAPHS },
     );
     if let Some(d) = c.drop {
         b.push(d.phase.byte());
@@ -873,6 +884,7 @@ fn catalog_bytes(c: &Catalog) -> Result<Vec<u8>> {
         && c.schema.is_none()
         && c.edge.is_none()
         && c.key.is_none()
+        && c.graphs.is_empty()
     {
         b.extend_from_slice(c.name.as_bytes());
     } else {
@@ -918,6 +930,9 @@ fn catalog_bytes(c: &Catalog) -> Result<Vec<u8>> {
         if let Some(key) = &c.key {
             column_rules::encode_key_spec(&mut b, key)?;
         }
+        if !c.graphs.is_empty() {
+            crate::index::graph::property_graph::encode_memberships(&mut b, &c.graphs)?;
+        }
     }
     packet(CATALOG_MAGIC, &b)
 }
@@ -931,7 +946,8 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
                 | CATALOG_RULES
                 | CATALOG_SCHEMA
                 | CATALOG_EDGE
-                | CATALOG_KEY)
+                | CATALOG_KEY
+                | CATALOG_GRAPHS)
             != 0
     {
         return Err(corrupt("catalog fields"));
@@ -957,7 +973,9 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
     let mut schema = None;
     let mut edge = None;
     let mut key = None;
-    let name = if b[8] & (CATALOG_DECLARED | CATALOG_RULES | CATALOG_SCHEMA | CATALOG_EDGE | CATALOG_KEY)
+    let mut graphs = Vec::new();
+    let name = if b[8]
+        & (CATALOG_DECLARED | CATALOG_RULES | CATALOG_SCHEMA | CATALOG_EDGE | CATALOG_KEY | CATALOG_GRAPHS)
         == 0
     {
         std::str::from_utf8(&b[at..]).map_err(corrupt)?.to_owned()
@@ -1002,6 +1020,11 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
         if b[8] & CATALOG_KEY != 0 {
             key = Some(column_rules::decode_key_spec(|n| read(n).map(<[u8]>::to_vec))?);
         }
+        if b[8] & CATALOG_GRAPHS != 0 {
+            graphs = crate::index::graph::property_graph::decode_memberships(|n| {
+                read(n).map(<[u8]>::to_vec)
+            })?;
+        }
         if at != b.len() {
             return Err(corrupt("catalog declared type tail"));
         }
@@ -1021,6 +1044,7 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
         schema,
         edge,
         key,
+        graphs,
     })
 }
 /// The kernel's own `E4LIMIT1` record: a damaged one is corruption, a valid
@@ -1050,7 +1074,9 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
 /// `0x100000` KEY declarations -- the catalog's key tail ([`KEY_SPEC_FEATURE`]).
 /// `0x200000` CONSTANT column defaults
 /// ([`column_rules::CONSTANT_DEFAULT_FEATURE`]).
-/// The mask is therefore `0x3fffff`.
+/// `0x400000` PROPERTY GRAPH definitions -- the catalog's memberships tail
+/// ([`crate::index::graph::property_graph::PROPERTY_GRAPH_FEATURE`]).
+/// The mask is therefore `0x7fffff`.
 /// Every one is additive: set in the same transaction as the first record
 /// that uses it, never cleared, and a file that declares a bit outside this
 /// mask is refused as `Unsupported` at admission (Law 8).
@@ -1082,6 +1108,7 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | crate::index::graph::edge_table::EDGE_TABLE_FEATURE
     | KEY_SPEC_FEATURE
     | column_rules::CONSTANT_DEFAULT_FEATURE
+    | crate::index::graph::property_graph::PROPERTY_GRAPH_FEATURE
     | catalog::JSON_EXPRESSION_FEATURE
     | SCHEMA_FEATURE
     | crate::index::graph::EDGE_ID_FEATURE;
@@ -1896,6 +1923,7 @@ impl Database {
             schema,
             edge: None,
             key: None,
+            graphs: Vec::new(),
         };
         let result = (|| {
             // The feature bit rides the same transaction as the first record
@@ -3231,7 +3259,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x3fffff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x7fffff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -3252,7 +3280,7 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0x3fffff
+            0x7fffff
         );
         // A bit outside the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
@@ -3260,11 +3288,12 @@ mod tests {
         // graph (`0x8000`) and the JSON-path expression index (`0x10000`)
         // landed together, named schemas took `0x20000` and edge identity
         // `0x40000`, so the mask is contiguous through bit 18 and the first
-        // unclaimed bit is `0x400000` (edge tables took `0x80000`, key
-        // declarations `0x100000`, constant defaults `0x200000`).
+        // unclaimed bit is `0x800000` (edge tables took `0x80000`, key
+        // declarations `0x100000`, constant defaults `0x200000`, property
+        // graph definitions `0x400000`).
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x400000)),
-            Err(Error::Unsupported(m)) if m.contains("0x7fffff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x800000)),
+            Err(Error::Unsupported(m)) if m.contains("0xffffff")
         ));
     }
     /// Law 8 for the live row count, the same shape the declared-type bit's
@@ -3295,9 +3324,9 @@ mod tests {
             Err(Error::Unsupported(m)) if m.contains("0x2001")
         ));
         // And a bit past every implemented family is refused by this build
-        // too. `0x200000` is constant defaults now, so the probe is `0x400000`.
+        // too. `0x400000` is property graphs now, so the probe is `0x800000`.
         assert!(matches!(
-            admit_features(1 | 0x400000, SUPPORTED_LOGICAL_FEATURES),
+            admit_features(1 | 0x800000, SUPPORTED_LOGICAL_FEATURES),
             Err(Error::Unsupported(_))
         ));
     }
@@ -3391,6 +3420,7 @@ mod tests {
             schema: None,
             edge: None,
             key: None,
+            graphs: Vec::new(),
             id: CollectionId(1),
             name: "t".into(),
             layout: 1,

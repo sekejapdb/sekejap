@@ -1,4 +1,4 @@
-//! Edge tables in SQL (`docs/core/EDGE_TABLES.md`): the PostgreSQL 19,
+//! Edge tables in SQL (`docs/core/EDGE_TABLES.md`): the ISO SQL/PGQ,
 //! Oracle 23ai and Spanner way of writing a property graph's edges --
 //! `CREATE TABLE` with `REFERENCES`, `CREATE PROPERTY GRAPH ... EDGE TABLES`,
 //! then plain `INSERT`, `UPDATE`, `DELETE` and `SELECT` -- over native edges.

@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 pub(crate) mod adjacency;
 pub(crate) mod edge_table;
+pub mod property_graph;
 pub mod endpoints;
 
 pub(crate) const GRAPH_FEATURE: u64 = 2;

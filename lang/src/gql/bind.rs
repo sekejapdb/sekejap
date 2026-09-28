@@ -231,7 +231,11 @@ pub(super) fn edge_occurrence(
     notices: &mut Vec<String>,
 ) -> SqlResult2<EdgeOcc> {
     let (types, label) = match &edge.label {
-        None => (None, None),
+        // In a named graph an unlabeled hop crosses the graph's own edges.
+        None => (
+            super::scope::named_edge_types(db)?.map(|ids| ids.into_iter().map(TypeRef::Id).collect()),
+            None,
+        ),
         Some(label) => {
             let (types, written) = edge_types(db, label, notices)?;
             (Some(types), Some(written))
@@ -338,13 +342,19 @@ fn label_names(label: &LabelExpr, out: &mut Vec<String>) {
     }
 }
 
+/// The tables a vertex label names, through the graph in scope
+/// (`scope.rs`).
 fn node_labels(db: &Database, label: &LabelExpr) -> SqlResult2<Labels> {
     let mut names = Vec::new();
     label_names(label, &mut names);
-    let ids = names
-        .iter()
-        .map(|name| crate::collection(db, name))
-        .collect::<SqlResult2<Vec<_>>>()?;
+    let mut ids: Vec<CollectionId> = Vec::new();
+    for name in &names {
+        for id in super::scope::vertex_label(db, name)? {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
     Ok(Labels {
         ids: ids.into(),
         written: names.join("|"),
@@ -362,15 +372,15 @@ fn edge_types(
     let written = names.join("|");
     let mut types = Vec::new();
     for name in names {
-        types.push(match db.edge_type(&name).map_err(SqlError::from)? {
-            Some(id) => TypeRef::Id(id),
+        match super::scope::edge_label(db, &name)? {
+            Some(ids) => types.extend(ids.into_iter().map(TypeRef::Id)),
             None => {
                 notices.push(format!(
                     "edge type `{name}` has no edge yet: the hop matches nothing until one is written, and the name is looked up again each time the statement runs"
                 ));
-                TypeRef::Named(name)
+                types.push(TypeRef::Named(name));
             }
-        });
+        }
     }
     Ok((types, written))
 }

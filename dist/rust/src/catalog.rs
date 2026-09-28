@@ -38,10 +38,11 @@ pub struct EdgeTableInfo {
     pub references: Vec<(String, String)>,
     /// The primary key's columns; empty for a table without one.
     pub key: Vec<String>,
-    /// The source and destination columns and their tables, the label the
-    /// edges carry, and the property graph that declared them -- all `None`
-    /// until a property graph declares the table. `graph` is `None` again
-    /// once that graph is dropped; the rest stay.
+    /// The source and destination columns and their tables and the label
+    /// (edge type) the edges carry -- `None` until the table's direction is
+    /// fixed, by a property graph or by `ALTER PROPERTY GRAPH base`. `graph`
+    /// is the first property graph, by name, that shows the table as an edge
+    /// table, and `None` when only `base` does.
     pub source: Option<String>,
     pub source_table: Option<String>,
     pub destination: Option<String>,

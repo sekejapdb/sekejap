@@ -665,7 +665,7 @@ impl Db {
             let info = db.collection_info(id)?;
             let edge = match db.edge_table(id)? {
                 None => None,
-                Some(table) => Some(edge_info(db, table)?),
+                Some(table) => Some(edge_info(db, id, table)?),
             };
             // An edge table has no `_key`: its ends name the rows it joins.
             let mut fields = if edge.is_some() {
@@ -1148,7 +1148,11 @@ fn table_name(db: &Database, id: CollectionId) -> Result<String> {
     Ok(shown_name(&info.schema, &info.name))
 }
 
-fn edge_info(db: &Database, table: sekejap_core::collections::EdgeTable) -> Result<EdgeTableInfo> {
+fn edge_info(
+    db: &Database,
+    c: CollectionId,
+    table: sekejap_core::collections::EdgeTable,
+) -> Result<EdgeTableInfo> {
     let mut references = Vec::with_capacity(table.references.len());
     for (column, target) in &table.references {
         references.push((column.clone(), table_name(db, *target)?));
@@ -1167,7 +1171,8 @@ fn edge_info(db: &Database, table: sekejap_core::collections::EdgeTable) -> Resu
             Some(binding.destination.clone()),
             end_table(&binding.destination),
             Some(db.edge_type_name(binding.edge_type)?),
-            (!binding.graph.is_empty()).then(|| binding.graph.clone()),
+            // The first property graph (by name) that shows the table.
+            db.graphs_of(c)?.into_iter().next(),
         ),
     };
     Ok(EdgeTableInfo {

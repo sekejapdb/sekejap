@@ -268,10 +268,11 @@ fn an_edge_table_writes_edges_in_sql() {
         tourist TEXT REFERENCES tourists, place TEXT REFERENCES restaurants,
         rating REAL, PRIMARY KEY (tourist, place)
     )"));
-    run(&db, readme("CREATE PROPERTY GRAPH bali
-        VERTEX TABLES (tourists, restaurants)
-        EDGE TABLES (visited SOURCE KEY (tourist) REFERENCES tourists (_key)
-                             DESTINATION KEY (place) REFERENCES restaurants (_key))"));
+    // Before its direction is fixed an edge table takes no row.
+    assert!(db.execute("INSERT INTO visited VALUES ('chloe', 'warung-sunset', 4.5)", &[]).is_err());
+    run(&db, readme("ALTER PROPERTY GRAPH base ADD EDGE TABLES (
+        visited SOURCE KEY (tourist) REFERENCES tourists (_key)
+                DESTINATION KEY (place) REFERENCES restaurants (_key))"));
     // The README creates the restaurant first; this file's fixture already
     // holds it, with its geometry, so the statement is only checked present.
     readme("INSERT INTO restaurants (_key, name, area) VALUES ('warung-sunset', 'Warung Sunset', 'Seminyak')");
@@ -285,10 +286,27 @@ fn an_edge_table_writes_edges_in_sql() {
     assert!(taken.unwrap_err().to_string().contains("23505"));
     let missing = db.execute("INSERT INTO visited VALUES ('chloe', 'no-such-place', 3.0)", &[]);
     assert!(missing.unwrap_err().to_string().contains("23503"));
-    let rows = query(&db, "SELECT * FROM GRAPH_TABLE (bali MATCH
+    let rows = query(&db, "SELECT * FROM GRAPH_TABLE (base MATCH
         (t:tourists WHERE t._key = 'chloe')-[v:visited]->(r:restaurants)
         RETURN r.name AS name, v.rating AS rating)");
     assert_eq!(texts(&rows, "name"), ["Warung Sunset"]);
+    // The named view: the fixed edge table is named without its ends, and a
+    // table is reached under the element name `AS` gave it.
+    run(&db, readme("CREATE PROPERTY GRAPH dining
+        VERTEX TABLES (tourists AS guest, restaurants)
+        EDGE TABLES (visited)"));
+    let rows = query(&db, readme("SELECT *
+    FROM GRAPH_TABLE (dining MATCH
+        (g:guest)-[v:visited]->(r:restaurants)
+        RETURN g.name AS guest, r.name AS restaurant, v.rating AS rating)"));
+    assert_eq!(texts(&rows, "restaurant"), ["Warung Sunset"]);
+    assert_eq!(column(&rows, "rating"), [json!(4.5)]);
+    // Contrast: in `dining` the tourists table is `guest`, not `tourists`.
+    let renamed = db.query(
+        "SELECT * FROM GRAPH_TABLE (dining MATCH (t:tourists)-[v:visited]->(r) RETURN r.name AS name)",
+        &[],
+    );
+    assert!(renamed.unwrap_err().to_string().contains("tourists"));
 }
 
 #[test]

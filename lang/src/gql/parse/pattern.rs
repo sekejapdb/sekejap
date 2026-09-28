@@ -337,7 +337,15 @@ impl Parser {
         match self.peek() {
             Tok::Bang => Err(refuse::gql_refuse("label negation")),
             Tok::Percent => Err(refuse::gql_refuse("label wildcard")),
-            _ => Ok(LabelExpr::Name(self.gql_spelled("a label")?)),
+            _ => {
+                let name = self.gql_spelled("a label")?;
+                if matches!(self.peek(), Tok::Dot) {
+                    return Err(SqlError::unsupported(format!(
+                        "`{name}.`: a label is not schema-qualified; the schema belongs in the graph's definition, which gives the table its label (in the base graph, quote the table: \"{name}.table\")"
+                    )));
+                }
+                Ok(LabelExpr::Name(name))
+            }
         }
     }
 }

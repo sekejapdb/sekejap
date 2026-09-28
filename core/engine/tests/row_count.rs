@@ -605,9 +605,9 @@ fn a_file_declaring_a_bit_this_binary_does_not_implement_is_unsupported() {
         let key = [0, 0, copy];
         let mut header = raw.get(&key).unwrap().unwrap();
         let features = u64::from_be_bytes(header[18..26].try_into().unwrap());
-        // `0x200000` is constant defaults; `0x400000` is the first bit no
+        // `0x400000` is property graphs; `0x800000` is the first bit no
         // release has.
-        header[18..26].copy_from_slice(&(features | 0x400000).to_be_bytes());
+        header[18..26].copy_from_slice(&(features | 0x800000).to_be_bytes());
         let end = header.len() - 4;
         let checksum = crc32c::crc32c(&header[..end]).to_le_bytes();
         header[end..].copy_from_slice(&checksum);

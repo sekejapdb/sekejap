@@ -720,13 +720,51 @@ pub(super) struct SelectStmt {
 /// One edge table of a `CREATE PROPERTY GRAPH`: which column is the source,
 /// which the destination, the tables they name, and the label.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct EdgeTableDecl {
+pub(super) struct ElementDecl {
     pub(super) table: String,
+    /// `AS alias`: the element name, else the table name without its schema.
+    pub(super) alias: Option<String>,
+    /// An edge table's `SOURCE KEY ... DESTINATION KEY ...`: required the
+    /// first time its direction is fixed, optional (and checked) after.
+    pub(super) ends: Option<EdgeEnds>,
+    /// `LABEL l` and `DEFAULT LABEL`, in order; empty is the default label.
+    pub(super) labels: Vec<LabelDecl>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct EdgeEnds {
     pub(super) source: String,
     pub(super) source_table: String,
     pub(super) destination: String,
     pub(super) destination_table: String,
-    pub(super) label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum LabelDecl {
+    /// `DEFAULT LABEL`: the element name as a label.
+    Default,
+    Named(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum GraphMode {
+    Create,
+    CreateOrReplace,
+    Alter,
+}
+
+/// One `ALTER PROPERTY GRAPH` action other than an ADD.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum GraphAlter {
+    /// `DROP VERTEX|EDGE TABLES (element, ...)`.
+    Drop { edge: bool, elements: Vec<String> },
+    /// `ALTER VERTEX|EDGE TABLE element ADD|DROP LABEL l`.
+    Label {
+        edge: bool,
+        element: String,
+        label: String,
+        add: bool,
+    },
 }
 
 /// `ON CONFLICT (target) DO NOTHING` or `DO UPDATE SET c = EXCLUDED.c, ...`.
@@ -902,11 +940,15 @@ pub(super) enum Stmt {
     /// `CREATE PROPERTY GRAPH g VERTEX TABLES (...) EDGE TABLES (...)`, and
     /// `ALTER PROPERTY GRAPH g ADD ...` with `alter` set
     /// (`docs/core/EDGE_TABLES.md` §2).
+    /// `CREATE [OR REPLACE] PROPERTY GRAPH` and `ALTER PROPERTY GRAPH`: the
+    /// tables named under `VERTEX|NODE TABLES` / `EDGE TABLES` (added, for an
+    /// ALTER), and an ALTER's other actions.
     PropertyGraph {
         name: String,
-        alter: bool,
-        vertex_tables: Vec<String>,
-        edge_tables: Vec<EdgeTableDecl>,
+        mode: GraphMode,
+        vertex_tables: Vec<ElementDecl>,
+        edge_tables: Vec<ElementDecl>,
+        alters: Vec<GraphAlter>,
     },
     DropPropertyGraph {
         name: String,

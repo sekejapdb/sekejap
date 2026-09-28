@@ -126,6 +126,26 @@ go get github.com/sekejapdb/sekejap/dist/bindings/wrappers/go
 
 ---
 
+## Names and defaults
+
+Two names exist from the start, and neither can be dropped:
+
+| Name | What it is |
+|---|---|
+| `public` (schema) | Where a table goes when you name no schema: `CREATE TABLE tourists` is `public.tourists`. `CREATE SCHEMA bali` makes another; its tables are written `bali.places`. |
+| `base` (graph) | Every table and every edge, in every schema. `GRAPH_TABLE (base MATCH ...)` works with no setup. |
+
+Edges live in three layers:
+
+1. **`base` stores every edge once.** Nothing else holds edges.
+2. **An edge table is how SQL writes edges.** It is a table whose
+   `REFERENCES` columns name the two rows an edge joins; its direction (which
+   column is the source) is fixed once, and `INSERT`/`DELETE` go through it.
+3. **A named property graph is an optional view** (`CREATE PROPERTY GRAPH`):
+   chosen tables under names and labels of your own, as Oracle and Spanner
+   write it. Any number of them may show the same tables; changing or
+   dropping one never touches an edge.
+
 ## A first look
 
 The examples below all use the same small dataset: some tourists, the flights
@@ -293,12 +313,12 @@ db.query("""
 A pattern usually starts at one row, named by its key, and walks out from
 it; with no key predicate it starts by scanning the collection instead.
 
-Edges can also be written in SQL, the way PostgreSQL, Oracle and Spanner
-write a property graph's edges: an **edge table** whose `REFERENCES` columns
-name the two rows an edge joins, declared in a property graph, then plain
+Edges can also be written in SQL, the way ISO SQL/PGQ (Oracle, Spanner)
+writes a property graph's edges: an **edge table** whose `REFERENCES` columns
+name the two rows an edge joins, its direction fixed once, then plain
 `INSERT`, `UPDATE`, `DELETE` and `SELECT`. Its `PRIMARY KEY` decides how many
 edges one pair may have, and a taken key is refused as in PostgreSQL. It is a
-view over the graph's own edges, not a table of rows
+door onto the graph's own edges, not a table of rows
 ([edge tables](docs/core/EDGE_TABLES.md)).
 
 ```python
@@ -309,16 +329,33 @@ db.execute("""
         rating REAL, PRIMARY KEY (tourist, place)
     )
 """)
+# Fix which end is the source, once -- in the base graph, no named graph needed.
 db.execute("""
-    CREATE PROPERTY GRAPH bali
-        VERTEX TABLES (tourists, restaurants)
-        EDGE TABLES (visited SOURCE KEY (tourist) REFERENCES tourists (_key)
-                             DESTINATION KEY (place) REFERENCES restaurants (_key))
+    ALTER PROPERTY GRAPH base ADD EDGE TABLES (
+        visited SOURCE KEY (tourist) REFERENCES tourists (_key)
+                DESTINATION KEY (place) REFERENCES restaurants (_key))
 """)
 db.execute("INSERT INTO restaurants (_key, name, area) VALUES ('warung-sunset', 'Warung Sunset', 'Seminyak')")
 db.execute("INSERT INTO visited VALUES ('chloe', 'warung-sunset', 4.5)")
 db.query("SELECT place, rating FROM visited WHERE tourist = 'chloe'")
 # → { place: "warung-sunset", rating: 4.5 }
+```
+
+A named property graph is a view with names of your own over chosen tables.
+Once an edge table's direction is fixed, a graph just names it:
+
+```python
+db.execute("""
+    CREATE PROPERTY GRAPH dining
+        VERTEX TABLES (tourists AS guest, restaurants)
+        EDGE TABLES (visited)
+""")
+db.query("""
+    SELECT *
+    FROM GRAPH_TABLE (dining MATCH
+        (g:guest)-[v:visited]->(r:restaurants)
+        RETURN g.name AS guest, r.name AS restaurant, v.rating AS rating)
+""")
 ```
 
 Graph queries follow ISO GQL: each matching path is one row, so a place

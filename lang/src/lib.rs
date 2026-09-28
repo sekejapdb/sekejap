@@ -1214,6 +1214,17 @@ pub(crate) fn index_stem(name: &str) -> String {
 }
 
 /// The collection a recorded name refers to, if there is one.
+/// A table's name as a statement writes it: bare in `public`, `schema.table`
+/// elsewhere.
+pub(crate) fn table_name_of(db: &Database, c: CollectionId) -> SqlResult2<String> {
+    let info = db.collection_info(c).map_err(SqlError::from)?;
+    Ok(if info.schema == sekejap_core::collections::PUBLIC_SCHEMA {
+        info.name
+    } else {
+        format!("{}.{}", info.schema, info.name)
+    })
+}
+
 pub(crate) fn find(db: &Database, name: &str) -> SqlResult2<Option<CollectionId>> {
     let (schema, table) = split_table(name);
     db.collection_in(schema, table).map_err(SqlError::from)

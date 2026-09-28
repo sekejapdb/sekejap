@@ -912,9 +912,14 @@ pub(crate) enum WritePlan {
         key: Vec<String>,
     },
     /// `CREATE/ALTER PROPERTY GRAPH`: one `bind_edge_table` per edge table.
-    BindEdgeTables {
+    /// A property graph statement: the edge tables whose direction is
+    /// fixed (table, source, destination, edge type) or taken back, then the
+    /// graph's whole definition, written once.
+    PropertyGraph {
         graph: String,
         binds: Vec<(CollectionId, String, String, String)>,
+        unbinds: Vec<CollectionId>,
+        elements: Vec<sekejap_core::collections::GraphElement>,
     },
     DropPropertyGraph {
         name: String,
@@ -1044,18 +1049,45 @@ impl WritePlan {
                 db.commit()?;
                 SqlResult::Affected(0)
             }
-            Self::BindEdgeTables { graph, binds } => {
-                for (c, source, destination, label) in &binds {
-                    db.bind_edge_table(*c, source, destination, label, &graph)?;
+            Self::PropertyGraph {
+                graph,
+                binds,
+                unbinds,
+                elements,
+            } => {
+                for (c, source, destination, edge_type) in &binds {
+                    db.bind_edge_table(*c, source, destination, edge_type, "")?;
                 }
+                for c in &unbinds {
+                    db.unbind_edge_table(*c)?;
+                }
+                db.set_property_graph(&graph, &elements)?;
                 db.commit()?;
                 notice(format!(
-                    "CREATE PROPERTY GRAPH {graph}: {} edge table(s) declared",
-                    binds.len()
+                    "property graph `{graph}`: {} element(s){}{}",
+                    elements.len(),
+                    if binds.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {} edge table direction(s) fixed", binds.len())
+                    },
+                    if unbinds.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {} taken back", unbinds.len())
+                    }
                 ))
             }
             Self::DropPropertyGraph { name, if_exists } => {
-                let dropped = db.drop_property_graph(&name)?;
+                if name.eq_ignore_ascii_case(sekejap_core::collections::BASE_GRAPH) {
+                    return Err(SqlError::unsupported(
+                        "`base` is the default graph: it always exists and holds every edge, so it is not dropped",
+                    ));
+                }
+                let dropped = db.property_graph(&name)?.len();
+                if dropped != 0 {
+                    db.set_property_graph(&name, &[])?;
+                }
                 if dropped == 0 {
                     if !if_exists {
                         return Err(SqlError::coded(
