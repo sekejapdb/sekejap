@@ -55,13 +55,11 @@ impl<'a> Binder<'a> {
         Ok(match literal {
             Literal::Null => Value::Null,
             Literal::Bool(b) => Value::Bool(*b),
-            Literal::Num(v, exact) => {
-                if *exact && v.fract() == 0.0 && v.abs() < 9.0e18 {
-                    Value::from(*v as i64)
-                } else {
-                    Value::from(*v)
-                }
-            }
+            // The exact integer as written (finding vuln-a05), else the float.
+            Literal::Num(v, exact) => match exact {
+                Some(integer) => Value::from(*integer),
+                None => Value::from(*v),
+            },
             Literal::Str(s) => Value::String(s.clone()),
             Literal::Param(n) => match self.param(*n)? {
                 Param::Null => Value::Null,

@@ -581,7 +581,7 @@ impl Planner<'_> {
         }
         let items = select.items.clone();
         let positional = |expr: &mut Expr, clause: &str| -> SqlResult2<()> {
-            let Expr::Literal(Literal::Num(n, true)) = expr else {
+            let Expr::Literal(Literal::Num(n, Some(_))) = expr else {
                 return Ok(());
             };
             let item = (*n >= 1.0)

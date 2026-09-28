@@ -389,8 +389,8 @@ impl Parser {
     fn gql_count(&mut self, clause: &str) -> SqlResult2<Count> {
         let at = self.here();
         match self.bump() {
-            Tok::Num(n, true) if (0.0..INEXACT_FROM).contains(&n) => Ok(Count::Lit(n as u64)),
-            Tok::Num(n, true) if n >= INEXACT_FROM => Err(SqlError::syntax(
+            Tok::Num(n, Some(_)) if (0.0..INEXACT_FROM).contains(&n) => Ok(Count::Lit(n as u64)),
+            Tok::Num(n, Some(_)) if n >= INEXACT_FROM => Err(SqlError::syntax(
                 format!("{clause} {n} is not below 2^53, where a literal count is read exactly; bind it as a parameter (`{clause} $1`), which reaches 9223372036854775807"),
                 at,
             )),

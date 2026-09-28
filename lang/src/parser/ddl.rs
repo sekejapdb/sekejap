@@ -372,10 +372,10 @@ impl Parser {
             Tok::Num(n, integral) => {
                 self.bump();
                 let n = if negative { -n } else { n };
-                let value = if integral {
-                    serde_json::Value::from(n as i64)
-                } else {
-                    serde_json::Value::from(n)
+                let integral = if negative { integral.and_then(i64::checked_neg) } else { integral };
+                let value = match integral {
+                    Some(integer) => serde_json::Value::from(integer),
+                    None => serde_json::Value::from(n),
                 };
                 return Ok(Some(DefaultValue::Constant(value)));
             }
@@ -692,7 +692,7 @@ impl Parser {
             "VECTOR" => {
                 self.expect(&Tok::LParen)?;
                 let dimensions = match self.bump() {
-                    Tok::Num(n, true) if n > 0.0 => n as usize,
+                    Tok::Num(n, Some(_)) if n > 0.0 => n as usize,
                     other => {
                         return Err(SqlError::syntax(
                             format!("VECTOR needs a positive dimension, found `{}`", other.written()),

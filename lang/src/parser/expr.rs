@@ -1773,7 +1773,7 @@ impl Parser {
                     "ST_ASEWKB" => GeoFunc::AsEwkb(order(&option)?),
                     "ST_ASGEOJSON" => GeoFunc::AsGeoJson(match option {
                         None => 9,
-                        Some(Tok::Num(n, true)) if (0.0..=15.0).contains(&n) => n as usize,
+                        Some(Tok::Num(n, Some(_))) if (0.0..=15.0).contains(&n) => n as usize,
                         Some(other) => {
                             return Err(SqlError::unsupported(format!(
                                 "st_asgeojson(g, {}): maxdecimaldigits is a whole number from 0 to 15; the options argument is not carried",
@@ -1873,7 +1873,7 @@ impl Parser {
     fn literal_no_cast(&mut self) -> SqlResult2<Literal> {
         if self.eat(&Tok::Minus) {
             return match self.literal_no_cast()? {
-                Literal::Num(value, exact) => Ok(Literal::Num(-value, exact)),
+                Literal::Num(value, exact) => Ok(Literal::Num(-value, exact.and_then(i64::checked_neg))),
                 other => Err(SqlError::unsupported(format!(
                     "unary minus applies to a number, not to {other:?}"
                 ))),
@@ -1912,7 +1912,7 @@ impl Parser {
     fn literal_inner(&mut self) -> SqlResult2<Literal> {
         if self.eat(&Tok::Minus) {
             return match self.literal()? {
-                Literal::Num(value, exact) => Ok(Literal::Num(-value, exact)),
+                Literal::Num(value, exact) => Ok(Literal::Num(-value, exact.and_then(i64::checked_neg))),
                 other => Err(SqlError::unsupported(format!(
                     "unary minus applies to a number, not to {other:?}"
                 ))),

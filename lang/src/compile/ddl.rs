@@ -527,7 +527,7 @@ impl Compiler<'_> {
         let literal = match value {
             Value::String(text) => Literal::Str(text.clone()),
             Value::Bool(b) => Literal::Bool(*b),
-            Value::Number(n) => Literal::Num(n.as_f64().unwrap_or(f64::NAN), n.is_i64()),
+            Value::Number(n) => Literal::Num(n.as_f64().unwrap_or(f64::NAN), n.as_i64()),
             other => {
                 return Err(SqlError::unsupported(format!(
                     "DEFAULT {other} on `{}`: a constant is a string, number or boolean literal",

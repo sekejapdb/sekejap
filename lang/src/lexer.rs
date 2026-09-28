@@ -18,7 +18,7 @@ pub(super) enum Tok {
     Str(String),
     /// A numeric literal and whether it was written without a fraction or
     /// exponent, which is what decides an Int from a Real at compile time.
-    Num(f64, bool),
+    Num(f64, Option<i64>),
     /// `$n`, one-based, as PostgreSQL numbers parameters.
     Param(usize),
     Star,
@@ -380,6 +380,10 @@ fn number(text: &str, bytes: &[u8], i: &mut usize, at: usize) -> SqlResult2<Tok>
     let value: f64 = text[start..j]
         .parse()
         .map_err(|_| SqlError::syntax("number literal is out of range", at))?;
+    // An integer literal keeps every digit: parsed from its text, never
+    // through the `f64` above, which rounds past 2^53 (finding vuln-a05).
+    // One too large for i64 stays a float.
+    let integer = if exact { text[start..j].parse::<i64>().ok() } else { None };
     *i = j;
-    Ok(Tok::Num(value, exact))
+    Ok(Tok::Num(value, integer))
 }

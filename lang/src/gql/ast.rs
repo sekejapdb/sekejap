@@ -290,7 +290,7 @@ pub(crate) enum Literal {
     Bool(bool),
     /// A number and whether it was written without a fraction or an
     /// exponent, as the SQL lexer reports it.
-    Num(f64, bool),
+    Num(f64, Option<i64>),
     Str(String),
 }
 
@@ -951,8 +951,8 @@ impl fmt::Display for Literal {
             Self::Bool(false) => f.write_str("FALSE"),
             // An exact number prints as the integer it is; an inexact one
             // keeps its fraction (`1.0`), so the two stay distinguishable.
-            Self::Num(value, true) => write!(f, "{value}"),
-            Self::Num(value, false) => write!(f, "{value:?}"),
+            Self::Num(_, Some(integer)) => write!(f, "{integer}"),
+            Self::Num(value, None) => write!(f, "{value:?}"),
             Self::Str(text) => write!(f, "'{}'", text.replace('\'', "''")),
         }
     }

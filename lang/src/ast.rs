@@ -36,7 +36,7 @@ pub(super) enum Literal {
     Null,
     Bool(bool),
     /// A number and whether it was written without a fraction or an exponent.
-    Num(f64, bool),
+    Num(f64, Option<i64>),
     Str(String),
     Param(usize),
     /// `(SELECT col FROM t WHERE _key = <literal>)` -- a scalar subquery,
@@ -1101,13 +1101,10 @@ impl Literal {
         match self {
             Self::Null => "NULL".into(),
             Self::Bool(b) => if *b { "TRUE" } else { "FALSE" }.into(),
-            Self::Num(value, exact) => {
-                if *exact {
-                    format!("{}", *value as i64)
-                } else {
-                    format!("{value}")
-                }
-            }
+            Self::Num(value, exact) => match exact {
+                Some(integer) => format!("{integer}"),
+                None => format!("{value}"),
+            },
             Self::Str(text) => format!("'{text}'"),
             Self::Param(n) => format!("${n}"),
             Self::Subquery(_) => "(SELECT ...)".into(),
