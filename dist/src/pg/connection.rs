@@ -990,56 +990,18 @@ impl<'a> Connection<'a> {
         let budget = self.budget();
         let cancel = self.cancel.clone();
         let interrupt = self.service.interrupt_handle();
+        let mut cancelled = || cancel.is_cancelled() || interrupt.is_cancelled();
+        // Inside a `BEGIN` block the read goes through the held writer, so
+        // it sees the block's own uncommitted writes, as PostgreSQL's does
+        // (finding vuln-a14). Outside one it reads this connection's
+        // snapshot.
+        if let Some(txn) = self.txn.as_mut() {
+            let db: &Database = txn.database();
+            return walk_on(db, sql, params, body, formats, budget, &mut cancelled);
+        }
         self.refresh_reader()?;
         let snapshot = self.reader.as_ref().expect("refresh_reader mints one");
-
-        snapshot.with(|db| {
-            let db: &Database = db;
-            let mut cancelled = || cancel.is_cancelled() || interrupt.is_cancelled();
-            let prepared = sekejap_lang::prepare_sql_with(db, sql, params, budget, &mut cancelled)
-                .map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
-
-            if prepared.is_select() || prepared.is_aggregate() {
-                let fields = apply_formats(&field_descriptions(db, &prepared), formats);
-                let paged = if prepared.is_aggregate() {
-                    prepared.for_each_group_with(db, PAGE_ROWS, budget, &mut cancelled, &mut |row| {
-                        body(row, &fields)
-                    })
-                } else {
-                    prepared.for_each_row_with(db, PAGE_ROWS, budget, &mut cancelled, &mut |row| {
-                        body(row, &fields)
-                    })
-                };
-                paged.map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
-                return Ok(fields);
-            }
-
-            // EXPLAIN and the notice families: one answer, not a walk.
-            match prepared.run(db) {
-                Ok(SqlResult::Rows { columns, rows }) => {
-                    let fields = apply_formats(
-                        &columns.iter().map(|name| text_field(name)).collect::<Vec<_>>(),
-                        formats,
-                    );
-                    for row in &rows {
-                        body(row, &fields)
-                            .map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
-                    }
-                    Ok(fields)
-                }
-                Ok(SqlResult::Explain(text)) | Ok(SqlResult::Notice(text)) => {
-                    let fields = apply_formats(&[text_field("QUERY PLAN")], formats);
-                    let row = SqlRow {
-                        id: EntityId::NO_OWNER,
-                        values: vec![SqlValue::Text(text)],
-                    };
-                    body(&row, &fields).map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
-                    Ok(fields)
-                }
-                Ok(SqlResult::Affected(_)) => Ok(Vec::new()),
-                Err(e) => Err(types::wire_error(&ServiceError::Sql(e))),
-            }
-        })
+        snapshot.with(|db| walk_on(db, sql, params, body, formats, budget, &mut cancelled))
     }
 
     /// Run a statement through the service's single WRITER, committing it
@@ -1649,6 +1611,62 @@ fn emit_outcome(out: &mut Vec<u8>, outcome: Outcome, formats: &[i16], describe: 
         }
         Outcome::Command(tag) => f::command_complete(out, &tag),
         Outcome::Empty => f::empty_query_response(out),
+    }
+}
+
+/// One read statement over `db`: a SELECT or aggregate paged into `body`,
+/// or EXPLAIN / a notice as one row. `Connection::walk` picks the `db`.
+fn walk_on(
+    db: &Database,
+    sql: &str,
+    params: &[Param],
+    body: &mut dyn FnMut(&SqlRow, &[FieldDescription]) -> Result<(), SqlError>,
+    formats: &[i16],
+    budget: QueryBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Vec<FieldDescription>, WireError> {
+    let prepared = sekejap_lang::prepare_sql_with(db, sql, params, budget, cancelled)
+        .map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
+
+    if prepared.is_select() || prepared.is_aggregate() {
+        let fields = apply_formats(&field_descriptions(db, &prepared), formats);
+        let paged = if prepared.is_aggregate() {
+            prepared.for_each_group_with(db, PAGE_ROWS, budget, cancelled, &mut |row| {
+                body(row, &fields)
+            })
+        } else {
+            prepared.for_each_row_with(db, PAGE_ROWS, budget, cancelled, &mut |row| {
+                body(row, &fields)
+            })
+        };
+        paged.map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
+        return Ok(fields);
+    }
+
+    // EXPLAIN and the notice families: one answer, not a walk.
+    match prepared.run(db) {
+        Ok(SqlResult::Rows { columns, rows }) => {
+            let fields = apply_formats(
+                &columns.iter().map(|name| text_field(name)).collect::<Vec<_>>(),
+                formats,
+            );
+            for row in &rows {
+                body(row, &fields)
+                    .map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
+            }
+            Ok(fields)
+        }
+        Ok(SqlResult::Explain(text)) | Ok(SqlResult::Notice(text)) => {
+            let fields = apply_formats(&[text_field("QUERY PLAN")], formats);
+            let row = SqlRow {
+                id: EntityId::NO_OWNER,
+                values: vec![SqlValue::Text(text)],
+            };
+            body(&row, &fields).map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
+            Ok(fields)
+        }
+        Ok(SqlResult::Affected(_)) => Ok(Vec::new()),
+        Err(e) => Err(types::wire_error(&ServiceError::Sql(e))),
     }
 }
 

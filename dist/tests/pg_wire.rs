@@ -1447,3 +1447,26 @@ fn a_streamed_answer_reaches_the_sink_while_it_runs() {
     assert_eq!(tag(&got), "SELECT 5000");
     assert_eq!(got.last().map(|f| f.typ), Some(b'Z'));
 }
+
+/// Finding vuln-a14 (0.18.5): inside a `BEGIN` block, writes went to the
+/// held writer while every SELECT read the published snapshot, so a block
+/// never saw its own inserts or updates. A block reads its own writes, as
+/// PostgreSQL's does; another connection still sees none of them until
+/// COMMIT.
+#[test]
+fn a_transaction_reads_its_own_writes() {
+    let fixture = build(4);
+    let mut one = connect(&fixture.service, 1);
+    let mut two = connect(&fixture.service, 2);
+    let name_of = |connection: &mut Connection<'_>, id: &str| -> Vec<Vec<Option<String>>> {
+        rows_of(&ask(connection, &format!("SELECT name FROM place WHERE id = '{id}'")))
+    };
+    assert!(first(&ask(&mut one, "BEGIN"), b'E').is_none());
+    assert!(first(&ask(&mut one, "INSERT INTO place (id, name, n, born, alive) VALUES ('k900000', 'new', 900000, 1, true)"), b'E').is_none());
+    assert!(first(&ask(&mut one, "UPDATE place SET name = 'renamed' WHERE id = 'k000001'"), b'E').is_none());
+    assert_eq!(name_of(&mut one, "k900000"), [[Some("new".to_owned())]], "the block sees its insert");
+    assert_eq!(name_of(&mut one, "k000001"), [[Some("renamed".to_owned())]], "the block sees its update");
+    assert!(name_of(&mut two, "k900000").is_empty(), "another connection sees nothing uncommitted");
+    assert!(first(&ask(&mut one, "COMMIT"), b'E').is_none());
+    assert_eq!(name_of(&mut two, "k900000"), [[Some("new".to_owned())]]);
+}

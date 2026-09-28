@@ -427,14 +427,16 @@ Three things this states rather than implies:
    `ROLLBACK` after one does not undo it. PostgreSQL's DDL is transactional;
    sekejap's is not, and there is no savepoint to make it so.
 
-A read takes THIS connection's own snapshot handle
-(`ServiceDatabase::open_reader`), re-minted when the service publishes a new
-generation — so two connections walk at once instead of taking turns on one
-published handle, at the cost of one reader slot each (`OPS_CONTRACT` §1
-bounds them). `sekejap-pg` sets the publish interval to **zero** by default,
-because a wire client expects to read its own writes on the next statement;
-that costs one snapshot mint per commit, and `--publish-interval <ms>` buys
-it back.
+Inside a `BEGIN` block a read goes through the held writer, so the block
+sees its own uncommitted writes, as in PostgreSQL; no other connection sees
+them before `COMMIT`. Outside a block a read takes THIS connection's own
+snapshot handle (`ServiceDatabase::open_reader`), re-minted when the service
+publishes a new generation — so two connections walk at once instead of
+taking turns on one published handle, at the cost of one reader slot each
+(`OPS_CONTRACT` §1 bounds them). `sekejap-pg` sets the publish interval to
+**zero** by default, because a wire client expects to read its own writes on
+the next statement; that costs one snapshot mint per commit, and
+`--publish-interval <ms>` buys it back.
 
 ---
 
