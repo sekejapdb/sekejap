@@ -18,6 +18,7 @@ path = "src/lib.rs"
 kernel = { package = "sekejap-kernel", path = "../kernel", version = "0.18.3" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 crc32c = "0.6"
+memchr = "2"
 getrandom = "0.4"
 geographiclib-rs = { version = "=0.2.7", default-features = false }
 

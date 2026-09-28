@@ -22,6 +22,10 @@
 //!   indexes and graph then answer, and still refuses what the release
 //!   refused (`a_release_file_takes_writes_and_reopens`).
 //!
+//! * `REINDEX DATABASE` on a copy -- the upgrader's rebuild -- keeps every
+//!   answer, every row identity and the feature word
+//!   (`a_release_file_reindexes_to_the_same_answers`).
+//!
 //! Not here: an OLDER binary reading the file after this build wrote to it
 //! (`L8-COMPAT` remaining, `docs/core/RELEASE_FIXTURES.md`).
 
@@ -264,6 +268,27 @@ fn a_release_file_takes_writes_and_reopens() {
             let (_, rows) = answer(&mut db, sql);
             let want: Vec<Value> = want.iter().map(|k| serde_json::json!([k])).collect();
             assert_eq!(rows, want, "{}: `{sql}`", label(&fx));
+        }
+        verify(&fx);
+    }
+}
+
+#[test]
+fn a_release_file_reindexes_to_the_same_answers() {
+    for fx in fixtures() {
+        let copy = copy(&fx);
+        let mut db = Database::open(copy.path(), cfg()).unwrap();
+        db.sql("REINDEX DATABASE", &[])
+            .unwrap_or_else(|e| panic!("{}: REINDEX DATABASE: {e}", label(&fx)));
+        let (recorded, now) = features(&fx, &db);
+        assert_eq!(now, recorded, "{}: REINDEX changed the feature word", label(&fx));
+        drop(db);
+        let mut db = Database::open(copy.path(), cfg()).unwrap();
+        for query in expected(&fx) {
+            let sql = query["sql"].as_str().unwrap();
+            let (columns, rows) = answer(&mut db, sql);
+            assert_eq!(columns, query["columns"], "{}: `{sql}` columns", label(&fx));
+            assert_eq!(rows, query["rows"].as_array().unwrap().clone(), "{}: after REINDEX: `{sql}`", label(&fx));
         }
         verify(&fx);
     }

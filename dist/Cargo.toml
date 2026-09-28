@@ -56,6 +56,9 @@ required-features = ["dev-bench"]
 [[bin]]
 name = "sekejap-pg"
 path = "src/cli/pg_server.rs"
+[[bin]]
+name = "sekejap-upgrade"
+path = "src/cli/upgrade.rs"
 
 [dependencies]
 sekejap-core = { path = "../core/engine", version = "0.18.3" }

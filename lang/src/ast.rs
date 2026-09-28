@@ -1053,6 +1053,11 @@ pub(super) enum Stmt {
         if_exists: bool,
     },
     /// `CREATE SCHEMA [IF NOT EXISTS] name` (QL_CONTRACT §2).
+    /// `REINDEX { INDEX | TABLE | SCHEMA | DATABASE } [CONCURRENTLY] name`.
+    Reindex {
+        target: ReindexTarget,
+        concurrently: bool,
+    },
     /// `CREATE EXTENSION [IF NOT EXISTS] name`.
     CreateExtension {
         name: String,
@@ -1244,4 +1249,15 @@ impl RowExpr {
             Self::Geo { func, arg } => format!("{}({})", func.written(), arg.written()),
         }
     }
+}
+
+/// What a `REINDEX` names.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum ReindexTarget {
+    Index(String),
+    Table(String),
+    Schema(String),
+    Database,
+    /// PostgreSQL's system catalogs: there are none to rebuild here.
+    System,
 }

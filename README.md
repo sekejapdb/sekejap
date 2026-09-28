@@ -71,7 +71,9 @@ extra to enable at build time. These are functions your app calls, in your app's
 own process — which is why it is still an embedded database.
 
 To reach a database from another machine, use the command-line tool: `sekejap-pg`
-so PostgreSQL clients can connect. See [`docs/dist/WIRE_CONTRACT.md`](docs/dist/WIRE_CONTRACT.md)
+so PostgreSQL clients can connect. To bring an older database's indexes up to the
+current format, on purpose, run `REINDEX` or `sekejap-upgrade --check` / `--apply`
+([`docs/core/UPGRADE.md`](docs/core/UPGRADE.md)). See [`docs/dist/WIRE_CONTRACT.md`](docs/dist/WIRE_CONTRACT.md)
 for what it answers.
 
 ---

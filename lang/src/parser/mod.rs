@@ -550,6 +550,40 @@ impl Parser {
             "CREATE" => self.create(),
             "ALTER" => self.alter(),
             "DROP" => self.drop(),
+            // `REINDEX [ (VERBOSE) ] { INDEX | TABLE | SCHEMA | DATABASE }
+            // [ CONCURRENTLY ] name`, PostgreSQL's spelling.
+            "REINDEX" => {
+                self.bump();
+                if self.eat(&Tok::LParen) {
+                    self.expect_word("VERBOSE")?;
+                    self.expect(&Tok::RParen)?;
+                }
+                let at = self.here();
+                let kind = self.word().ok_or_else(|| SqlError::syntax("expected INDEX, TABLE, SCHEMA or DATABASE", at))?;
+                self.bump();
+                let concurrently = self.eat_word("CONCURRENTLY");
+                let target = match kind.as_str() {
+                    "INDEX" => ReindexTarget::Index(self.name()?),
+                    "TABLE" => ReindexTarget::Table(self.table_name()?),
+                    "SCHEMA" => ReindexTarget::Schema(self.name()?),
+                    "DATABASE" => {
+                        // PostgreSQL names the database it is connected to;
+                        // one handle is one database, so a name is optional.
+                        if !matches!(self.peek(), Tok::Eof | Tok::Semicolon) {
+                            self.name()?;
+                        }
+                        ReindexTarget::Database
+                    }
+                    "SYSTEM" => ReindexTarget::System,
+                    other => {
+                        return Err(SqlError::syntax(
+                            format!("expected INDEX, TABLE, SCHEMA or DATABASE after REINDEX, found `{other}`"),
+                            at,
+                        ))
+                    }
+                };
+                Ok(Stmt::Reindex { target, concurrently })
+            }
             "BEGIN" => {
                 self.bump();
                 // `docs/dist/OPS_CONTRACT.md` §7: e4 spells the bulk scope

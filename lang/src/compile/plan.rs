@@ -921,6 +921,15 @@ pub(crate) enum WritePlan {
         index: IndexId,
         name: String,
     },
+    /// `REINDEX`: rebuild each index into the current format beside itself,
+    /// swap the names in one commit, drop the old in bounded steps. The
+    /// collections named have any index a crashed run left DROPPING
+    /// finished first.
+    Reindex {
+        collections: Vec<CollectionId>,
+        indexes: Vec<IndexId>,
+        notice: Option<String>,
+    },
     /// `CREATE SCHEMA`: one record, `Database::create_schema`.
     CreateSchema { name: String },
     /// `DROP SCHEMA`: `Database::drop_schema`, which refuses a schema that
@@ -1484,6 +1493,32 @@ impl WritePlan {
                 db.commit()?;
                 SqlResult::Affected(0)
             }
+            Self::Reindex {
+                collections,
+                indexes,
+                notice,
+            } => {
+                db.commit()?;
+                for &c in &collections {
+                    for info in db.list_indexes(c)? {
+                        if info.state == IndexState::Dropping {
+                            while !db.drop_index_step(info.id, 256)? {}
+                            db.commit()?;
+                        }
+                    }
+                }
+                for &index in &indexes {
+                    reindex_one(db, index)?;
+                }
+                let mut said = format!(
+                    "REINDEX: rebuilt {} index(es) in this build's format; answers are unchanged",
+                    indexes.len()
+                );
+                if let Some(notice) = notice {
+                    said = format!("{notice}; {said}");
+                }
+                SqlResult::Notice(said)
+            }
             Self::DropIndex { index, name } => {
                 db.commit()?;
                 db.begin_drop_index(index)?;
@@ -1545,6 +1580,66 @@ impl WritePlan {
 /// usable index and so does this: the build is incremental underneath
 /// (`build_index_step`) and is run to the end here rather than left
 /// half-built.
+/// The `CREATE INDEX` that builds `info` again: same family, field,
+/// expression, uniqueness and analyzer.
+fn compiled_index_of(info: &IndexInfo) -> CompiledIndex {
+    let field = info.field.clone();
+    match info.family {
+        IndexFamily::Scalar => match &info.expression {
+            None => CompiledIndex::Scalar {
+                field,
+                unique: info.unique,
+            },
+            Some(IndexExpr::Lower) => CompiledIndex::LowerScalar { field },
+            Some(IndexExpr::JsonText(member)) => CompiledIndex::JsonScalar {
+                field,
+                member: member.clone(),
+            },
+        },
+        IndexFamily::Text if info.analyzer == Some(TextAnalyzer::Trigram) => {
+            CompiledIndex::Trigram { field }
+        }
+        IndexFamily::Text => CompiledIndex::Text { field },
+        IndexFamily::SpatialPoint => CompiledIndex::Point { field },
+        IndexFamily::SpatialGeometry => CompiledIndex::Geometry { field },
+        IndexFamily::ExactVector => CompiledIndex::ExactVector { field },
+        IndexFamily::QuantizedVector => CompiledIndex::QuantizedVector { field },
+        IndexFamily::VamanaGraph => CompiledIndex::VamanaGraph { field },
+    }
+}
+
+/// One index rebuilt beside itself (`WritePlan::Reindex`). Each step commits,
+/// so an interrupted run leaves either the old index whole (and, perhaps, a
+/// temporary one the next run drops first) or the new one named and the old
+/// one DROPPING (which the next run finishes).
+fn reindex_one(db: &mut Database, old: IndexId) -> SqlResult2<()> {
+    let info = db.index_info(old)?;
+    if info.state != IndexState::Ready {
+        return Ok(());
+    }
+    let c = info.collection;
+    let temporary = format!("__reindex_{}", old.0);
+    if let Some(stale) = db.list_indexes(c)?.into_iter().find(|i| i.name == temporary) {
+        if stale.state != IndexState::Dropping {
+            db.begin_drop_index(stale.id)?;
+        }
+        while !db.drop_index_step(stale.id, 256)? {}
+        db.commit()?;
+    }
+    build_index(db, c, &temporary, &compiled_index_of(&info))?;
+    let new = db
+        .list_indexes(c)?
+        .into_iter()
+        .find(|i| i.name == temporary)
+        .ok_or_else(|| SqlError::engine("the rebuilt index vanished before its swap"))?
+        .id;
+    db.swap_index_names(old, new)?;
+    db.commit()?;
+    while !db.drop_index_step(old, 256)? {}
+    db.commit()?;
+    Ok(())
+}
+
 fn build_index(
     db: &mut Database,
     collection: CollectionId,

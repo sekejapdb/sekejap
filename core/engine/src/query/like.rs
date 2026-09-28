@@ -12,10 +12,26 @@
 //! classic wildcard walk, which backtracks only to the last `%`.
 
 /// One compiled `LIKE` pattern.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct LikeMatcher {
     shape: Shape,
     insensitive: bool,
+    /// `Contains`' needle, compiled once: the SIMD substring search
+    /// (`memchr::memmem`) the row check runs per row.
+    finder: Option<memchr::memmem::Finder<'static>>,
+}
+
+impl PartialEq for LikeMatcher {
+    fn eq(&self, other: &Self) -> bool {
+        // The finder is derived from the shape.
+        self.shape == other.shape && self.insensitive == other.insensitive
+    }
+}
+
+thread_local! {
+    /// The lower-cased text of the row being checked, reused from row to row
+    /// so an `ILIKE` over ASCII text allocates nothing per row.
+    static LOWERED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,19 +86,37 @@ impl LikeMatcher {
                 c => push_char(&mut tokens, c, insensitive),
             }
         }
+        let shape = shape_of(tokens);
+        let finder = match &shape {
+            Shape::Contains(s) => Some(memchr::memmem::Finder::new(s.as_bytes()).into_owned()),
+            _ => None,
+        };
         Ok(Self {
-            shape: shape_of(tokens),
+            shape,
             insensitive,
+            finder,
         })
     }
 
     /// Whether `text` matches. The caller decides what a missing or NULL
     /// value means (it matches nothing, `NOT LIKE` included).
     pub(crate) fn matches(&self, text: &str) -> bool {
-        if self.insensitive {
-            self.matches_folded(&text.to_lowercase())
+        if !self.insensitive {
+            return self.matches_folded(text);
+        }
+        // ASCII text lower-cases byte by byte, into a buffer reused across
+        // rows; anything else takes the standard library's whole-string
+        // lowercase, which is what defines ILIKE here.
+        if text.is_ascii() {
+            LOWERED.with(|buffer| {
+                let mut buffer = buffer.borrow_mut();
+                buffer.clear();
+                buffer.push_str(text);
+                buffer.make_ascii_lowercase();
+                self.matches_folded(&buffer)
+            })
         } else {
-            self.matches_folded(text)
+            self.matches_folded(&text.to_lowercase())
         }
     }
 
@@ -92,7 +126,10 @@ impl LikeMatcher {
             Shape::Exact(s) => text == s,
             Shape::Prefix(s) => text.starts_with(s.as_str()),
             Shape::Suffix(s) => text.ends_with(s.as_str()),
-            Shape::Contains(s) => text.contains(s.as_str()),
+            Shape::Contains(s) => match &self.finder {
+                Some(finder) => finder.find(text.as_bytes()).is_some(),
+                None => text.contains(s.as_str()),
+            },
             Shape::General(tokens) => wildcard(tokens, text),
         }
     }

@@ -13,6 +13,14 @@ Search, toward Elasticsearch / Solr / Manticore.
   Shorter patterns and `NOT LIKE` are still checked row by row. Not built:
   `similarity()`, `%` and `<->`. A database gains feature bit `0x800000`
   only when its first trigram index is created; 0.18 cannot open it after.
+- **`REINDEX` and `sekejap-upgrade`**: rebuild indexes into the current
+  format on purpose -- `REINDEX INDEX | TABLE | SCHEMA | DATABASE` in SQL,
+  `sekejap-upgrade --check` / `--apply` for a server (backup first). An old
+  database keeps working without it; an upgrade is never automatic
+  (`docs/core/UPGRADE.md`).
+- **Faster `LIKE` without an index**: the row check reads the text where it
+  lies in the page, with no copy per row, and `count(*)` judges each row in
+  place.
 - **Release fixtures**: databases written by the tagged 0.18.3 build are
   kept in the repository, and every build must open them with the same
   answers (`docs/core/RELEASE_FIXTURES.md`).

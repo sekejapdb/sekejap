@@ -2437,6 +2437,43 @@ impl Database {
         self.commit()?;
         Ok((max_seq as usize).div_ceil(chunk_rows).max(1))
     }
+    /// `REINDEX`'s one commit: `new` -- a READY index built beside `old`
+    /// under a temporary name -- takes `old`'s name, and `old` takes the name
+    /// `__reindex_retired_<old id>` and is marked DROPPING, to be reclaimed
+    /// in bounded steps. A reader sees the old index or the new one, never
+    /// neither; and the old one's last drop step removes only its retired
+    /// name, never the name the new index now holds.
+    pub fn swap_index_names(&mut self, old: IndexId, new: IndexId) -> Result<()> {
+        self.ready_write()?;
+        let mut o = self.index_info(old)?;
+        let mut n = self.index_info(new)?;
+        if o.collection != n.collection || o.id == n.id {
+            return Err(invalid("a REINDEX swap names two indexes of one collection"));
+        }
+        if o.state != IndexState::Ready || n.state != IndexState::Ready {
+            return Err(invalid("a REINDEX swap needs both indexes ready"));
+        }
+        let c = o.collection;
+        let name = o.name.clone();
+        let temporary = n.name.clone();
+        let retired = format!("__reindex_retired_{}", o.id.0);
+        if self.store()?.get(&nkey(c, &retired))?.is_some() {
+            return Err(Error::AlreadyExists);
+        }
+        let result = (|| {
+            o.name = retired.clone();
+            o.state = IndexState::Dropping;
+            n.name = name.clone();
+            self.save_index(&o)?;
+            self.save_index(&n)?;
+            self.writer()?.delete(&nkey(c, &temporary))?;
+            self.writer()?.put(&nkey(c, &name), &ordered(n.id.0))?;
+            self.writer()?.put(&nkey(c, &retired), &ordered(o.id.0))?;
+            self.index_descriptors_changed();
+            Ok(())
+        })();
+        self.finish(result)
+    }
     pub fn begin_drop_index(&mut self, id: IndexId) -> Result<()> {
         self.ready_write()?;
         let mut i = self.index_info(id)?;

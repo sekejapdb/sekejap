@@ -35,7 +35,15 @@ pub(super) fn batch_filters_match<C: FnMut() -> bool>(
     scratch: &mut RowScratch,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<Option<bool>> {
-    let layout = db.layout(layout_id(bytes)?)?;
+    let id_of_layout = layout_id(bytes)?;
+    let layout = match &scratch.layout {
+        Some(held) if held.id == u64::from(id_of_layout) => held.clone(),
+        _ => {
+            let fresh = db.layout(id_of_layout)?;
+            scratch.layout = Some(fresh.clone());
+            fresh
+        }
+    };
     for (position, filter) in filters.iter().enumerate() {
         meter.check_cancelled()?;
         if satisfied == Some(position) {
@@ -72,7 +80,16 @@ pub(super) fn batch_filters_match<C: FnMut() -> bool>(
                 negated,
             } => {
                 meter.note_row_decode();
-                like_matches(selected_field_in(&layout, bytes, field)?, matcher, *negated)
+                // Borrowed out of the row: no copy of the text per row.
+                match dense_v3::read_text_field_in_trusted(&layout, bytes, field)
+                    .map_err(|error| corrupt_query(format!("dense-v3 row: {error}")))?
+                {
+                    dense_v3::TextFieldRef::Text(text) => matcher.matches(text) != *negated,
+                    dense_v3::TextFieldRef::Missing | dense_v3::TextFieldRef::Null => false,
+                    dense_v3::TextFieldRef::Elsewhere => {
+                        like_matches(selected_field_in(&layout, bytes, field)?, matcher, *negated)
+                    }
+                }
             }
             CompiledFilter::RowCompare { fields, values, op } => {
                 meter.note_row_decode();
@@ -517,7 +534,15 @@ pub(super) fn filters_match<'a, C: FnMut() -> bool>(
                 ensure_row_seq(db, rows, id, row, encoded, meter)?;
                 let row = row.as_ref().unwrap();
                 meter.note_row_decode();
-                like_matches(selected_field(row, field)?, matcher, *negated)
+                match dense_v3::read_text_field_in_trusted(&row.layout, &row.bytes, field)
+                    .map_err(|error| corrupt_query(format!("dense-v3 row: {error}")))?
+                {
+                    dense_v3::TextFieldRef::Text(text) => matcher.matches(text) != *negated,
+                    dense_v3::TextFieldRef::Missing | dense_v3::TextFieldRef::Null => false,
+                    dense_v3::TextFieldRef::Elsewhere => {
+                        like_matches(selected_field(row, field)?, matcher, *negated)
+                    }
+                }
             }
             CompiledFilter::RowCompare { fields, values, op } => {
                 ensure_row_seq(db, rows, id, row, encoded, meter)?;

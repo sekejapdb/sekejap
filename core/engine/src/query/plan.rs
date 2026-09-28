@@ -261,6 +261,10 @@ pub(super) struct RowScratch {
     /// How often each of the query's terms was seen in the document the phrase
     /// scanner is on. Positionally by prepared term.
     pub(super) seen: Vec<u32>,
+    /// The layout of the last row a batch filter judged: consecutive rows of
+    /// one collection almost always share it, and asking the database for it
+    /// per row was a lock, a lookup and a reference-count round trip.
+    pub(super) layout: Option<std::sync::Arc<crate::Layout>>,
 }
 
 /// The per-term frequencies the text merge cursor decoded on its way past this

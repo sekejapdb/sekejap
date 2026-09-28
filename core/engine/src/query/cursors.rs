@@ -511,6 +511,22 @@ impl<'a> DriverCursor<'a> {
         }
     }
 
+    /// [`Self::next`], with the row judged where it lies: a walk that stands
+    /// on the row -- the primary scan -- hands its bytes to `judge` instead of
+    /// copying them out, and records the verdict in `row_filtered`. `judge`
+    /// answers `None` when it cannot decide from the bytes alone; the row is
+    /// then copied as `next` would. Every other walk is `next`.
+    pub(super) fn next_judged<C: FnMut() -> bool>(
+        &mut self,
+        meter: &mut WorkMeter<'_, C>,
+        judge: &mut dyn FnMut(EntityId, &[u8], &mut WorkMeter<'_, C>) -> QueryResult<Option<bool>>,
+    ) -> QueryResult<Option<Candidate>> {
+        match self {
+            Self::Entities(cursor) => cursor.next_judged(meter, judge),
+            other => other.next(meter),
+        }
+    }
+
     pub(super) fn next<C: FnMut() -> bool>(
         &mut self,
         meter: &mut WorkMeter<'_, C>,
@@ -666,6 +682,44 @@ impl EntityCursor<'_> {
         };
         self.inner.step();
         Ok(Some(Candidate { row, ..Candidate::bare(id) }))
+    }
+    /// [`Self::next`] with the row judged in the pinned leaf (see
+    /// `DriverCursor::next_judged`).
+    fn next_judged<C: FnMut() -> bool>(
+        &mut self,
+        meter: &mut WorkMeter<'_, C>,
+        judge: &mut dyn FnMut(EntityId, &[u8], &mut WorkMeter<'_, C>) -> QueryResult<Option<bool>>,
+    ) -> QueryResult<Option<Candidate>> {
+        if self.done {
+            return Ok(None);
+        }
+        meter.charge(WorkResource::PrimaryReads, 1)?;
+        let (id, row, verdict) = {
+            let Some((key, value)) = self
+                .inner
+                .peek_ref()
+                .map_err(Error::from)
+                .map_err(QueryError::from)?
+            else {
+                self.done = true;
+                return Ok(None);
+            };
+            if !crate::collections::has_prefix(key, &self.prefix) {
+                self.done = true;
+                return Ok(None);
+            }
+            let id = crate::collections::row_id_after_prefix(key, self.prefix.len(), self.collection)?;
+            match judge(id, value, meter)? {
+                Some(verdict) => (id, None, Some(verdict)),
+                None => (id, self.wants_row.then(|| value.to_vec()), None),
+            }
+        };
+        self.inner.step();
+        Ok(Some(Candidate {
+            row,
+            row_filtered: verdict,
+            ..Candidate::bare(id)
+        }))
     }
 }
 

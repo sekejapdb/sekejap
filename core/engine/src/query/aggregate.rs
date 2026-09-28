@@ -1473,6 +1473,8 @@ impl PreparedAggregate<'_> {
         let mut scratch = RowScratch::default();
         let mut inputs: Vec<Option<OwnedScalarValue>> = Vec::new();
         let mut table: BTreeMap<GroupOrdKey, Vec<Acc>> = BTreeMap::new();
+        let row_free = self.group.is_none()
+            && self.accumulators.iter().all(|accumulator| accumulator.source.is_none());
         let mut ungrouped: Option<Vec<Acc>> = None;
         let mut opened = 0u64;
         // The groups budget is a byte bound: text keys and text extremes are
@@ -1480,14 +1482,52 @@ impl PreparedAggregate<'_> {
         let unit = group_bytes(self.accumulators.len()).max(1);
         let mut held_extra = 0usize;
 
-        while let Some(mut candidate) = cursor.next(meter)? {
+        loop {
+            // Nothing after the filter reads the row: a scan judges each row
+            // in the leaf it lies in (no copy), every other walk as before.
+            let next = if row_free && !self.query.filters.is_empty() {
+                let filters = &self.query.filters;
+                let ranges = &self.query.membership;
+                let scratch = &mut scratch;
+                cursor.next_judged(meter, &mut |id, bytes, meter| {
+                    batch_filters_match(db, filters, ranges, None, id, bytes, scratch, meter)
+                })?
+            } else {
+                cursor.next(meter)?
+            };
+            let Some(mut candidate) = next else { break };
             meter.charge(WorkResource::Candidates, 1)?;
             if candidate.id.collection != collection {
                 return Err(corrupt_query("an aggregate driver crossed collection boundary"));
             }
             let mut encoded = candidate.row.take();
             let mut row = None;
-            let kept = if self.query.filters.is_empty() {
+            // Nothing after the filter reads the row (no group key, only
+            // `count(*)`): the filters run on the row's bytes where they lie
+            // in the page, as a page query's borrowed pass does, instead of on
+            // an owned copy of every candidate.
+            let borrowed = if candidate.row_filtered.is_some() {
+                candidate.row_filtered
+            } else if row_free && encoded.is_none() && !self.query.filters.is_empty() {
+                meter.charge(WorkResource::PrimaryReads, 1)?;
+                let id = candidate.id;
+                let satisfied = candidate.satisfied_filter;
+                let filters = &self.query.filters;
+                let ranges = &self.query.membership;
+                let scratch = &mut scratch;
+                let meter = &mut *meter;
+                rows.with_row(id, |bytes| match bytes {
+                    Some(bytes) => {
+                        batch_filters_match(db, filters, ranges, satisfied, id, bytes, scratch, meter)
+                    }
+                    None => Err(corrupt_query("query candidate points to a missing entity")),
+                })?
+            } else {
+                None
+            };
+            let kept = if let Some(kept) = borrowed {
+                kept
+            } else if self.query.filters.is_empty() {
                 // `filters_match` over an empty slice can only say yes, and
                 // saying it costs a nine-argument call per candidate.
                 true
@@ -2066,8 +2106,24 @@ impl PreparedAggregate<'_> {
         // candidate past that key ends the skipping: nothing behind it can
         // come back.
         let mut skipping = resume.is_some();
+        // Nothing after the filter reads the row (one group over everything,
+        // only `count(*)`): a scan judges each row in the leaf it lies in.
+        let row_free = self.group.is_none()
+            && self.accumulators.iter().all(|accumulator| accumulator.source.is_none())
+            && !self.query.filters.is_empty();
 
-        while let Some(mut candidate) = cursor.next(meter)? {
+        loop {
+            let next = if row_free {
+                let filters = &self.query.filters;
+                let ranges = &self.query.membership;
+                let scratch = &mut scratch;
+                cursor.next_judged(meter, &mut |id, bytes, meter| {
+                    batch_filters_match(db, filters, ranges, None, id, bytes, scratch, meter)
+                })?
+            } else {
+                cursor.next(meter)?
+            };
+            let Some(mut candidate) = next else { break };
             meter.charge(WorkResource::Candidates, 1)?;
             if candidate.id.collection != collection {
                 return Err(corrupt_query("an aggregate driver crossed collection boundary"));
@@ -2086,7 +2142,9 @@ impl PreparedAggregate<'_> {
                     _ => skipping = false,
                 }
             }
-            let kept = if self.query.filters.is_empty() {
+            let kept = if let Some(kept) = candidate.row_filtered {
+                kept
+            } else if self.query.filters.is_empty() {
                 true
             } else {
                 filters_match(

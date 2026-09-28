@@ -379,6 +379,77 @@ impl Compiler<'_> {
                 };
                 Plan::Write(WritePlan::DropIndex { index, name })
             }
+            Stmt::Reindex {
+                target,
+                concurrently,
+            } => {
+                let mut collections = Vec::new();
+                match &target {
+                    ReindexTarget::System => {
+                        return Err(SqlError::coded(
+                            "0A000",
+                            "REINDEX SYSTEM: there are no system catalogs to rebuild",
+                        ))
+                    }
+                    ReindexTarget::Index(name) => {
+                        let Some(index) = self.index_named(name)? else {
+                            return Err(SqlError::coded(
+                                "42704",
+                                format!(r#"index "{name}" does not exist"#),
+                            ));
+                        };
+                        collections.push(self.db.index_info(index).map_err(SqlError::from)?.collection);
+                    }
+                    ReindexTarget::Table(table) => {
+                        let c = crate::collection(self.db, table).map_err(|_| {
+                            SqlError::coded("42P01", format!(r#"relation "{table}" does not exist"#))
+                        })?;
+                        collections.push(c);
+                    }
+                    ReindexTarget::Schema(schema) => {
+                        if !self.db.schema_exists(schema).map_err(SqlError::from)? {
+                            return Err(SqlError::coded(
+                                "3F000",
+                                format!(r#"schema "{schema}" does not exist"#),
+                            ));
+                        }
+                        for (s, table) in self.db.list_qualified_collections().map_err(SqlError::from)? {
+                            if s == *schema {
+                                if let Some(c) = self.db.collection_in(&s, &table).map_err(SqlError::from)? {
+                                    collections.push(c);
+                                }
+                            }
+                        }
+                    }
+                    ReindexTarget::Database => {
+                        for (s, table) in self.db.list_qualified_collections().map_err(SqlError::from)? {
+                            if let Some(c) = self.db.collection_in(&s, &table).map_err(SqlError::from)? {
+                                collections.push(c);
+                            }
+                        }
+                    }
+                }
+                let mut indexes = Vec::new();
+                for &c in &collections {
+                    for info in self.db.list_indexes(c).map_err(SqlError::from)? {
+                        let named = match &target {
+                            ReindexTarget::Index(name) => info.name == *name,
+                            _ => true,
+                        };
+                        // A crashed run's leftovers are finished, not rebuilt.
+                        if named && info.state == IndexState::Ready && !info.name.starts_with("__reindex_") {
+                            indexes.push(info.id);
+                        }
+                    }
+                }
+                Plan::Write(WritePlan::Reindex {
+                    collections,
+                    indexes,
+                    notice: concurrently.then(|| {
+                        "REINDEX CONCURRENTLY: every rebuild already runs beside the old index, so the word changes nothing".to_owned()
+                    }),
+                })
+            }
             // pg_trgm's index is built in (0.19 A1); its similarity
             // functions and operators are not, and are refused where they
             // are written. Any other extension is not available.

@@ -621,6 +621,79 @@ pub(crate) fn read_field_in_trusted(layout: &Layout, bytes: &[u8], field: &str) 
         // way to find a key there.
         return read_field_in(layout, bytes, field);
     };
+    let (mut r, widths, width_index) = match step_trusted(layout, bytes, declared)? {
+        Stepped::Missing => return Ok(FieldValue::Missing),
+        Stepped::Null => return Ok(FieldValue::Null),
+        Stepped::At { r, widths, width_index } => (r, widths, width_index),
+    };
+    Ok(match &layout.fields[declared].1 {
+        Kind::Text => FieldValue::Inline(Value::String(std::str::from_utf8(r.blob()?)?.to_owned())),
+        Kind::Int => {
+            let n = (width_get(widths, width_index) + 1) as usize;
+            let bytes = r.take(n)?;
+            let mut full = [if bytes[0] & 128 == 0 { 0 } else { 255 }; 8];
+            full[8 - n..].copy_from_slice(bytes);
+            FieldValue::Inline(Value::from(i64::from_be_bytes(full)))
+        }
+        Kind::Real => FieldValue::Inline(Value::from(r.float()?)),
+        Kind::Bool => FieldValue::Inline(Value::Bool(match r.byte()? {
+            0 => false,
+            1 => true,
+            _ => return Err("boolean encoding".into()),
+        })),
+        Kind::Json => FieldValue::Inline(json_read(&mut r, 0)?),
+        Kind::Geo => FieldValue::Inline(geo_json(
+            Geom::decode(r.blob()?).ok_or("invalid binary geometry")?,
+        )),
+        Kind::Point => FieldValue::Inline(geo_json(Geom::Point(r.float()?, r.float()?))),
+        Kind::Vector(dimension) => FieldValue::Vector {
+            ordinal: declared,
+            dimension: *dimension,
+        },
+    })
+}
+
+/// [`read_text_field_in`] on the terms of [`read_field_in_trusted`]: the
+/// fields before the one asked for are stepped over by length, the ones after
+/// it are not read, and the one asked for is decoded -- and its UTF-8
+/// checked -- exactly as the full reader does, then BORROWED. The per-row
+/// `LIKE` check reads text this way; the sacrifice is the one named on
+/// [`read_field_in_trusted`].
+pub(crate) fn read_text_field_in_trusted<'b>(
+    layout: &Layout,
+    bytes: &'b [u8],
+    field: &str,
+) -> Result<TextFieldRef<'b>> {
+    let Some(declared) = layout
+        .fields
+        .iter()
+        .position(|(name, kind)| name == field && matches!(kind, Kind::Text))
+    else {
+        return Ok(TextFieldRef::Elsewhere);
+    };
+    Ok(match step_trusted(layout, bytes, declared)? {
+        Stepped::Missing => TextFieldRef::Missing,
+        Stepped::Null => TextFieldRef::Null,
+        Stepped::At { mut r, .. } => TextFieldRef::Text(std::str::from_utf8(r.blob()?)?),
+    })
+}
+
+/// Where a trusted read of the field at ordinal `declared` stands.
+enum Stepped<'b> {
+    Missing,
+    Null,
+    /// The cursor is at the field's bytes; `widths` and `width_index` size an
+    /// integer.
+    At {
+        r: Read<'b>,
+        widths: &'b [u8],
+        width_index: usize,
+    },
+}
+
+/// Check the row's layout id and field states, and step over every field
+/// before `declared` by its length, decoding nothing.
+fn step_trusted<'b>(layout: &Layout, bytes: &'b [u8], declared: usize) -> Result<Stepped<'b>> {
     let mut r = Read { b: bytes, p: 0 };
     let h = r.uv()?;
     if h >> 2 > u32::MAX as u64 {
@@ -651,13 +724,13 @@ pub(crate) fn read_field_in_trusted(layout: &Layout, bytes: &[u8], field: &str) 
         match state {
             0 => {
                 if requested {
-                    return Ok(FieldValue::Missing);
+                    return Ok(Stepped::Missing);
                 }
                 continue;
             }
             1 => {
                 if requested {
-                    return Ok(FieldValue::Null);
+                    return Ok(Stepped::Null);
                 }
                 continue;
             }
@@ -665,32 +738,10 @@ pub(crate) fn read_field_in_trusted(layout: &Layout, bytes: &[u8], field: &str) 
             _ => return Err("invalid field state".into()),
         }
         if requested {
-            return Ok(match kind {
-                Kind::Text => FieldValue::Inline(Value::String(
-                    std::str::from_utf8(r.blob()?)?.to_owned(),
-                )),
-                Kind::Int => {
-                    let n = (width_get(widths, width_index) + 1) as usize;
-                    let bytes = r.take(n)?;
-                    let mut full = [if bytes[0] & 128 == 0 { 0 } else { 255 }; 8];
-                    full[8 - n..].copy_from_slice(bytes);
-                    FieldValue::Inline(Value::from(i64::from_be_bytes(full)))
-                }
-                Kind::Real => FieldValue::Inline(Value::from(r.float()?)),
-                Kind::Bool => FieldValue::Inline(Value::Bool(match r.byte()? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err("boolean encoding".into()),
-                })),
-                Kind::Json => FieldValue::Inline(json_read(&mut r, 0)?),
-                Kind::Geo => FieldValue::Inline(geo_json(
-                    Geom::decode(r.blob()?).ok_or("invalid binary geometry")?,
-                )),
-                Kind::Point => FieldValue::Inline(geo_json(Geom::Point(r.float()?, r.float()?))),
-                Kind::Vector(dimension) => FieldValue::Vector {
-                    ordinal,
-                    dimension: *dimension,
-                },
+            return Ok(Stepped::At {
+                r,
+                widths,
+                width_index,
             });
         }
         // Stepped over: advance by length, decode nothing.

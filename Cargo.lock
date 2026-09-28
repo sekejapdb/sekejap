@@ -916,6 +916,7 @@ dependencies = [
  "crc32c",
  "geographiclib-rs",
  "getrandom 0.4.3",
+ "memchr",
  "postgres",
  "sekejap-kernel",
  "serde_json",

@@ -576,7 +576,11 @@ these persistent tags blindly.
   the only permitted change to the on-disk format: with a new keyspace, or --
   since the tag run is full -- with an existing family's keyspaces under a
   descriptor value that family's decoder refuses today (the trigram
-  analyzer is the first).
+  analyzer is the first). A new format is a deliberate, rare decision, made
+  once to carry what a family of algorithms needs; later work improves the
+  algorithms on the same bytes. The release that adds a format ships the
+  step that rewrites the older one into it (`REINDEX`, `sekejap-upgrade`,
+  `docs/core/UPGRADE.md`).
 - `E4PWAL02` persists required feature bits, including compact cells.
   Since the loop-2 codec change (2026-09-16) the cell encoding is a property
   of the database, not of the build: every build decodes both cell families, a
