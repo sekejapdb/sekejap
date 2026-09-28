@@ -1,0 +1,1290 @@
+[
+  {
+    "columns": [
+      "_key",
+      "name",
+      "area",
+      "rating",
+      "visits",
+      "opened",
+      "open_now",
+      "info",
+      "description"
+    ],
+    "rows": [
+      [
+        "batur",
+        "Mount Batur",
+        "Bangli",
+        {
+          "float": "4616977747989548237",
+          "shown": 4.7
+        },
+        {
+          "int": 3
+        },
+        "2020-01-09",
+        true,
+        {
+          "json": {
+            "kind": "nature",
+            "tier": 2
+          }
+        },
+        "volcano sunrise hike above the crater lake"
+      ],
+      [
+        "jimbaran",
+        "Jimbaran Bay",
+        "Badung",
+        {
+          "float": "4616865157998863974",
+          "shown": 4.6
+        },
+        {
+          "int": 0
+        },
+        "2020-01-05",
+        true,
+        {
+          "json": {
+            "kind": "beach",
+            "tier": 1
+          }
+        },
+        "calm bay with grilled seafood dinners on the sand"
+      ],
+      [
+        "kuta-beach",
+        "Kuta Beach",
+        "Badung",
+        {
+          "float": "4616527388026811187",
+          "shown": 4.3
+        },
+        {
+          "int": 0
+        },
+        "2020-01-03",
+        true,
+        {
+          "json": {
+            "kind": "beach",
+            "tier": 2
+          }
+        },
+        "long sandy beach for surfing lessons and sunset walks"
+      ],
+      [
+        "lovina",
+        "Lovina Beach",
+        "Badung",
+        {
+          "float": "4616302208045442662",
+          "shown": 4.1
+        },
+        {
+          "int": 0
+        },
+        null,
+        {
+          "missing": true
+        },
+        {
+          "missing": true
+        },
+        "black sand beach with dolphins at dawn"
+      ],
+      [
+        "monkey-forest",
+        "Sacred Monkey Forest",
+        "Gianyar",
+        {
+          "float": "4616752568008179712",
+          "shown": 4.5
+        },
+        {
+          "int": 0
+        },
+        "2020-01-08",
+        true,
+        {
+          "json": {
+            "kind": "nature",
+            "tier": 1
+          }
+        },
+        "forest temple where monkeys roam the paths"
+      ],
+      [
+        "sanur",
+        "Sanur Beach",
+        "Denpasar",
+        {
+          "float": "4616639978017495450",
+          "shown": 4.4
+        },
+        {
+          "int": 0
+        },
+        "2020-01-10",
+        false,
+        "{\"kind\":\"beach\",\"tier\":0}",
+        "quiet sunrise beach with a long walking path"
+      ],
+      [
+        "seminyak",
+        "Seminyak Beach",
+        "Badung",
+        {
+          "float": "4616752568008179712",
+          "shown": 4.5
+        },
+        {
+          "int": 0
+        },
+        "2020-01-04",
+        false,
+        {
+          "json": {
+            "kind": "beach",
+            "tier": 0
+          }
+        },
+        "wide beach with sunset cafes and quiet mornings"
+      ],
+      [
+        "tanah-lot",
+        "Tanah Lot",
+        "Tabanan",
+        {
+          "float": "4616977747989548237",
+          "shown": 4.7
+        },
+        {
+          "int": 0
+        },
+        "2020-01-02",
+        true,
+        {
+          "json": {
+            "kind": "temple",
+            "tier": 1
+          }
+        },
+        "sea temple on a rock reached at low tide"
+      ],
+      [
+        "tegallalang",
+        "Tegallalang Rice Terrace",
+        "Gianyar",
+        {
+          "float": "4616865157998863974",
+          "shown": 4.6
+        },
+        {
+          "int": 0
+        },
+        "2020-01-07",
+        false,
+        {
+          "json": {
+            "kind": "nature",
+            "tier": 0
+          }
+        },
+        "green rice terraces with a quiet morning walk"
+      ],
+      [
+        "ubud-market",
+        "Ubud Art Market",
+        "Gianyar",
+        {
+          "float": "4616414798036126925",
+          "shown": 4.2
+        },
+        {
+          "int": 0
+        },
+        "2020-01-06",
+        true,
+        {
+          "json": {
+            "kind": "market",
+            "tier": 2
+          }
+        },
+        "crafts, woven bags and paintings in the town centre"
+      ],
+      [
+        "uluwatu",
+        "Uluwatu Temple",
+        "Badung",
+        {
+          "float": "4617202927970916762",
+          "shown": 4.9
+        },
+        {
+          "int": 12
+        },
+        "2020-01-01",
+        false,
+        {
+          "json": {
+            "kind": "temple",
+            "tier": 0
+          }
+        },
+        "cliff temple above the ocean with a sunset dance"
+      ]
+    ],
+    "sql": "SELECT _key, name, area, rating, visits, opened, open_now, info, description FROM place ORDER BY _key"
+  },
+  {
+    "columns": [
+      "_key",
+      "name",
+      "email",
+      "joined"
+    ],
+    "rows": [
+      [
+        "ketut",
+        "Ketut",
+        null,
+        "2024-01-20T07:15:00Z"
+      ],
+      [
+        "made",
+        "Made",
+        "made@example.com",
+        "2023-03-01T08:00:00Z"
+      ],
+      [
+        "nyoman",
+        "Nyoman",
+        "nyoman@example.com",
+        "2023-05-12T09:30:00Z"
+      ],
+      [
+        "wayan",
+        "Wayan",
+        {
+          "missing": true
+        },
+        null
+      ]
+    ],
+    "sql": "SELECT _key, name, email, joined FROM travel.guide ORDER BY _key"
+  },
+  {
+    "columns": [
+      "_key",
+      "name",
+      "price"
+    ],
+    "rows": [
+      [
+        "bebek-betutu",
+        "Bebek Betutu",
+        {
+          "int": 90
+        }
+      ],
+      [
+        "gado-gado",
+        "Gado-Gado",
+        {
+          "int": 28
+        }
+      ],
+      [
+        "jaja-bali",
+        "Jaja Bali",
+        {
+          "int": 15
+        }
+      ],
+      [
+        "lawar",
+        "Lawar",
+        {
+          "int": 25
+        }
+      ],
+      [
+        "nasi-campur",
+        "Nasi Campur",
+        {
+          "int": 35
+        }
+      ],
+      [
+        "sate-lilit",
+        "Sate Lilit",
+        {
+          "int": 30
+        }
+      ]
+    ],
+    "sql": "SELECT _key, name, price FROM dish ORDER BY _key"
+  },
+  {
+    "columns": [
+      "guide",
+      "place",
+      "score",
+      "note"
+    ],
+    "rows": [
+      [
+        "made",
+        "jimbaran",
+        {
+          "float": "4616639978017495450",
+          "shown": 4.4
+        },
+        "none"
+      ],
+      [
+        "made",
+        "uluwatu",
+        {
+          "float": "4617202927970916762",
+          "shown": 4.9
+        },
+        "none"
+      ]
+    ],
+    "sql": "SELECT guide, place, score, note FROM guided WHERE guide = 'made' ORDER BY place"
+  },
+  {
+    "columns": [
+      "guide",
+      "place",
+      "score",
+      "note"
+    ],
+    "rows": [
+      [
+        "nyoman",
+        "monkey-forest",
+        {
+          "float": "4616527388026811187",
+          "shown": 4.3
+        },
+        "none"
+      ],
+      [
+        "nyoman",
+        "tegallalang",
+        {
+          "float": "4617202927970916762",
+          "shown": 4.9
+        },
+        "none"
+      ],
+      [
+        "nyoman",
+        "ubud-market",
+        {
+          "float": "4616189618054758400",
+          "shown": 4.0
+        },
+        "none"
+      ]
+    ],
+    "sql": "SELECT guide, place, score, note FROM guided WHERE guide = 'nyoman' ORDER BY place"
+  },
+  {
+    "columns": [
+      "guide",
+      "place",
+      "score",
+      "note"
+    ],
+    "rows": [
+      [
+        "ketut",
+        "batur",
+        {
+          "float": "4617090337980232499",
+          "shown": 4.8
+        },
+        "none"
+      ]
+    ],
+    "sql": "SELECT guide, place, score, note FROM guided WHERE guide = 'ketut' ORDER BY place"
+  },
+  {
+    "columns": [
+      "count"
+    ],
+    "rows": [
+      [
+        {
+          "int": 11
+        }
+      ]
+    ],
+    "sql": "SELECT count(*) FROM place"
+  },
+  {
+    "columns": [
+      "area",
+      "n"
+    ],
+    "rows": [
+      [
+        "Badung",
+        {
+          "int": 5
+        }
+      ],
+      [
+        "Bangli",
+        {
+          "int": 1
+        }
+      ],
+      [
+        "Denpasar",
+        {
+          "int": 1
+        }
+      ],
+      [
+        "Gianyar",
+        {
+          "int": 3
+        }
+      ],
+      [
+        "Tabanan",
+        {
+          "int": 1
+        }
+      ]
+    ],
+    "sql": "SELECT area, count(*) AS n FROM place GROUP BY area ORDER BY area"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "uluwatu"
+      ],
+      [
+        "batur"
+      ],
+      [
+        "tanah-lot"
+      ],
+      [
+        "jimbaran"
+      ],
+      [
+        "tegallalang"
+      ]
+    ],
+    "sql": "SELECT _key FROM place WHERE rating >= 4.6 ORDER BY rating DESC, _key"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "lovina"
+      ],
+      [
+        "ubud-market"
+      ],
+      [
+        "kuta-beach"
+      ],
+      [
+        "sanur"
+      ],
+      [
+        "monkey-forest"
+      ],
+      [
+        "seminyak"
+      ],
+      [
+        "jimbaran"
+      ],
+      [
+        "tegallalang"
+      ],
+      [
+        "batur"
+      ],
+      [
+        "tanah-lot"
+      ],
+      [
+        "uluwatu"
+      ]
+    ],
+    "sql": "SELECT _key FROM place ORDER BY rating, _key"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "kuta-beach"
+      ]
+    ],
+    "sql": "SELECT _key FROM place WHERE lower(name) = 'kuta beach'"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "tanah-lot"
+      ],
+      [
+        "uluwatu"
+      ]
+    ],
+    "sql": "SELECT _key FROM place WHERE info->>'kind' = 'temple' ORDER BY _key"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "monkey-forest"
+      ],
+      [
+        "sanur"
+      ],
+      [
+        "seminyak"
+      ]
+    ],
+    "sql": "SELECT _key FROM place WHERE name LIKE 'S%' ORDER BY _key"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "kuta-beach"
+      ],
+      [
+        "lovina"
+      ],
+      [
+        "sanur"
+      ],
+      [
+        "seminyak"
+      ]
+    ],
+    "sql": "SELECT _key FROM place WHERE name ILIKE '%beach%' ORDER BY _key"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "jimbaran"
+      ],
+      [
+        "tegallalang"
+      ],
+      [
+        "batur"
+      ],
+      [
+        "tanah-lot"
+      ],
+      [
+        "uluwatu"
+      ]
+    ],
+    "sql": "SELECT _key FROM place WHERE (rating, _key) > (4.5, 'seminyak') ORDER BY rating, _key"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "kuta-beach"
+      ],
+      [
+        "seminyak"
+      ]
+    ],
+    "sql": "SELECT _key FROM place WHERE to_tsvector('simple', description) @@ to_tsquery('simple', 'sunset & beach') ORDER BY _key"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "batur"
+      ],
+      [
+        "monkey-forest"
+      ],
+      [
+        "sanur"
+      ],
+      [
+        "tanah-lot"
+      ],
+      [
+        "uluwatu"
+      ]
+    ],
+    "sql": "SELECT _key FROM place WHERE to_tsvector('simple', description) @@ to_tsquery('simple', 'sunrise | temple') ORDER BY _key"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "tegallalang"
+      ]
+    ],
+    "sql": "SELECT _key FROM place WHERE to_tsvector('simple', description) @@ to_tsquery('simple', '\"quiet morning\"') ORDER BY _key"
+  },
+  {
+    "columns": [
+      "_key",
+      "score"
+    ],
+    "rows": [
+      [
+        "sanur",
+        {
+          "float": "4615775922635012894",
+          "shown": 3.8162823279266282
+        }
+      ],
+      [
+        "seminyak",
+        {
+          "float": "4612211308015863974",
+          "shown": 2.2332754382888025
+        }
+      ],
+      [
+        "batur",
+        {
+          "float": "4610186896341482317",
+          "shown": 1.667128028700705
+        }
+      ],
+      [
+        "tegallalang",
+        {
+          "float": "4608278810004142372",
+          "shown": 1.243447751763207
+        }
+      ],
+      [
+        "lovina",
+        {
+          "float": "4607373494036623203",
+          "shown": 1.0424272254230906
+        }
+      ]
+    ],
+    "sql": "SELECT _key, bm25(description, 'quiet sunrise beach') AS score FROM place ORDER BY bm25(description, 'quiet sunrise beach') DESC LIMIT 5"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "batur"
+      ],
+      [
+        "sanur"
+      ]
+    ],
+    "sql": "SELECT _key FROM place WHERE search(description, 'sunrese') ORDER BY _key"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "jimbaran"
+      ],
+      [
+        "kuta-beach"
+      ],
+      [
+        "seminyak"
+      ]
+    ],
+    "sql": "SELECT _key FROM place WHERE ST_DWithin(geometry, ST_MakePoint(115.168, -8.718)::geography, 6000.0) ORDER BY _key"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "ubud-market"
+      ],
+      [
+        "monkey-forest"
+      ],
+      [
+        "tegallalang"
+      ]
+    ],
+    "sql": "SELECT _key FROM place ORDER BY geometry <-> ST_MakePoint(115.26, -8.51)::geography LIMIT 3"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "highlands"
+      ]
+    ],
+    "sql": "SELECT _key FROM travel.region WHERE ST_Contains(shape, ST_SetSRID(ST_MakePoint(115.279, -8.434), 4326)) ORDER BY _key"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "uluwatu"
+      ],
+      [
+        "tanah-lot"
+      ],
+      [
+        "monkey-forest"
+      ]
+    ],
+    "sql": "SELECT _key FROM place ORDER BY taste <=> '[0.9, 0.1, 0.0, 0.0]' LIMIT 3"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "gado-gado"
+      ],
+      [
+        "lawar"
+      ],
+      [
+        "sate-lilit"
+      ]
+    ],
+    "sql": "SELECT _key FROM dish ORDER BY embedding <=> '[0.2, 0.7, 0.1, 0.0]' LIMIT 3"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "sate-lilit"
+      ],
+      [
+        "nasi-campur"
+      ]
+    ],
+    "sql": "SELECT _key FROM dish ORDER BY embedding <-> '[0.6, 0.3, 0.1, 0.0]' LIMIT 2"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "sate-lilit"
+      ],
+      [
+        "nasi-campur"
+      ],
+      [
+        "bebek-betutu"
+      ]
+    ],
+    "sql": "SELECT _key FROM dish ORDER BY flavour <=> '[0.0, 0.1, 0.3, 0.6]' LIMIT 3"
+  },
+  {
+    "columns": [
+      "_key",
+      "d"
+    ],
+    "rows": [
+      [
+        "uluwatu",
+        {
+          "float": "0",
+          "shown": 0.0
+        }
+      ],
+      [
+        "tanah-lot",
+        {
+          "float": "4576346131772428608",
+          "shown": 0.009007568981282632
+        }
+      ],
+      [
+        "monkey-forest",
+        {
+          "float": "4595402397934928220",
+          "shown": 0.17303874012533071
+        }
+      ]
+    ],
+    "sql": "SELECT _key, taste <=> '[0.9, 0.1, 0.0, 0.0]' AS d FROM place ORDER BY taste <=> '[0.9, 0.1, 0.0, 0.0]' LIMIT 3"
+  },
+  {
+    "columns": [
+      "_key"
+    ],
+    "rows": [
+      [
+        "r002"
+      ],
+      [
+        "r005"
+      ],
+      [
+        "r014"
+      ],
+      [
+        "r017"
+      ],
+      [
+        "r026"
+      ],
+      [
+        "r029"
+      ],
+      [
+        "r038"
+      ],
+      [
+        "r041"
+      ],
+      [
+        "r050"
+      ],
+      [
+        "r053"
+      ],
+      [
+        "r062"
+      ],
+      [
+        "r065"
+      ],
+      [
+        "r074"
+      ],
+      [
+        "r077"
+      ],
+      [
+        "r086"
+      ],
+      [
+        "r089"
+      ],
+      [
+        "r098"
+      ],
+      [
+        "r101"
+      ],
+      [
+        "r110"
+      ],
+      [
+        "r113"
+      ],
+      [
+        "r122"
+      ],
+      [
+        "r125"
+      ],
+      [
+        "r134"
+      ],
+      [
+        "r137"
+      ],
+      [
+        "r146"
+      ],
+      [
+        "r149"
+      ],
+      [
+        "r158"
+      ],
+      [
+        "r161"
+      ],
+      [
+        "r170"
+      ],
+      [
+        "r173"
+      ],
+      [
+        "r182"
+      ],
+      [
+        "r185"
+      ],
+      [
+        "r194"
+      ],
+      [
+        "r197"
+      ],
+      [
+        "r206"
+      ],
+      [
+        "r209"
+      ],
+      [
+        "r218"
+      ],
+      [
+        "r221"
+      ],
+      [
+        "r230"
+      ],
+      [
+        "r233"
+      ],
+      [
+        "r242"
+      ],
+      [
+        "r245"
+      ],
+      [
+        "r254"
+      ],
+      [
+        "r257"
+      ],
+      [
+        "r266"
+      ],
+      [
+        "r269"
+      ],
+      [
+        "r278"
+      ],
+      [
+        "r281"
+      ],
+      [
+        "r290"
+      ],
+      [
+        "r293"
+      ],
+      [
+        "r302"
+      ],
+      [
+        "r305"
+      ],
+      [
+        "r314"
+      ],
+      [
+        "r317"
+      ],
+      [
+        "r326"
+      ],
+      [
+        "r329"
+      ],
+      [
+        "r338"
+      ],
+      [
+        "r341"
+      ],
+      [
+        "r350"
+      ],
+      [
+        "r353"
+      ],
+      [
+        "r362"
+      ],
+      [
+        "r365"
+      ],
+      [
+        "r374"
+      ],
+      [
+        "r377"
+      ],
+      [
+        "r386"
+      ],
+      [
+        "r389"
+      ],
+      [
+        "r398"
+      ]
+    ],
+    "sql": "SELECT _key FROM review WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'market & beach') ORDER BY _key"
+  },
+  {
+    "columns": [
+      "count"
+    ],
+    "rows": [
+      [
+        {
+          "int": 68
+        }
+      ]
+    ],
+    "sql": "SELECT count(*) FROM review WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'sunset')"
+  },
+  {
+    "columns": [
+      "_id",
+      "_key"
+    ],
+    "rows": [
+      [
+        {
+          "id": [
+            1,
+            9
+          ]
+        },
+        "batur"
+      ],
+      [
+        {
+          "id": [
+            1,
+            5
+          ]
+        },
+        "jimbaran"
+      ],
+      [
+        {
+          "id": [
+            1,
+            3
+          ]
+        },
+        "kuta-beach"
+      ],
+      [
+        {
+          "id": [
+            1,
+            12
+          ]
+        },
+        "lovina"
+      ],
+      [
+        {
+          "id": [
+            1,
+            8
+          ]
+        },
+        "monkey-forest"
+      ],
+      [
+        {
+          "id": [
+            1,
+            10
+          ]
+        },
+        "sanur"
+      ],
+      [
+        {
+          "id": [
+            1,
+            4
+          ]
+        },
+        "seminyak"
+      ],
+      [
+        {
+          "id": [
+            1,
+            2
+          ]
+        },
+        "tanah-lot"
+      ],
+      [
+        {
+          "id": [
+            1,
+            7
+          ]
+        },
+        "tegallalang"
+      ],
+      [
+        {
+          "id": [
+            1,
+            6
+          ]
+        },
+        "ubud-market"
+      ],
+      [
+        {
+          "id": [
+            1,
+            1
+          ]
+        },
+        "uluwatu"
+      ]
+    ],
+    "sql": "SELECT _id, _key FROM place ORDER BY _key"
+  },
+  {
+    "columns": [
+      "place",
+      "score"
+    ],
+    "rows": [
+      [
+        "monkey-forest",
+        {
+          "float": "4616527388026811187",
+          "shown": 4.3
+        }
+      ],
+      [
+        "tegallalang",
+        {
+          "float": "4617202927970916762",
+          "shown": 4.9
+        }
+      ],
+      [
+        "ubud-market",
+        {
+          "float": "4616189618054758400",
+          "shown": 4.0
+        }
+      ]
+    ],
+    "sql": "SELECT * FROM GRAPH_TABLE (base MATCH (g:guide WHERE g._key = 'nyoman')-[v:guided]->(p:place) RETURN p._key AS place, v.score AS score) ORDER BY place"
+  },
+  {
+    "columns": [
+      "place"
+    ],
+    "rows": [
+      [
+        "jimbaran"
+      ],
+      [
+        "kuta-beach"
+      ],
+      [
+        "uluwatu"
+      ]
+    ],
+    "sql": "SELECT * FROM GRAPH_TABLE (base MATCH (a:place WHERE a._key = 'seminyak')-[:near]->{1,3}(b:place) RETURN b._key AS place) ORDER BY place"
+  },
+  {
+    "columns": [
+      "place"
+    ],
+    "rows": [
+      [
+        "batur"
+      ],
+      [
+        "tegallalang"
+      ]
+    ],
+    "sql": "SELECT * FROM GRAPH_TABLE (routes MATCH (a:place WHERE a._key = 'monkey-forest')-[:near]->{1,2}(b:place) RETURN b._key AS place) ORDER BY place"
+  },
+  {
+    "columns": [
+      "guide",
+      "place"
+    ],
+    "rows": [
+      [
+        "ketut",
+        "batur"
+      ],
+      [
+        "made",
+        "jimbaran"
+      ],
+      [
+        "made",
+        "uluwatu"
+      ],
+      [
+        "nyoman",
+        "monkey-forest"
+      ],
+      [
+        "nyoman",
+        "tegallalang"
+      ],
+      [
+        "nyoman",
+        "ubud-market"
+      ]
+    ],
+    "sql": "SELECT * FROM GRAPH_TABLE (tours MATCH (g:person)-[e:led]->(p:place) RETURN g._key AS guide, p._key AS place) ORDER BY guide, place"
+  }
+]
