@@ -982,7 +982,7 @@ impl TextCursor<'_> {
                 }
                 sequence
             }
-            TextMatch::All | TextMatch::Phrase => loop {
+            TextMatch::All | TextMatch::Phrase | TextMatch::Trigram { .. } => loop {
                 if self.streams.iter().any(|stream| stream.done) {
                     self.drain(meter)?;
                     self.done = true;

@@ -514,10 +514,14 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
             IndexFamily::SpatialGeometry => crate::index::spatial::geometry_index::GEOMETRY_FEATURE,
             IndexFamily::Text => crate::index::text::TEXT_FEATURE,
             IndexFamily::VamanaGraph => crate::index::vector::graph::VAMANA_FEATURE,
+        } | if index.analyzer == Some(crate::collections::TextAnalyzer::Trigram) {
+            crate::index::text::TRIGRAM_FEATURE
+        } else {
+            0
         };
         if !header
             .indexes
-            .is_some_and(|value| value.features & feature != 0)
+            .is_some_and(|value| value.features & feature == feature)
         {
             return Err(corrupt("index descriptor lacks its required feature"));
         }

@@ -22,7 +22,7 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     // so they are ACCEPTED rather than refused. A boolean LEAF an index
     // cannot answer -- a geometry predicate, a traversal, a JSON equality, a
     // phrase -- is still refused, by `prepare_query`, with that reason.
-    ("LIKE", Tier::Two, "QL_CONTRACT §3: LIKE 'abc%' is a text-key prefix range; LIKE '%abc%' needs the trigram index family (pg_trgm-compatible) under a new feature bit. Neither is built."),
+    ("LIKE", Tier::Two, "QL_CONTRACT §3: `col LIKE` on a TEXT column takes any pattern -- a plain 'abc%' is the btree prefix range, any other is checked on each row, narrowed first by a trigram index (`gin_trgm_ops`) when the column has one; a position that is not a TEXT column takes none of them."),
     ("SIMILAR TO", Tier::Three, "QL_CONTRACT §3: SIMILAR TO has no index atomic."),
     ("~", Tier::Three, "QL_CONTRACT §3: regex `~` has no index atomic."),
     ("&&", Tier::Two, "QL_CONTRACT §4.4: `&&` is Tier 1 in ONE position -- a WHERE predicate `geom && <shape>` over a Point or geometry column with a spatial index, planar bounding boxes as PostGIS compares them. Array overlap, and `&&` in a SELECT list or an ORDER BY, have no atomic in this slice."),

@@ -483,6 +483,7 @@ impl Lowering<'_> {
                         .find(|info| {
                             info.field == *property
                                 && info.family == IndexFamily::Text
+                                && info.analyzer == Some(sekejap_core::collections::TextAnalyzer::Words)
                                 && info.expression.is_none()
                                 && info.state == IndexState::Ready
                         });

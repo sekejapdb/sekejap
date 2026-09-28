@@ -872,6 +872,9 @@ fn index_statement(table: &str, index: &IndexInfo) -> String {
     };
     let method = match index.family {
         IndexFamily::Scalar => format!("btree ({target})"),
+        IndexFamily::Text if index.analyzer == Some(TextAnalyzer::Trigram) => {
+            format!("gin ({target} gin_trgm_ops)")
+        }
         IndexFamily::Text => format!("gin (to_tsvector('simple', {target}))"),
         IndexFamily::SpatialPoint | IndexFamily::SpatialGeometry => format!("gist ({target})"),
         IndexFamily::ExactVector => format!("exact ({target})"),

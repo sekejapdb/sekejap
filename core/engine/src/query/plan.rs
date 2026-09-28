@@ -155,7 +155,7 @@ impl PreparedText {
     pub(super) fn admits(&self, present: &[bool]) -> bool {
         match self.matching {
             TextMatch::Any => present.iter().any(|held| *held),
-            TextMatch::All | TextMatch::Phrase => {
+            TextMatch::All | TextMatch::Phrase | TextMatch::Trigram { .. } => {
                 present.len() == self.terms.len() && present.iter().all(|held| *held)
             }
             TextMatch::Search | TextMatch::Prefix => self
@@ -414,6 +414,75 @@ pub(super) fn require_family_index(
     Ok(info)
 }
 
+/// A trigram index's candidate walk for one `[I]LIKE` pattern: every piece
+/// the pattern requires (`crate::index::text::trigram::required`).
+///
+/// More than 64 pieces are cut to the 64 RAREST -- fewer required pieces is a
+/// larger candidate set and never a smaller one, and the rarest are the ones
+/// that narrow. A pattern with no piece has no walk; the caller checks rows.
+fn prepare_trigram(
+    db: &Database,
+    info: IndexInfo,
+    pattern: &str,
+    escape: Option<char>,
+    insensitive: bool,
+    matching: TextMatch,
+) -> QueryResult<PreparedText> {
+    let id = info.id;
+    let pieces = crate::index::text::trigram::required(pattern, escape, insensitive)
+        .map_err(invalid_query)?;
+    if pieces.is_empty() {
+        return Err(invalid_query(
+            "this LIKE pattern has no 3-character piece for a trigram index to narrow",
+        ));
+    }
+    let corpus = crate::index::text::read_corpus(db, id)?;
+    let mut ranked = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        let df = crate::index::text::read_df(db, id, &piece)?.unwrap_or(0);
+        if df > corpus.documents {
+            return Err(corrupt_query(
+                "text document frequency exceeds corpus document count",
+            ));
+        }
+        ranked.push((df, piece));
+    }
+    ranked.sort();
+    ranked.truncate(MAX_TEXT_TERMS);
+    let (dfs, terms): (Vec<u64>, Vec<String>) = ranked.into_iter().unzip();
+    Ok(PreparedText {
+        info,
+        idfs: vec![0.0; terms.len()],
+        terms,
+        phrase: None,
+        phrase_prefix: Vec::new(),
+        matching,
+        groups: Vec::new(),
+        truncated: false,
+        dfs,
+        weights: crate::index::text::Bm25Weights::unscored(),
+        driven: None,
+    })
+}
+
+/// [`prepare_text`] for a SCORE (`ORDER BY bm25(...)`, a BM25 leaf): a
+/// trigram walk is a candidate test with no score, so it is refused here
+/// rather than scored as zero.
+pub(super) fn prepare_scored_text(
+    db: &Database,
+    collection: CollectionId,
+    id: IndexId,
+    query: &str,
+    matching: TextMatch,
+) -> QueryResult<PreparedText> {
+    if matches!(matching, TextMatch::Trigram { .. }) {
+        return Err(invalid_query(
+            "a trigram walk narrows LIKE; it has no score to rank by",
+        ));
+    }
+    prepare_text(db, collection, id, query, matching)
+}
+
 pub(super) fn prepare_text(
     db: &Database,
     collection: CollectionId,
@@ -423,6 +492,20 @@ pub(super) fn prepare_text(
 ) -> QueryResult<PreparedText> {
     let info = require_family_index(db, collection, id, IndexFamily::Text, "text")?;
     crate::index::text::descriptor(&info)?;
+    let trigram_index = info.analyzer == Some(crate::collections::TextAnalyzer::Trigram);
+    if let TextMatch::Trigram { escape, insensitive } = matching {
+        if !trigram_index {
+            return Err(invalid_query("a LIKE candidate walk needs a trigram index"));
+        }
+        return prepare_trigram(db, info, query, escape, insensitive, matching);
+    }
+    if trigram_index {
+        // Its terms are pieces, not words: a word query or a BM25 score over
+        // them would answer a question nobody asked.
+        return Err(invalid_query(
+            "a trigram index answers LIKE and ILIKE; words and BM25 need a text index",
+        ));
+    }
     let (analysis, phrase) = if matching == TextMatch::Phrase {
         let phrase = crate::text_analyzer::analyze_phrase_query(query).map_err(invalid_query)?;
         (phrase.analysis, Some(phrase.sequence))
@@ -1636,7 +1719,7 @@ impl Database {
                 index,
                 query,
                 matching,
-            } => CompiledOrder::Bm25(prepare_text(
+            } => CompiledOrder::Bm25(prepare_scored_text(
                 self,
                 request.collection,
                 index,

@@ -159,7 +159,9 @@ fn intact_future_text_family_versions_or_options_refuse_without_mutation() {
         match damage {
             0 => descriptor[10 + 12] = 0x7f,
             1 => descriptor[10 + 13..10 + 15].copy_from_slice(&2u16.to_be_bytes()),
-            2 => descriptor[10 + 15..10 + 17].copy_from_slice(&2u16.to_be_bytes()),
+            // Analyzer 1 is words and 2 the trigram analyzer (0.19); 3 is
+            // the first no release knows.
+            2 => descriptor[10 + 15..10 + 17].copy_from_slice(&3u16.to_be_bytes()),
             3 => descriptor[10 + 17] ^= 1,
             4 => descriptor[10 + 20..10 + 22].copy_from_slice(&2u16.to_be_bytes()),
             5 => descriptor[10 + 22] = 1,
@@ -171,6 +173,38 @@ fn intact_future_text_family_versions_or_options_refuse_without_mutation() {
         drop(raw);
         tail_without_coordination(&path);
         assert_unsupported_unchanged(&path);
+    }
+}
+
+/// A trigram descriptor (analyzer 2) in a file whose header never admitted
+/// the trigram feature is not a newer file but an inconsistent one: every
+/// build that knows the analyzer refuses it as corruption, and changes
+/// nothing.
+#[test]
+fn a_trigram_descriptor_without_its_feature_bit_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("trigram-without-bit");
+    fixture(&path);
+    let mut raw = PageWalStore::open(&path, false, 1 << 20).unwrap();
+    for copy in 0..3u8 {
+        let key = [3, copy, 0x81, 1];
+        let mut descriptor = raw.get(&key).unwrap().unwrap();
+        descriptor[10 + 15..10 + 17].copy_from_slice(&2u16.to_be_bytes());
+        reseal(&mut descriptor);
+        raw.put(&key, &descriptor).unwrap();
+    }
+    raw.commit().unwrap();
+    drop(raw);
+    tail_without_coordination(&path);
+    let before = files(&path);
+    for snapshot in [false, true] {
+        let result = if snapshot {
+            Database::open_snapshot(&path, cfg())
+        } else {
+            Database::open(&path, cfg())
+        };
+        assert!(matches!(result, Err(Error::Corrupt(_))), "a trigram descriptor without its bit opened");
+        assert_eq!(files(&path), before);
     }
 }
 

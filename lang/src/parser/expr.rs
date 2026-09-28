@@ -274,8 +274,8 @@ impl Parser {
                 },
             });
         }
-        // `col LIKE 'abc%'` is a text-key prefix range over `col`'s own
-        // btree; any other pattern needs the trigram family (§3).
+        // `col LIKE 'abc%'` here is a text-key prefix range over `col`'s own
+        // btree; any other pattern is the TEXT column's own `LIKE` (§3).
         if self.word().as_deref().map(str::to_ascii_uppercase).as_deref() == Some("LIKE") {
             self.bump();
             let value = self.literal()?;

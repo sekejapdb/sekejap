@@ -557,12 +557,26 @@ these persistent tags blindly.
   MEMBERSHIPS tail -- per table, the graphs it is an element of, its element
   name, vertex or edge, and its labels (`core/engine/src/index/graph/property_graph.rs`).
   Set only when a definition is first stored, so a file without one is
-  unchanged. The next unclaimed bit is `0x800000`.
+  unchanged.
+  `TRIGRAM_FEATURE = 0x800000` (0.19) is TRIGRAM text indexes, and the mask
+  is `0xffffff`: a text-family descriptor whose analyzer field -- present in
+  every text descriptor since the first, and 1 until now -- is 2. The index
+  writes the text family's own keyspaces (`0x75` postings, `0x76` norms,
+  `0x77` term statistics, `0x78` corpus, the packed segment tier) under its
+  own index id, with 3-character pieces where analyzer 1 writes words
+  (`core/engine/src/index/text/trigram.rs`); no key of another index can
+  collide with them. Set only when the first trigram index is created, so a
+  file without one is unchanged; a binary without the bit refuses a file
+  that has one at admission, and a text descriptor naming an analyzer it
+  does not know as `Unsupported`. The next unclaimed bit is `0x1000000`.
   Every bit in it is
   additive: set in the same transaction as the first record that needs it,
   never cleared, and a file declaring a bit outside the mask is refused as
   `Unsupported` at admission, before a record is read (Law 8). Adding a bit is
-  the only permitted change to the on-disk format.
+  the only permitted change to the on-disk format: with a new keyspace, or --
+  since the tag run is full -- with an existing family's keyspaces under a
+  descriptor value that family's decoder refuses today (the trigram
+  analyzer is the first).
 - `E4PWAL02` persists required feature bits, including compact cells.
   Since the loop-2 codec change (2026-09-16) the cell encoding is a property
   of the database, not of the build: every build decodes both cell families, a

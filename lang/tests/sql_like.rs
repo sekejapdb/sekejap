@@ -6,7 +6,7 @@
 //!
 //! * every pattern shape -- `%`, `_`, the backslash and an `ESCAPE` character,
 //!   case folding beyond ASCII, the empty string, `NOT` -- answers exactly the
-//!   rows PostgreSQL 16 answers; `VECTORS` below was produced by it
+//!   rows PostgreSQL 16 answers; `VECTORS` (`common/like_vectors.rs`) was produced by it
 //!   (`like_and_ilike_answer_as_postgresql`);
 //! * a row with no value matches neither `LIKE` nor `NOT LIKE`, and a prefix
 //!   `LIKE` keeps using the column's index
@@ -22,65 +22,9 @@ use sekejap_core::collections::Database;
 use sekejap_lang::{SqlDatabase, SqlError, SqlResult, SqlValue};
 use tempfile::TempDir;
 
-/// `(operator, pattern as written after it, keys PostgreSQL answers)`.
-const VECTORS: &[(&str, &str, &str)] = &[
-    ("LIKE", r#"'%doe%'"#, "k2,k4"),
-    ("ILIKE", r#"'%doe%'"#, "k1,k2,k4,k9"),
-    ("NOT LIKE", r#"'%doe%'"#, "k1,k10,k3,k5,k6,k7,k9"),
-    ("NOT ILIKE", r#"'%doe%'"#, "k10,k3,k5,k6,k7"),
-    ("LIKE", r#"'john%'"#, "k2"),
-    ("ILIKE", r#"'john%'"#, "k1,k2"),
-    ("NOT LIKE", r#"'john%'"#, "k1,k10,k3,k4,k5,k6,k7,k9"),
-    ("NOT ILIKE", r#"'john%'"#, "k10,k3,k4,k5,k6,k7,k9"),
-    ("LIKE", r#"'%com'"#, "k1,k2"),
-    ("ILIKE", r#"'%com'"#, "k1,k2"),
-    ("NOT LIKE", r#"'%com'"#, "k10,k3,k4,k5,k6,k7,k9"),
-    ("NOT ILIKE", r#"'%com'"#, "k10,k3,k4,k5,k6,k7,k9"),
-    ("LIKE", r#"'j_hn%'"#, "k2"),
-    ("ILIKE", r#"'j_hn%'"#, "k1,k2"),
-    ("NOT LIKE", r#"'j_hn%'"#, "k1,k10,k3,k4,k5,k6,k7,k9"),
-    ("NOT ILIKE", r#"'j_hn%'"#, "k10,k3,k4,k5,k6,k7,k9"),
-    ("LIKE", r#"'%\%%'"#, "k5"),
-    ("ILIKE", r#"'%\%%'"#, "k5"),
-    ("NOT LIKE", r#"'%\%%'"#, "k1,k10,k2,k3,k4,k6,k7,k9"),
-    ("NOT ILIKE", r#"'%\%%'"#, "k1,k10,k2,k3,k4,k6,k7,k9"),
-    ("LIKE", r#"'%!_%' ESCAPE '!'"#, "k6"),
-    ("ILIKE", r#"'%!_%' ESCAPE '!'"#, "k6"),
-    ("NOT LIKE", r#"'%!_%' ESCAPE '!'"#, "k1,k10,k2,k3,k4,k5,k7,k9"),
-    ("NOT ILIKE", r#"'%!_%' ESCAPE '!'"#, "k1,k10,k2,k3,k4,k5,k7,k9"),
-    ("LIKE", r#"'_'"#, ""),
-    ("ILIKE", r#"'_'"#, ""),
-    ("NOT LIKE", r#"'_'"#, "k1,k10,k2,k3,k4,k5,k6,k7,k9"),
-    ("NOT ILIKE", r#"'_'"#, "k1,k10,k2,k3,k4,k5,k6,k7,k9"),
-    ("LIKE", r#"'%'"#, "k1,k10,k2,k3,k4,k5,k6,k7,k9"),
-    ("ILIKE", r#"'%'"#, "k1,k10,k2,k3,k4,k5,k6,k7,k9"),
-    ("NOT LIKE", r#"'%'"#, ""),
-    ("NOT ILIKE", r#"'%'"#, ""),
-    ("LIKE", r#"''"#, "k10"),
-    ("ILIKE", r#"''"#, "k10"),
-    ("NOT LIKE", r#"''"#, "k1,k2,k3,k4,k5,k6,k7,k9"),
-    ("NOT ILIKE", r#"''"#, "k1,k2,k3,k4,k5,k6,k7,k9"),
-    ("LIKE", r#"'Doe'"#, ""),
-    ("ILIKE", r#"'Doe'"#, "k9"),
-    ("NOT LIKE", r#"'Doe'"#, "k1,k10,k2,k3,k4,k5,k6,k7,k9"),
-    ("NOT ILIKE", r#"'Doe'"#, "k1,k10,k2,k3,k4,k5,k6,k7"),
-    ("LIKE", r#"'%é%'"#, ""),
-    ("ILIKE", r#"'%é%'"#, "k7"),
-    ("NOT LIKE", r#"'%é%'"#, "k1,k10,k2,k3,k4,k5,k6,k7,k9"),
-    ("NOT ILIKE", r#"'%é%'"#, "k1,k10,k2,k3,k4,k5,k6,k9"),
-    ("LIKE", r#"'%ÉCOLE%'"#, ""),
-    ("ILIKE", r#"'%ÉCOLE%'"#, "k7"),
-    ("NOT LIKE", r#"'%ÉCOLE%'"#, "k1,k10,k2,k3,k4,k5,k6,k7,k9"),
-    ("NOT ILIKE", r#"'%ÉCOLE%'"#, "k1,k10,k2,k3,k4,k5,k6,k9"),
-    ("LIKE", r#"'%DOE%'"#, "k9"),
-    ("ILIKE", r#"'%DOE%'"#, "k1,k2,k4,k9"),
-    ("NOT LIKE", r#"'%DOE%'"#, "k1,k10,k2,k3,k4,k5,k6,k7"),
-    ("NOT ILIKE", r#"'%DOE%'"#, "k10,k3,k5,k6,k7"),
-    ("LIKE", r#"'%do_%'"#, "k2,k4"),
-    ("ILIKE", r#"'%do_%'"#, "k1,k2,k4,k9"),
-    ("NOT LIKE", r#"'%do_%'"#, "k1,k10,k3,k5,k6,k7,k9"),
-    ("NOT ILIKE", r#"'%do_%'"#, "k10,k3,k5,k6,k7"),
-];
+#[path = "common/like_vectors.rs"]
+mod like_vectors;
+use like_vectors::{ROWS, VECTORS};
 
 fn fixture(dir: &TempDir) -> Database {
     let mut db = Database::create(
@@ -94,7 +38,7 @@ fn fixture(dir: &TempDir) -> Database {
     .unwrap();
     for sql in [
         "CREATE TABLE t (_key TEXT PRIMARY KEY, v TEXT, n INT)",
-        "INSERT INTO t (_key, v) VALUES ('k1', 'JohnDoe@example.com'), ('k2', 'john.doe@example.com'), ('k3', 'Jane Roe'), ('k4', 'joshndoesadikin'), ('k5', '100% cotton'), ('k6', 'under_score'), ('k7', 'École Ubud'), ('k8', NULL), ('k9', 'DOE'), ('k10', '')",
+        ROWS,
         "COMMIT",
     ] {
         db.sql(sql, &[]).unwrap_or_else(|e| panic!("`{sql}`: {e}"));

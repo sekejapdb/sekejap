@@ -1048,6 +1048,33 @@ impl Compiler<'_> {
                 }
                 CompiledIndex::QuantizedVector { field: column }
             }
+            IndexMethod::Trigram { column, alias } => {
+                let class = alias.as_deref().unwrap_or("gin_trgm_ops");
+                let kind = self.kind_of(c, &column)?;
+                if !matches!(kind, Kind::Text) {
+                    // PostgreSQL 14's sentence and SQLSTATE, with the type
+                    // named as PostgreSQL names it.
+                    let type_name = match kind {
+                        Kind::Int => "bigint",
+                        Kind::Real => "double precision",
+                        Kind::Bool => "boolean",
+                        Kind::Json => "jsonb",
+                        Kind::Geo | Kind::Point => "geometry",
+                        Kind::Vector(_) => "vector",
+                        Kind::Text => unreachable!(),
+                    };
+                    return Err(SqlError::coded(
+                        "42804",
+                        format!(r#"operator class "{class}" does not accept data type {type_name}"#),
+                    ));
+                }
+                if alias.is_some() {
+                    self.notices.push(format!(
+                        "USING gist ({column} gist_trgm_ops) builds the same index as USING gin ({column} gin_trgm_ops): one trigram family, which narrows LIKE and ILIKE; the GiST variant's <-> ordering is not built"
+                    ));
+                }
+                CompiledIndex::Trigram { field: column }
+            }
             IndexMethod::Vamana { column, alias } => {
                 if !matches!(self.kind_of(c, &column)?, Kind::Vector(_)) {
                     return Err(SqlError::unsupported(format!(
@@ -1078,6 +1105,7 @@ impl Compiler<'_> {
                         (format!("{field}_{member}"), "btree")
                     }
                     CompiledIndex::Text { field } => (field.clone(), "gin"),
+                    CompiledIndex::Trigram { field } => (field.clone(), "trgm"),
                     CompiledIndex::Point { field } | CompiledIndex::Geometry { field } => {
                         (field.clone(), "gist")
                     }
@@ -1144,7 +1172,16 @@ fn same_index(method: &CompiledIndex, info: &IndexInfo) -> bool {
                 && info.expression == Some(IndexExpr::JsonText(member.clone()))
                 && info.field == *field
         }
-        CompiledIndex::Text { field } => info.family == IndexFamily::Text && info.field == *field,
+        CompiledIndex::Text { field } => {
+            info.family == IndexFamily::Text
+                && info.analyzer == Some(TextAnalyzer::Words)
+                && info.field == *field
+        }
+        CompiledIndex::Trigram { field } => {
+            info.family == IndexFamily::Text
+                && info.analyzer == Some(TextAnalyzer::Trigram)
+                && info.field == *field
+        }
         CompiledIndex::Point { field } => {
             info.family == IndexFamily::SpatialPoint && info.field == *field
         }

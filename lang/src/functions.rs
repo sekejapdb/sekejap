@@ -687,7 +687,7 @@ pub(crate) fn prefix_successor(prefix: &str) -> PrefixSuccessor {
 ///
 /// `_` and an interior `%` are not prefixes, and a `%` inside the literal
 /// part cannot be escaped in this slice: both cases return `None` and the
-/// caller refuses with the trigram reason `docs/lang/QL_CONTRACT.md` §3 names.
+/// caller refuses with the reason `docs/lang/QL_CONTRACT.md` §3 names.
 pub(crate) fn like_prefix(pattern: &str) -> Option<&str> {
     let body = pattern.strip_suffix('%')?;
     if body.is_empty() || body.contains('%') || body.contains('_') || body.contains('\\') {

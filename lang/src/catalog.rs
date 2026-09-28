@@ -730,6 +730,8 @@ struct Index {
     target: String,
     state: IndexState,
     unique: bool,
+    /// A text-family index with the trigram analyzer (`gin_trgm_ops`).
+    trigram: bool,
 }
 
 /// A column DEFAULT as a `CREATE TABLE` writes it, so a statement built from
@@ -841,6 +843,7 @@ fn snapshot(db: &Database, graph: bool) -> SqlResult2<Snapshot> {
                     .map_or_else(|| index.field.clone(), |e| e.target(&index.field)),
                 expression: index.expression.map(|e| e.written()),
                 name: index.name,
+                trigram: index.analyzer == Some(sekejap_core::collections::TextAnalyzer::Trigram),
                 family: index.family,
                 field: index.field,
                 state: index.state,
@@ -1399,6 +1402,7 @@ fn index_def(table: &str, index: &Index) -> String {
     let unique = if index.unique { "UNIQUE " } else { "" };
     let target = &index.target;
     let method = match index.family {
+        IndexFamily::Text if index.trigram => format!("gin ({target} gin_trgm_ops)"),
         IndexFamily::Text => format!("gin (to_tsvector('simple', {target}))"),
         family => format!("{} ({target})", family_word(family)),
     };

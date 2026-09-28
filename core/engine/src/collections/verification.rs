@@ -883,8 +883,12 @@ pub fn verify_indexed_source(
                     IndexFamily::SpatialGeometry => crate::index::spatial::geometry_index::GEOMETRY_FEATURE,
                     IndexFamily::Text => crate::index::text::TEXT_FEATURE,
                     IndexFamily::VamanaGraph => crate::index::vector::graph::VAMANA_FEATURE,
+                } | if decoded.analyzer == Some(crate::collections::TextAnalyzer::Trigram) {
+                    crate::index::text::TRIGRAM_FEATURE
+                } else {
+                    0
                 };
-                if header.features & required == 0 {
+                if header.features & required != required {
                     return Err(corrupt("index descriptor lacks required feature bit"));
                 }
             }
@@ -1513,7 +1517,7 @@ fn verify_expected<F: FnMut(&VerificationIssue)>(
         IndexFamily::Text => {
             let f = field(l, row, &i.field)?;
             if let crate::dense_v3::FieldValue::Inline(Value::String(text)) = f {
-                let a = crate::text_analyzer::analyze(&text).map_err(invalid)?;
+                let a = crate::index::text::analyze_value(i, &text)?;
                 for (term, tf) in &a.terms {
                     let key = crate::index::text::posting_key(i.id, term, id.sequence);
                     let mut actual = run.read(&key)?;
@@ -2294,7 +2298,7 @@ fn verify_text_norm_blocks<F: FnMut(&VerificationIssue)>(
         if let Some((id, layout, row)) = primary_field(run, i, sequence)? {
             let expected = match field(&layout, &row, &i.field)? {
                 crate::dense_v3::FieldValue::Inline(Value::String(text)) => {
-                    Some(crate::text_analyzer::analyze(&text).map_err(invalid)?.length)
+                    Some(crate::index::text::analyze_value(i, &text)?.length)
                 }
                 _ => None,
             };
@@ -2512,8 +2516,7 @@ fn verify_text_segments<F: FnMut(&VerificationIssue)>(
         if let Some((id, layout, row)) = primary_field(run, i, sequence)? {
             let expected = match field(&layout, &row, &i.field)? {
                 crate::dense_v3::FieldValue::Inline(Value::String(text)) => {
-                    crate::text_analyzer::analyze(&text)
-                        .map_err(invalid)?
+                    crate::index::text::analyze_value(i, &text)?
                         .terms
                         .get(&term)
                         .copied()
@@ -2641,8 +2644,7 @@ fn verify_text_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexI
         if let Some((id, l, row)) = primary_field(run, i, seq)? {
             let expected = match field(&l, &row, &i.field)? {
                 crate::dense_v3::FieldValue::Inline(Value::String(s)) => {
-                    crate::text_analyzer::analyze(&s)
-                        .map_err(invalid)?
+                    crate::index::text::analyze_value(i, &s)?
                         .terms
                         .get(t)
                         .copied()
@@ -2790,7 +2792,7 @@ fn verify_text_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexI
         if let Some((id, l, row)) = primary_field(run, i, seq)? {
             let expected = match field(&l, &row, &i.field)? {
                 crate::dense_v3::FieldValue::Inline(Value::String(s)) => {
-                    Some(crate::text_analyzer::analyze(&s).map_err(invalid)?.length)
+                    Some(crate::index::text::analyze_value(i, &s)?.length)
                 }
                 _ => None,
             };

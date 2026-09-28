@@ -559,6 +559,12 @@ pub(super) fn text_score<'a, C: FnMut() -> bool>(
     if scratch.text.frequencies.is_empty() || !prepared.admits(&scratch.text.present) {
         return Ok(None);
     }
+    // A trigram walk is a candidate test: every required piece is present,
+    // which is all it can say. It has no score, and BM25 over pieces would
+    // be a number nobody asked for (and zero, which BM25 refuses).
+    if matches!(prepared.matching, TextMatch::Trigram { .. }) {
+        return Ok(Some(0.0));
+    }
     let frequencies = scratch.text.frequencies.as_slice();
     let idfs = scratch.text.idfs.as_slice();
     if let Some(phrase) = prepared.phrase.as_deref() {

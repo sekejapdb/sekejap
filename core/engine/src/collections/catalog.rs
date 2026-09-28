@@ -151,6 +151,34 @@ pub struct IndexInfo {
     /// [`IndexExpr::apply`] first. No row byte changes: the derived value
     /// lives in the index and nowhere else.
     pub expression: Option<IndexExpr>,
+    /// `Some` for the text family, `None` for every other: how a value
+    /// becomes terms. It is the descriptor's analyzer field, which every text
+    /// descriptor has carried since the first one (always 1 until 0.19).
+    pub analyzer: Option<TextAnalyzer>,
+}
+/// How a text-family index turns a value into the terms its postings hold.
+///
+/// Both analyzers write the same keyspaces -- postings, norms, term and
+/// corpus statistics, packed segments -- under the index's own id; only the
+/// terms differ. The descriptor records which one wrote them, so a reader
+/// never analyzes a value one way and looks it up another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextAnalyzer {
+    /// Analyzer v1 (`crate::index::text::analyzer`): words, pinned Unicode
+    /// lowercase. `to_tsvector('simple', col)`. Descriptor analyzer 1.
+    Words,
+    /// Every 3-character piece of the whole folded text, with start and end
+    /// markers (`crate::index::text::trigram`). `col gin_trgm_ops`.
+    /// Descriptor analyzer 2, behind [`crate::index::text::TRIGRAM_FEATURE`].
+    Trigram,
+}
+impl TextAnalyzer {
+    pub(crate) fn version(self) -> u16 {
+        match self {
+            Self::Words => crate::text_analyzer::ANALYZER_VERSION,
+            Self::Trigram => crate::index::text::trigram::TRIGRAM_ANALYZER_VERSION,
+        }
+    }
 }
 impl IndexInfo {
     /// The declared [`Kind`] of the SOURCE field, which is `kind` for an
@@ -460,7 +488,10 @@ pub(super) fn encode(i: &IndexInfo) -> Result<Vec<u8>> {
             }
             b.push(4);
             b.extend(i.encoding_version.to_be_bytes());
-            b.extend(crate::text_analyzer::ANALYZER_VERSION.to_be_bytes());
+            let analyzer = i
+                .analyzer
+                .ok_or_else(|| invalid("text index descriptor without an analyzer"))?;
+            b.extend(analyzer.version().to_be_bytes());
             let unicode = crate::text_analyzer::UNICODE_VERSION;
             b.extend([unicode.0, unicode.1, unicode.2]);
             b.extend(crate::index::text::BM25_VERSION.to_be_bytes());
@@ -551,6 +582,7 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
             )));
         }
     };
+    let mut analyzer = None;
     let (kind, unique, state_at, cursor_at, mut at) = match family {
         IndexFamily::Scalar => {
             if b.len() < 26 {
@@ -616,9 +648,18 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
             if b.len() < 32 {
                 return Err(corrupt("short text index descriptor"));
             }
-            if u16::from_be_bytes(b[15..17].try_into().unwrap())
-                != crate::text_analyzer::ANALYZER_VERSION
-                || b[17..20]
+            analyzer = match u16::from_be_bytes(b[15..17].try_into().unwrap()) {
+                v if v == crate::text_analyzer::ANALYZER_VERSION => Some(TextAnalyzer::Words),
+                v if v == crate::index::text::trigram::TRIGRAM_ANALYZER_VERSION => {
+                    Some(TextAnalyzer::Trigram)
+                }
+                _ => {
+                    return Err(Error::Unsupported(
+                        "text analyzer/Unicode/BM25/options".into(),
+                    ))
+                }
+            };
+            if b[17..20]
                     != [
                         crate::text_analyzer::UNICODE_VERSION.0,
                         crate::text_analyzer::UNICODE_VERSION.1,
@@ -759,6 +800,7 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
         encoding_version: version,
         tree,
         expression,
+        analyzer,
     })
 }
 pub(super) fn read_index(
@@ -807,6 +849,11 @@ pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Resu
         }
         if i.family == IndexFamily::Text && h.features & crate::index::text::TEXT_FEATURE == 0 {
             return Err(corrupt("text descriptor without feature admission"));
+        }
+        if i.analyzer == Some(TextAnalyzer::Trigram)
+            && h.features & crate::index::text::TRIGRAM_FEATURE == 0
+        {
+            return Err(corrupt("trigram descriptor without feature admission"));
         }
         if i.family == IndexFamily::QuantizedVector
             && h.features & crate::index::vector::quantized::QUANTIZED_VECTOR_FEATURE == 0
@@ -1355,6 +1402,7 @@ impl Database {
             },
             tree,
             expression,
+            analyzer: (family == IndexFamily::Text).then_some(TextAnalyzer::Words),
         };
         let (nc, nl) = self.header()?;
         let result = (|| {
@@ -2577,6 +2625,7 @@ mod codec_tests {
             encoding_version: 1,
             tree: None,
             expression: None,
+            analyzer: None,
         };
         let mut payload = 9u64.to_be_bytes().to_vec();
         payload.extend(7u32.to_be_bytes());
@@ -2608,6 +2657,7 @@ mod codec_tests {
             encoding_version: 1,
             tree: None,
             expression: None,
+            analyzer: None,
         };
         let encoded = encode(&info).unwrap();
         assert_eq!(decode(&encoded).unwrap(), info);
@@ -2633,15 +2683,34 @@ mod codec_tests {
             encoding_version: 1,
             tree: None,
             expression: None,
+            analyzer: Some(TextAnalyzer::Words),
         };
         let encoded = encode(&info).unwrap();
         assert_eq!(decode(&encoded).unwrap(), info);
-        let mut future = encoded;
+        let reseal = |mut bytes: Vec<u8>| {
+            let n = bytes.len();
+            let crc = crc32c::crc32c(&bytes[..n - 4]).to_le_bytes();
+            bytes[n - 4..].copy_from_slice(&crc);
+            bytes
+        };
+        let mut future = encoded.clone();
         future[10 + 22] = 1;
-        let n = future.len();
-        let crc = crc32c::crc32c(&future[..n - 4]).to_le_bytes();
-        future[n - 4..].copy_from_slice(&crc);
-        assert!(matches!(decode(&future), Err(Error::Unsupported(_))));
+        assert!(matches!(decode(&reseal(future)), Err(Error::Unsupported(_))));
+        // The analyzer field: 1 is words and its bytes are unchanged, 2 is
+        // the trigram analyzer, and one this build does not know is refused.
+        assert_eq!(&encoded[10 + 15..10 + 17], &[0, 1]);
+        let trigram = IndexInfo {
+            analyzer: Some(TextAnalyzer::Trigram),
+            ..info.clone()
+        };
+        let encoded = encode(&trigram).unwrap();
+        assert_eq!(&encoded[10 + 15..10 + 17], &[0, 2]);
+        assert_eq!(decode(&encoded).unwrap(), trigram);
+        let mut unknown = encoded;
+        unknown[10 + 16] = 3;
+        assert!(matches!(decode(&reseal(unknown)), Err(Error::Unsupported(_))));
+        // A text descriptor must name its analyzer.
+        assert!(encode(&IndexInfo { analyzer: None, ..info }).is_err());
     }
 
     #[test]
@@ -2658,6 +2727,7 @@ mod codec_tests {
             encoding_version: 1,
             tree: None,
             expression: None,
+            analyzer: None,
         };
         let encoded = encode(&info).unwrap();
         assert_eq!(decode(&encoded).unwrap(), info);
@@ -2685,6 +2755,7 @@ mod codec_tests {
             encoding_version: 1,
             tree: None,
             expression: None,
+            analyzer: None,
         };
         let encoded = encode(&info).unwrap();
         assert_eq!(decode(&encoded).unwrap(), info);

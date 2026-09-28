@@ -1684,6 +1684,13 @@ fn text_predicate_text(prepared: &PreparedText) -> String {
         TextMatch::Phrase => "phrase",
         TextMatch::Search => "search",
         TextMatch::Prefix => "prefix",
+        TextMatch::Trigram { .. } => {
+            // Candidates only: the `LIKE` filter beside it decides.
+            return format!(
+                "trigram, all of {} piece(s) of the pattern, candidates only",
+                prepared.terms.len()
+            );
+        }
     };
     if matches!(prepared.matching, TextMatch::Search | TextMatch::Prefix) {
         // A search predicate's term count is the DICTIONARY's answer, not the

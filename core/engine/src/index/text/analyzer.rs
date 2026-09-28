@@ -46,7 +46,7 @@ fn alphanumeric(ch: char) -> bool {
     let at = unicode_v1::ALNUM.partition_point(|&(lo, _)| lo <= cp);
     at > 0 && cp <= unicode_v1::ALNUM[at - 1].1
 }
-fn push_lower(ch: char, token: &mut String) {
+pub(crate) fn push_lower(ch: char, token: &mut String) {
     if ch.is_ascii() {
         token.push(ch.to_ascii_lowercase());
         return;
@@ -137,6 +137,8 @@ pub(crate) struct BuildAnalyzer {
     document: Vec<(u32, u32)>,
     token: String,
     length: u32,
+    /// Cut trigram pieces (`super::trigram`) instead of words.
+    trigram: bool,
 }
 
 impl Default for BuildAnalyzer {
@@ -155,6 +157,17 @@ impl BuildAnalyzer {
             document: Vec::new(),
             token: String::new(),
             length: 0,
+            trigram: false,
+        }
+    }
+
+    /// The build analyzer for a trigram index: the same interning and the
+    /// same per-document output, with [`super::trigram::analyze`]'s pieces,
+    /// counts and refusals.
+    pub(crate) fn trigram() -> Self {
+        Self {
+            trigram: true,
+            ..Self::new()
         }
     }
 
@@ -194,6 +207,17 @@ impl BuildAnalyzer {
             return Err("indexed text exceeds 64 KiB");
         }
         self.length = 0;
+        if self.trigram {
+            let chars = super::trigram::marked(text)?;
+            for window in chars.windows(3) {
+                if window.contains(&'\0') {
+                    continue;
+                }
+                self.token.extend(window);
+                self.finish_token()?;
+            }
+            return Ok(self.length);
+        }
         for ch in text.chars() {
             if alphanumeric(ch) {
                 push_lower(ch, &mut self.token);
@@ -212,7 +236,7 @@ impl BuildAnalyzer {
         if self.token.is_empty() {
             return Ok(());
         }
-        if self.length == MAX_TOKENS {
+        if !self.trigram && self.length == MAX_TOKENS {
             return Err("indexed text exceeds 16384 tokens");
         }
         self.length += 1;
@@ -228,7 +252,10 @@ impl BuildAnalyzer {
             }
         };
         if self.frequency[id] == 0 {
-            if self.touched.len() == MAX_TERMS {
+            if self.trigram && self.touched.len() == super::trigram::MAX_PIECES {
+                return Err("indexed text exceeds 262144 distinct trigram pieces");
+            }
+            if !self.trigram && self.touched.len() == MAX_TERMS {
                 return Err("indexed text exceeds 4096 distinct terms");
             }
             self.touched.push(id as u32);
@@ -548,6 +575,29 @@ mod tests {
             }
             assert_eq!(seen, oracle.terms, "terms for {body:?}");
         }
+    }
+
+    /// The trigram build analyzer against `trigram::analyze`, document by
+    /// document, one analyzer reused across all of them.
+    #[test]
+    fn the_trigram_build_analyzer_agrees_with_trigram_analyze() {
+        let mut build = BuildAnalyzer::trigram();
+        for i in 0..2_000u64 {
+            let body = generated_body(i);
+            let oracle = super::super::trigram::analyze(&body).unwrap();
+            let length = build.analyze(&body).unwrap();
+            assert_eq!(length, oracle.length, "piece count for {body:?}");
+            let mut seen: BTreeMap<String, u32> = BTreeMap::new();
+            for &(id, frequency) in build.document() {
+                seen.insert(build.names()[id as usize].to_string(), frequency);
+            }
+            assert_eq!(seen, oracle.terms, "pieces for {body:?}");
+        }
+        let long = "x".repeat(MAX_TEXT_BYTES + 1);
+        assert_eq!(
+            build.analyze(&long).unwrap_err(),
+            super::super::trigram::analyze(&long).unwrap_err()
+        );
     }
 
     /// Every bound, with the same sentence, and the analyzer still usable

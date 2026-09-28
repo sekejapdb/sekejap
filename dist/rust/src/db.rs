@@ -708,6 +708,7 @@ impl Db {
                     name: i.name,
                     field: i.field,
                     family: i.family,
+                    analyzer: i.analyzer,
                     unique: i.unique,
                     ready: matches!(
                         i.state,

@@ -2,7 +2,7 @@
 pub mod analyzer;
 use crate::collections::{
     corrupt, catalog, invalid, layout_id, ordered, read_ordered, row_key, CollectionId, Database,
-    EntityId, Error, IndexFamily, IndexId, IndexInfo, IndexState, Result,
+    EntityId, Error, IndexFamily, IndexId, IndexInfo, IndexState, Result, TextAnalyzer,
 };
 use crate::Kind;
 use kernel::btree::RangeIter;
@@ -14,6 +14,9 @@ use std::{
 };
 
 pub(crate) const TEXT_FEATURE: u64 = 0x10;
+/// A text descriptor whose analyzer is 2 (`trigram`): set in the transaction
+/// that creates the first trigram index, never cleared (Law 8).
+pub const TRIGRAM_FEATURE: u64 = 0x800000;
 pub(crate) const POSTING: u8 = 0x75;
 pub(crate) const NORM: u8 = 0x76;
 pub(crate) const TERM_STATS: u8 = 0x77;
@@ -63,6 +66,14 @@ pub enum TextMatch {
     /// PREFIXES. The same bounded dictionary walk as [`TextMatch::Search`]
     /// with typos off; the query text keeps the `:*` markers.
     Prefix,
+    /// A trigram index (`col gin_trgm_ops`) narrowing `[I]LIKE`: the query
+    /// text is the PATTERN, and a document is a candidate when it holds every
+    /// piece [`trigram::required`] names for it. Only a CANDIDATE: the caller
+    /// keeps the `LIKE` filter, which decides.
+    Trigram {
+        escape: Option<char>,
+        insensitive: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -103,6 +114,7 @@ pub(crate) struct Corpus {
 
 pub mod fuzzy;
 pub(crate) mod segments;
+pub(crate) mod trigram;
 mod unicode_v1;
 
 /// Does this file's collection header admit the packed segment tier?
@@ -537,6 +549,19 @@ pub(crate) fn corpus_key(id: IndexId) -> Vec<u8> {
     index_prefix(CORPUS_STATS, id)
 }
 
+/// [`descriptor`], and the analyzer is words: the API calls that analyze a
+/// QUERY as words refuse a trigram index rather than look up words among
+/// its pieces.
+pub(crate) fn words_descriptor(index: &IndexInfo) -> Result<()> {
+    descriptor(index)?;
+    if index.analyzer != Some(TextAnalyzer::Words) {
+        return Err(invalid(
+            "a trigram index answers LIKE and ILIKE; words and BM25 need a text index",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn descriptor(index: &IndexInfo) -> Result<()> {
     if index.family != IndexFamily::Text
         || index.kind != Kind::Text
@@ -548,7 +573,35 @@ pub(crate) fn descriptor(index: &IndexInfo) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn selected(document: &Value, field: &str) -> Result<Option<Analysis>> {
+/// How many pieces a trigram index would require for this `[I]LIKE`
+/// pattern: 0 means it cannot narrow it and the rows are checked instead.
+/// The SQL layer asks before it plans, so the answer and the walk come from
+/// the same function.
+pub fn trigram_pieces(pattern: &str, escape: Option<char>, insensitive: bool) -> Result<usize> {
+    trigram::required(pattern, escape, insensitive)
+        .map(|pieces| pieces.len())
+        .map_err(invalid)
+}
+
+/// One text value's terms under the index's own analyzer.
+pub(crate) fn analyze_value(index: &IndexInfo, text: &str) -> Result<Analysis> {
+    match index.analyzer {
+        Some(TextAnalyzer::Trigram) => trigram::analyze(text),
+        _ => text_analyzer::analyze(text),
+    }
+    .map_err(invalid)
+}
+
+/// The build analyzer for the index's own analyzer.
+pub(crate) fn build_analyzer(index: &IndexInfo) -> text_analyzer::BuildAnalyzer {
+    match index.analyzer {
+        Some(TextAnalyzer::Trigram) => text_analyzer::BuildAnalyzer::trigram(),
+        _ => text_analyzer::BuildAnalyzer::new(),
+    }
+}
+
+pub(super) fn selected(index: &IndexInfo, document: &Value) -> Result<Option<Analysis>> {
+    let field = &index.field;
     let Some(value) = document.get(field) else {
         return Ok(None);
     };
@@ -558,7 +611,7 @@ pub(super) fn selected(document: &Value, field: &str) -> Result<Option<Analysis>
     let text = value
         .as_str()
         .ok_or_else(|| invalid("indexed text field must be a string"))?;
-    text_analyzer::analyze(text).map(Some).map_err(invalid)
+    analyze_value(index, text).map(Some)
 }
 
 pub(crate) fn decode_u32(bytes: &[u8], what: &'static str) -> Result<u32> {
@@ -1108,11 +1161,11 @@ pub(crate) fn maintain_text(
 ) -> Result<()> {
     descriptor(index)?;
     let old = old
-        .map(|document| selected(document, &index.field))
+        .map(|document| selected(index, document))
         .transpose()?
         .flatten();
     let new = new
-        .map(|document| selected(document, &index.field))
+        .map(|document| selected(index, document))
         .transpose()?
         .flatten();
     apply_transition(db, index, entity, old.as_ref(), new.as_ref())
@@ -1135,7 +1188,7 @@ pub(crate) fn analyze_row_bytes(
     match crate::dense_v3::read_field(&layout, row, &index.field).map_err(corrupt)? {
         crate::dense_v3::FieldValue::Missing | crate::dense_v3::FieldValue::Null => Ok(None),
         crate::dense_v3::FieldValue::Inline(Value::String(text)) => {
-            Ok(Some(text_analyzer::analyze(&text).map_err(invalid)?))
+            Ok(Some(analyze_value(index, &text)?))
         }
         crate::dense_v3::FieldValue::Inline(_) | crate::dense_v3::FieldValue::Vector { .. } => {
             Err(invalid("historical indexed text field changed kind"))
@@ -1361,6 +1414,10 @@ const BYTES_PER_UNIT: usize = 64;
 /// Rows one scan run visits before the builder is handed the store back to
 /// flush what that run finished.
 const SCAN_RUN_ROWS: usize = 65_536;
+/// Rows per scan run for a trigram index: a 64 KiB text is about 57 Ki
+/// distinct pieces, so 256 such rows complete tens of MiB of segments where
+/// 65,536 would complete gigabytes.
+const TRIGRAM_SCAN_RUN_ROWS: usize = 256;
 
 /// Unfinished segment bytes the accumulator may hold before it gives up
 /// maximal packing to stay inside a bound. See `build_sorted`'s sacrifices.
@@ -1488,11 +1545,20 @@ pub(crate) fn build_sorted(
     descriptor(i)?;
     clear_unpublished(db, i)?;
 
-    let mut analyzer = text_analyzer::BuildAnalyzer::new();
+    let mut analyzer = build_analyzer(i);
     let mut terms: Vec<TermAccumulator> = Vec::new();
     let mut corpus = Corpus {
         documents: 0,
         tokens: 0,
+    };
+    // A trigram row writes one posting per distinct piece -- tens of
+    // thousands for a long text -- and the segments a run completes are held
+    // until the run ends, so its runs are shorter (Law 1: the held bytes stay
+    // near `MAX_HELD_BYTES` whatever the analyzer).
+    let run_rows = if i.analyzer == Some(TextAnalyzer::Trigram) {
+        TRIGRAM_SCAN_RUN_ROWS
+    } else {
+        SCAN_RUN_ROWS
     };
     // Norms are packed straight off the scan -- `scan_collection_rows_from`
     // already walks primary rows in ascending sequence, which is the order the
@@ -1524,7 +1590,7 @@ pub(crate) fn build_sorted(
             source.scan_collection_rows_from(
                 index.collection,
                 after,
-                SCAN_RUN_ROWS,
+                run_rows,
                 |eid, row| {
                     let Some(length) = analyze_row_bytes_into(source, index, row, analyzer)? else {
                         return Ok(());
@@ -1790,6 +1856,15 @@ pub(crate) struct Bm25Weights {
     average: f64,
 }
 
+impl Bm25Weights {
+    /// The weights a query that never scores carries: a trigram walk. Its
+    /// corpus may hold documents with no piece at all (a text of NUL), which
+    /// BM25 would refuse and a candidate test has no reason to.
+    pub(crate) fn unscored() -> Self {
+        Self { average: 1.0 }
+    }
+}
+
 /// The corpus half of the score, once per query.
 pub(crate) fn bm25_weights(corpus: Corpus) -> Result<Bm25Weights> {
     // An EMPTY corpus is a new or emptied table, not a damaged one: it has no
@@ -1912,6 +1987,28 @@ impl Database {
         Ok(id)
     }
 
+    /// A trigram index over a Text field (`col gin_trgm_ops`, 0.19 A1): a
+    /// text index whose analyzer is [`TextAnalyzer::Trigram`]. It answers
+    /// `[I]LIKE` candidates through `TextMatch::Trigram`; words and BM25 are
+    /// refused against it. The first one sets [`TRIGRAM_FEATURE`] in this
+    /// same transaction.
+    pub fn create_trigram_index(
+        &mut self,
+        collection: CollectionId,
+        name: &str,
+        field: &str,
+    ) -> Result<IndexId> {
+        let id = self.create_text_index(collection, name, field)?;
+        let result = (|| {
+            let mut info = self.index_info(id)?;
+            info.analyzer = Some(TextAnalyzer::Trigram);
+            self.save_index(&info)?;
+            self.enable_index_feature(TRIGRAM_FEATURE)
+        })();
+        self.finish(result)?;
+        Ok(id)
+    }
+
     /// What `search(col, 'query')` expands to against this index's term
     /// dictionary, WITHOUT preparing a query.
     ///
@@ -1923,7 +2020,7 @@ impl Database {
     /// cheap and asking twice is bounded twice.
     pub fn search_expansion(&self, id: IndexId, query: &str) -> Result<fuzzy::SearchExpansion> {
         let index = self.index_info(id)?;
-        descriptor(&index)?;
+        words_descriptor(&index)?;
         if index.state != IndexState::Ready {
             return Err(invalid("index is not ready"));
         }
@@ -1956,8 +2053,13 @@ impl Database {
         if k > catalog::MAX_RESULTS {
             return Err(invalid("query result limit exceeds 65536"));
         }
+        if matches!(matching, TextMatch::Trigram { .. }) {
+            return Err(invalid(
+                "a trigram walk narrows LIKE inside a query; query_text ranks words",
+            ));
+        }
         let index = self.index_info(id)?;
-        descriptor(&index)?;
+        words_descriptor(&index)?;
         if index.state != IndexState::Ready {
             return Err(invalid("index is not ready"));
         }

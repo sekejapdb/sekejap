@@ -294,7 +294,8 @@ one spelling and this crate does not add a second.
 ```rust,signatures
 pub struct Collection { pub name: String, pub fields: Vec<Field>, pub indexes: Vec<Index>, pub timestamps: bool, pub rows: Option<u64> }
 pub struct Field { pub name: String, pub kind: FieldKind, pub declared: Option<String>, pub primary_key: bool, pub not_null: bool, pub default: Option<String> }
-pub struct Index { pub name: String, pub field: String, pub family: IndexFamily, pub unique: bool, pub ready: bool }
+pub struct Index { pub name: String, pub field: String, pub family: IndexFamily, pub analyzer: Option<TextAnalyzer>, pub unique: bool, pub ready: bool }
+// analyzer: Some(Words) for gin(to_tsvector(...)), Some(Trigram) for gin(col gin_trgm_ops), None for other families (0.19)
 ```
 
 `FieldKind` is `sekejap_core::Kind`, re-exported: `Text`, `Int`, `Real`, `Bool`,

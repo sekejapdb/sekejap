@@ -75,7 +75,7 @@ const GEO_CONSTRUCTORS: &[&str] = &[
 
 /// The reason a `LIKE` that is not a pure prefix carries. Named here because
 /// two sites raise it and `docs/lang/QL_CONTRACT.md` §3 writes it once.
-pub(super) const LIKE_NOT_A_PREFIX: &str = "QL_CONTRACT §3: `LIKE 'abc%'` is a text-key PREFIX range and is accepted; any other pattern (`'%abc%'`, `'a_c'`, an interior `%`) needs the trigram index family (pg_trgm-compatible) under a new feature bit, which is not built. Without that index the only way to answer it is a scan, and §6 does not allow one to be taken silently.";
+pub(super) const LIKE_NOT_A_PREFIX: &str = "QL_CONTRACT §3: in this position `LIKE 'abc%'` is a text-key PREFIX range and is the one form accepted; any other pattern (`'%abc%'`, `'a_c'`, an interior `%`) is answered by `col LIKE ...` on the TEXT column itself -- checked on each row, and narrowed by a trigram index (`gin_trgm_ops`) when the column has one.";
 
 /// A statement nests at most this deep: a scalar subquery inside a predicate
 /// inside a statement, and an arithmetic ORDER BY of bounded depth. The cap is

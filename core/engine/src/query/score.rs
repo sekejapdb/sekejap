@@ -157,7 +157,7 @@ pub(super) fn compile_score_expr(
             matching,
         } => {
             leaf(leaves)?;
-            Ok(CompiledScoreExpr::Bm25(prepare_text(
+            Ok(CompiledScoreExpr::Bm25(super::plan::prepare_scored_text(
                 db, collection, *index, query, *matching,
             )?))
         }

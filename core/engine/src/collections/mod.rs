@@ -138,7 +138,7 @@ pub use crate::index::graph::adjacency::{AdjacencyCursor, AdjacentEdge, PausedAd
 pub use crate::index::graph::endpoints::{EndpointProgress, ENDPOINT_FEATURE};
 pub use crate::index::spatial::point::{SpatialCandidates, SpatialHit};
 pub use crate::index::text::fuzzy::SearchExpansion;
-pub use crate::index::text::{TextCandidates, TextHit, TextMatch};
+pub use crate::index::text::{trigram_pieces, TextCandidates, TextHit, TextMatch, TRIGRAM_FEATURE};
 pub use crate::index::vector::exact::{vector_distance, VectorCandidates, VectorHit, VectorMetric};
 pub use crate::index::vector::quantized::{
     ApproxVectorMethod, ApproxVectorResult, QuantizedVectorCandidates,
@@ -160,6 +160,7 @@ pub use crate::query::{
 /// so the layer that sets a statement timeout, and the test that measures
 /// one, can name the number instead of assuming it.
 pub use crate::query::DEADLINE_POLL_CHARGES;
+pub use crate::query::MAX_FILTERS as MAX_QUERY_FILTERS;
 pub use crate::query::{
     ApproximationDiagnostics, CandidateDriver, FilterAnswer, FilterPlan, Geom, GeometryFilter,
     OrderValue, OwnedScalarValue, PointFilter, PreparedQuery, ProjectedValue, Projection,
@@ -170,7 +171,7 @@ pub use crate::query::{
 pub use catalog::{
     create_index_trees, set_create_index_trees, IndexExpr, IndexFamily, IndexId, IndexInfo,
     IndexState, JSON_EXPRESSION_FEATURE,
-    IndexTree, ScalarPredicate, MAX_INDEXES,
+    IndexTree, ScalarPredicate, TextAnalyzer, MAX_INDEXES,
 };
 pub use column_rules::{ColumnRule, DefaultValue, COLUMN_RULES_FEATURE, CONSTANT_DEFAULT_FEATURE};
 pub use drop_collection::{DropMode, DropPhase, DropProgress, DropState, MAX_DROP_BATCH};
@@ -1076,7 +1077,9 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
 /// ([`column_rules::CONSTANT_DEFAULT_FEATURE`]).
 /// `0x400000` PROPERTY GRAPH definitions -- the catalog's memberships tail
 /// ([`crate::index::graph::property_graph::PROPERTY_GRAPH_FEATURE`]).
-/// The mask is therefore `0x7fffff`.
+/// `0x800000` TRIGRAM text indexes -- a text descriptor whose analyzer is 2
+/// ([`crate::index::text::TRIGRAM_FEATURE`]).
+/// The mask is therefore `0xffffff`.
 /// Every one is additive: set in the same transaction as the first record
 /// that uses it, never cleared, and a file that declares a bit outside this
 /// mask is refused as `Unsupported` at admission (Law 8).
@@ -1111,7 +1114,8 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | crate::index::graph::property_graph::PROPERTY_GRAPH_FEATURE
     | catalog::JSON_EXPRESSION_FEATURE
     | SCHEMA_FEATURE
-    | crate::index::graph::EDGE_ID_FEATURE;
+    | crate::index::graph::EDGE_ID_FEATURE
+    | crate::index::text::TRIGRAM_FEATURE;
 /// One header's feature word against the mask a binary implements.
 ///
 /// Split out of [`parse_header`] so a test can put an OLDER mask in place of
@@ -3259,7 +3263,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x7fffff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0xffffff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -3280,7 +3284,7 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0x7fffff
+            0xffffff
         );
         // A bit outside the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
@@ -3288,12 +3292,13 @@ mod tests {
         // graph (`0x8000`) and the JSON-path expression index (`0x10000`)
         // landed together, named schemas took `0x20000` and edge identity
         // `0x40000`, so the mask is contiguous through bit 18 and the first
-        // unclaimed bit is `0x800000` (edge tables took `0x80000`, key
+        // unclaimed bit is `0x1000000` (edge tables took `0x80000`, key
         // declarations `0x100000`, constant defaults `0x200000`, property
-        // graph definitions `0x400000`).
+        // graph definitions `0x400000`, trigram indexes `0x800000`), so the
+        // probe is `0x1000000`.
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x800000)),
-            Err(Error::Unsupported(m)) if m.contains("0xffffff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x1000000)),
+            Err(Error::Unsupported(m)) if m.contains("0x1ffffff")
         ));
     }
     /// Law 8 for the live row count, the same shape the declared-type bit's
@@ -3324,9 +3329,9 @@ mod tests {
             Err(Error::Unsupported(m)) if m.contains("0x2001")
         ));
         // And a bit past every implemented family is refused by this build
-        // too. `0x400000` is property graphs now, so the probe is `0x800000`.
+        // too. `0x800000` is trigram indexes now, so the probe is `0x1000000`.
         assert!(matches!(
-            admit_features(1 | 0x800000, SUPPORTED_LOGICAL_FEATURES),
+            admit_features(1 | 0x1000000, SUPPORTED_LOGICAL_FEATURES),
             Err(Error::Unsupported(_))
         ));
     }

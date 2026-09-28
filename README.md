@@ -206,6 +206,8 @@ approximate — and nobody can pick for you.
 A `WHERE` over a column with no index is still refused rather than answered by
 scanning every row -- except `LIKE` / `ILIKE`, which work on any text column
 with no setup (`WHERE email ILIKE '%doe%'`) by checking each row, and say so.
+A trigram index, as PostgreSQL's pg_trgm writes it, makes them read only the
+rows that can match: `CREATE INDEX ON users USING gin (email gin_trgm_ops)`.
 `ORDER BY` works on any column, several keys at once, with or without an index:
 an index lets the walk stop early, and `EXPLAIN` says which. "Load more" is
 plain SQL: `WHERE (name, _key) > ($1, $2) ORDER BY name, _key LIMIT 20`. If you want a wide table to index nothing automatically,

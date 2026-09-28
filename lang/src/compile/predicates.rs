@@ -441,15 +441,30 @@ impl Compiler<'_> {
                 ));
             }
         }
-        self.notices.push(format!(
-            "{written}: checked on each row the driver reaches -- no index, no extra storage; a text index makes it faster when one exists (docs/lang/QL_CONTRACT.md §3)"
-        ));
+        // A trigram index narrows any pattern with a 3-character piece
+        // (`gin_trgm_ops`, 0.19 A1); the row check below stays and decides.
+        // `NOT LIKE` has nothing to narrow, and `_key` is not a column an
+        // index is declared over.
+        let trigram = match (negated || key, self.trigram_index_opt(c, column)?) {
+            (false, Some(index)) => {
+                let pieces = sekejap_core::collections::trigram_pieces(&text, escape, insensitive)
+                    .map_err(|e| SqlError::coded("22025", e.to_string()))?;
+                (pieces > 0).then_some(index)
+            }
+            _ => None,
+        };
+        if trigram.is_none() {
+            self.notices.push(format!(
+                "{written}: checked on each row the driver reaches -- no index, no extra storage; a trigram index (`CREATE INDEX ... USING gin ({column} gin_trgm_ops)`) narrows a pattern with a 3-character piece (docs/lang/QL_CONTRACT.md §3)"
+            ));
+        }
         Ok(OwnedFilter::Like {
             field: column.to_owned(),
             pattern: text,
             escape,
             insensitive,
             negated,
+            trigram,
         })
     }
 

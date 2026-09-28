@@ -122,6 +122,12 @@ pub(crate) enum OwnedFilter {
         escape: Option<char>,
         insensitive: bool,
         negated: bool,
+        /// The trigram index that narrows it, when the column has one and the
+        /// pattern has a piece to ask for. At the top level of a `WHERE` it
+        /// becomes a second filter in front of this one: the index's
+        /// candidates (`TextMatch::Trigram`), then this row check, which
+        /// decides. Nested in a boolean it narrows nothing.
+        trigram: Option<IndexId>,
     },
     RowCompare {
         fields: Vec<String>,
@@ -139,6 +145,7 @@ impl OwnedFilter {
                 escape,
                 insensitive,
                 negated,
+                ..
             } => QueryFilter::Like {
                 field,
                 pattern,
@@ -261,10 +268,35 @@ fn with_boolean_filters<T>(
 ) -> SqlResult2<T> {
     match remaining.split_first() {
         None => {
-            let filters: Vec<QueryFilter<'_>> = owned
-                .iter()
-                .enumerate()
-                .map(|(at, filter)| match filter {
+            let mut filters: Vec<QueryFilter<'_>> = Vec::with_capacity(owned.len() + 1);
+            // The narrowing is optional: it may use only the room the
+            // statement's own filters leave under the engine's bound, so an
+            // index never turns a statement that compiled into one refused.
+            let mut room = sekejap_core::collections::MAX_QUERY_FILTERS.saturating_sub(owned.len());
+            for (at, filter) in owned.iter().enumerate() {
+                // A trigram-narrowed LIKE: the index's candidates first.
+                if let OwnedFilter::Like {
+                    pattern,
+                    escape,
+                    insensitive,
+                    negated: false,
+                    trigram: Some(index),
+                    ..
+                } = filter
+                {
+                    if room > 0 {
+                        filters.push(QueryFilter::Text {
+                            index: *index,
+                            query: pattern,
+                            matching: TextMatch::Trigram {
+                                escape: *escape,
+                                insensitive: *insensitive,
+                            },
+                        });
+                        room -= 1;
+                    }
+                }
+                filters.push(match filter {
                     OwnedFilter::Any(_) | OwnedFilter::All(_) | OwnedFilter::Not(_) => {
                         let mut link = built;
                         loop {
@@ -278,8 +310,8 @@ fn with_boolean_filters<T>(
                         }
                     }
                     other => other.borrowed(),
-                })
-                .collect();
+                });
+            }
             k(&filters)
         }
         Some((at, rest)) => {
@@ -730,6 +762,9 @@ pub(crate) enum CompiledIndex {
     /// member of a `JSONB` column.
     JsonScalar { field: String, member: String },
     Text { field: String },
+    /// `gin (field gin_trgm_ops)`: a text-family index with the trigram
+    /// analyzer (0.19 A1).
+    Trigram { field: String },
     Point { field: String },
     Geometry { field: String },
     ExactVector { field: String },
@@ -1531,6 +1566,7 @@ fn build_index(
             false,
         )?,
         CompiledIndex::Text { field } => db.create_text_index(collection, name, field)?,
+        CompiledIndex::Trigram { field } => db.create_trigram_index(collection, name, field)?,
         CompiledIndex::Point { field } => db.create_point_index(collection, name, field)?,
         CompiledIndex::Geometry { field } => db.create_geometry_index(collection, name, field)?,
         CompiledIndex::ExactVector { field } => {

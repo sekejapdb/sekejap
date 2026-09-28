@@ -913,6 +913,12 @@ pub(super) enum IndexMethod {
         column: String,
         alias: Option<String>,
     },
+    /// `gin (col gin_trgm_ops)`, and `gist (col gist_trgm_ops)`, which builds
+    /// the same index and carries its spelling so a notice can say so.
+    Trigram {
+        column: String,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1047,6 +1053,10 @@ pub(super) enum Stmt {
         if_exists: bool,
     },
     /// `CREATE SCHEMA [IF NOT EXISTS] name` (QL_CONTRACT §2).
+    /// `CREATE EXTENSION [IF NOT EXISTS] name`.
+    CreateExtension {
+        name: String,
+    },
     CreateSchema {
         name: String,
         if_not_exists: bool,

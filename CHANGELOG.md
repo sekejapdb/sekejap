@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.19.0 (in development)
+
+Search, toward Elasticsearch / Solr / Manticore.
+
+- **Trigram index for `LIKE` and `ILIKE`**, as PostgreSQL's pg_trgm writes
+  it: `CREATE INDEX ON place USING gin (name gin_trgm_ops)`. Any pattern
+  with a 3-character piece -- `'%york-ci%'`, `ILIKE '%doe%'`, `'ne%'` --
+  reads only the rows holding every piece, then checks them as before, so
+  the index never changes an answer. `gist (name gist_trgm_ops)` builds the
+  same index; `CREATE EXTENSION pg_trgm` is accepted and does nothing.
+  Shorter patterns and `NOT LIKE` are still checked row by row. Not built:
+  `similarity()`, `%` and `<->`. A database gains feature bit `0x800000`
+  only when its first trigram index is created; 0.18 cannot open it after.
+- **Release fixtures**: databases written by the tagged 0.18.3 build are
+  kept in the repository, and every build must open them with the same
+  answers (`docs/core/RELEASE_FIXTURES.md`).
+
 ## 0.18.3
 
 ORDER BY as PostgreSQL has it, and "load more" in plain SQL.

@@ -25,7 +25,7 @@ use sekejap_core::collections::{
     IndexFamily, IndexId,
     IndexInfo, IndexState, OwnedScalarValue, PointFilter, ProjectedValue, Projection, QueryBudget,
     QueryFilter, QueryOrder, QueryRequest, QueryRow, ScalarFilter, ScalarValue, ScoreExpr,
-    SortDirection, SortKey, SortValue, TextMatch, UpdatePatch, VectorMetric, WriteAction,
+    SortDirection, SortKey, SortValue, TextAnalyzer, TextMatch, UpdatePatch, VectorMetric, WriteAction,
     WriteCursor, WriteRequest,
 };
 use sekejap_core::spatial_io;
@@ -379,6 +379,20 @@ impl Compiler<'_> {
                 };
                 Plan::Write(WritePlan::DropIndex { index, name })
             }
+            // pg_trgm's index is built in (0.19 A1); its similarity
+            // functions and operators are not, and are refused where they
+            // are written. Any other extension is not available.
+            Stmt::CreateExtension { name } => {
+                if name.eq_ignore_ascii_case("pg_trgm") {
+                    return Ok(Plan::Write(WritePlan::Notice(
+                        "CREATE EXTENSION pg_trgm: the trigram index is built in, so nothing was installed -- `CREATE INDEX ... USING gin (col gin_trgm_ops)` narrows LIKE and ILIKE; similarity() and the % and <-> operators are not built".into(),
+                    )));
+                }
+                return Err(SqlError::coded(
+                    "0A000",
+                    format!(r#"extension "{name}" is not available"#),
+                ));
+            }
             Stmt::CreateSchema {
                 name,
                 if_not_exists,
@@ -639,6 +653,11 @@ impl Compiler<'_> {
         let indexes = &lists[position].1;
         let mut building = false;
         for info in indexes {
+            // A trigram index is a text-family index whose terms are pieces:
+            // a word query, a phrase or BM25 is never answered from it.
+            if info.analyzer == Some(TextAnalyzer::Trigram) {
+                continue;
+            }
             if info.field == field && info.family == family && info.expression == expression {
                 match info.state {
                     IndexState::Ready => return Ok(info.id),
@@ -715,6 +734,28 @@ impl Compiler<'_> {
             .map(|info| info.id))
     }
 
+    /// The READY trigram index over `field` (`gin_trgm_ops`), if there is
+    /// one: a `LIKE` without one checks rows, which is a stated cost.
+    fn trigram_index_opt(&self, c: CollectionId, field: &str) -> SqlResult2<Option<IndexId>> {
+        let mut lists = self.index_lists.borrow_mut();
+        let position = match lists.iter().position(|(id, _)| *id == c) {
+            Some(position) => position,
+            None => {
+                lists.push((c, self.db.list_indexes(c).map_err(SqlError::from)?));
+                lists.len() - 1
+            }
+        };
+        Ok(lists[position]
+            .1
+            .iter()
+            .find(|info| {
+                info.field == field
+                    && info.family == IndexFamily::Text
+                    && info.analyzer == Some(TextAnalyzer::Trigram)
+                    && info.state == IndexState::Ready
+            })
+            .map(|info| info.id))
+    }
 }
 
 /// pgvector's text form: `[a, b, c]`.

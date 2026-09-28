@@ -1470,7 +1470,11 @@ pub unsafe extern "C" fn sekejap_describe(
                 json!({
                     "name": index.name,
                     "field": index.field,
-                    "family": family_name(index.family),
+                    "family": if index.analyzer == Some(sekejap::TextAnalyzer::Trigram) {
+                        "trigram"
+                    } else {
+                        family_name(index.family)
+                    },
                     "unique": index.unique,
                     "ready": index.ready,
                 })

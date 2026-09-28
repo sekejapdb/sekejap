@@ -14,18 +14,22 @@ impl Compiler<'_> {
             // `NOT (col LIKE x)` is `col NOT LIKE x`: the row check negates
             // itself, where a complement of a row check has no set to take.
             Expr::Not(inner) => match self.where_filter(c, inner)? {
+                // A complement has no candidates to narrow: the trigram
+                // index, if one was chosen, is dropped with the negation.
                 OwnedFilter::Like {
                     field,
                     pattern,
                     escape,
                     insensitive,
                     negated,
+                    ..
                 } => OwnedFilter::Like {
                     field,
                     pattern,
                     escape,
                     insensitive,
                     negated: !negated,
+                    trigram: None,
                 },
                 other => OwnedFilter::Not(Box::new(other)),
             },

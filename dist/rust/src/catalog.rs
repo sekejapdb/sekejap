@@ -1,6 +1,6 @@
 //! What `Db::describe` answers. `docs/dist/RUST_API.md` §5.
 
-use sekejap_core::collections::IndexFamily;
+use sekejap_core::collections::{IndexFamily, TextAnalyzer};
 use sekejap_core::Kind;
 
 /// The declared shape of one collection.
@@ -87,6 +87,10 @@ pub struct Index {
     pub name: String,
     pub field: String,
     pub family: IndexFamily,
+    /// For the text family, how values become terms: `Words` for
+    /// `gin (to_tsvector('simple', col))`, `Trigram` for
+    /// `gin (col gin_trgm_ops)`. `None` for every other family.
+    pub analyzer: Option<TextAnalyzer>,
     pub unique: bool,
     /// False while the index is still being built: a query that needs it is
     /// refused rather than answered from a half-built index.

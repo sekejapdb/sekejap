@@ -59,7 +59,9 @@ use {cursors::*, drivers::*, filters::*, membership::*, plan::*, rank::*, rows::
 
 pub use kernel::spatial::Geom;
 
-const MAX_FILTERS: usize = 64;
+/// Filters one query may carry. `pub` so a caller that adds OPTIONAL
+/// filters -- the SQL layer's trigram narrowing -- can stay within it.
+pub const MAX_FILTERS: usize = 64;
 
 /// How deep one `Any`/`Not` tree may nest. A boolean tree is compiled into
 /// set algebra by recursion, so the depth is a stack bound as much as a

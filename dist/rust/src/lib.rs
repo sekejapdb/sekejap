@@ -59,7 +59,7 @@ pub use sekejap_core::{Config, IoMode, SyncMode};
 /// The engine's row identity, and the identity of a collection.
 pub use sekejap_core::collections::{CollectionId, EntityId};
 /// Which family an index belongs to, and which way an edge points.
-pub use sekejap_core::collections::{Direction, IndexFamily};
+pub use sekejap_core::collections::{Direction, IndexFamily, TextAnalyzer};
 /// What a column stores. `Vector(n)` carries its dimension; `Point` and
 /// `Geo` are the two spatial kinds.
 pub use sekejap_core::Kind as FieldKind;

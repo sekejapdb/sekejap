@@ -100,7 +100,7 @@ A `kind` is one of `text`, `int`, `real`, `bool`, `json`, `geo`, `point`,
 declaring one. `declared` is the SQL spelling the catalog recorded where the
 kind does not carry it (`TIMESTAMPTZ` and `DATE` are both `int`), or `null`.
 An index `family` is one of `scalar`, `text`, `exact_vector`,
-`quantized_vector`, `spatial_point`, `spatial_geometry`.
+`quantized_vector`, `spatial_point`, `spatial_geometry`, and `trigram` for a text index built with `gin_trgm_ops` (0.19).
 
 `describe`'s `rows` is the LIVE row count, or `null` where this database keeps
 no record for the collection. `null` is "no record", not "no rows"; then the

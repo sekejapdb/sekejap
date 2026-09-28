@@ -5,6 +5,18 @@ impl Parser {
     pub(super) fn create(&mut self) -> SqlResult2<Stmt> {
         self.expect_word("CREATE")?;
         match self.word().as_deref() {
+            // `CREATE EXTENSION [IF NOT EXISTS] name`: a PostgreSQL migration
+            // script's first lines. What an extension would add is either
+            // built in or refused by name when compiled.
+            Some("EXTENSION") => {
+                self.bump();
+                if self.eat_word("IF") {
+                    self.expect_word("NOT")?;
+                    self.expect_word("EXISTS")?;
+                }
+                let name = self.name()?;
+                Ok(Stmt::CreateExtension { name })
+            }
             Some("SCHEMA") => {
                 self.bump();
                 let if_not_exists = if self.eat_word("IF") {
@@ -763,7 +775,9 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         let method = match method.as_str() {
             "BTREE" => self.index_expression()?,
-            "GIN" => {
+            "GIN" if self.word().as_deref() == Some("TO_TSVECTOR")
+                && matches!(self.peek_at(1), Tok::LParen) =>
+            {
                 // `gin(to_tsvector('simple', col))` -- the expression index
                 // Postgres needs, spelled the same way the query spells it.
                 self.expect_word("TO_TSVECTOR")?;
@@ -774,7 +788,29 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 IndexMethod::Gin(column)
             }
-            "GIST" | "SPGIST" => IndexMethod::Gist(self.name()?),
+            // `gin (col gin_trgm_ops)`: pg_trgm's operator class, the trigram
+            // index that narrows `LIKE` and `ILIKE` (0.19 A1).
+            "GIN" => {
+                let column = self.name()?;
+                self.expect_word("GIN_TRGM_OPS")?;
+                IndexMethod::Trigram {
+                    column,
+                    alias: None,
+                }
+            }
+            // `gist (col gist_trgm_ops)` builds the same trigram index; any
+            // other GiST target is spatial.
+            "GIST" | "SPGIST" => {
+                let column = self.name()?;
+                if self.eat_word("GIST_TRGM_OPS") {
+                    IndexMethod::Trigram {
+                        column,
+                        alias: Some("gist_trgm_ops".to_owned()),
+                    }
+                } else {
+                    IndexMethod::Gist(column)
+                }
+            }
             "EXACT" => IndexMethod::Exact(self.name()?),
             "QUANTIZED" => {
                 let column = self.name()?;
@@ -824,6 +860,14 @@ impl Parser {
             }
         };
         self.expect(&Tok::RParen)?;
+        if unique {
+            if let IndexMethod::Gin(_) | IndexMethod::Trigram { alias: None, .. } = method {
+                return Err(SqlError::coded("0A000", r#"access method "gin" does not support unique indexes"#));
+            }
+            if let IndexMethod::Gist(_) | IndexMethod::Trigram { alias: Some(_), .. } = method {
+                return Err(SqlError::coded("0A000", r#"access method "gist" does not support unique indexes"#));
+            }
+        }
         if unique && !matches!(method, IndexMethod::Btree(_)) {
             return Err(SqlError::unsupported(
                 "UNIQUE belongs to a btree index only: `create_scalar_index` is the one family that takes it",
