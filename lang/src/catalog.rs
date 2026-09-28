@@ -39,7 +39,8 @@
 
 use super::{SqlError, SqlResult2, SqlValue};
 use sekejap_core::collections::{
-    CollectionId, Database, DefaultValue, GraphContextId, IndexFamily, IndexState,
+    CollectionId, CollectionInfo, Database, DefaultValue, GraphContextId, IndexFamily,
+    IndexState,
 };
 use sekejap_core::Kind;
 
@@ -731,13 +732,49 @@ struct Index {
     unique: bool,
 }
 
-fn default_spelling(value: &DefaultValue) -> String {
+/// A column DEFAULT as a `CREATE TABLE` writes it, so a statement built from
+/// the catalog declares the same generator again: `uuid5` with its own
+/// namespace and name, not a placeholder.
+pub fn default_spelling(value: &DefaultValue) -> String {
     match value {
         DefaultValue::Now => "now()".into(),
         DefaultValue::Uuid4 => "uuid4()".into(),
         DefaultValue::Ulid => "ulid()".into(),
-        DefaultValue::Uuid5 { .. } => "uuid5(namespace, name)".into(),
+        DefaultValue::Uuid5 { namespace, name } => {
+            let hex: String = namespace.iter().map(|b| format!("{b:02x}")).collect();
+            format!(
+                "uuid5('{}-{}-{}-{}-{}', '{}')",
+                &hex[0..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..32],
+                name.replace('\'', "''")
+            )
+        }
     }
+}
+
+/// What the catalog says about one column's NOT NULL and DEFAULT, the key
+/// included: `(not_null, default)`.
+///
+/// The key's own declaration lives in `CollectionInfo::key`, not in the
+/// column rules, so this is the one place both are read. `_key` is NOT NULL
+/// and carries the key's DEFAULT when the table declared it on `_key`; a
+/// named PRIMARY KEY column is NOT NULL (PostgreSQL: a primary key implies
+/// it) and carries the key's DEFAULT when it was declared there.
+pub fn column_constraints(info: &CollectionInfo, column: &str) -> (bool, Option<DefaultValue>) {
+    let named = info.key.as_ref().and_then(|k| k.column.as_deref());
+    let key_default = info.key.as_ref().and_then(|k| k.default.clone());
+    let rule = info.rules.iter().find(|(name, _)| name == column).map(|(_, r)| r);
+    if column == super::KEY_COLUMN {
+        return (true, if named.is_none() { key_default } else { None });
+    }
+    let default = rule.and_then(|r| r.default.clone());
+    if named == Some(column) {
+        return (true, default.or(key_default));
+    }
+    (rule.is_some_and(|r| r.not_null), default)
 }
 
 /// Read the catalog once. `graph` is false for every relation that has no
@@ -763,20 +800,22 @@ fn snapshot(db: &Database, graph: bool) -> SqlResult2<Snapshot> {
         // declared -- but it IS a column of every row, it is the PRIMARY KEY
         // every constraint view names, and a client that cannot see it
         // cannot map the key it is told about onto anything. So the catalog
-        // relations put it back, first, NOT NULL and with no default.
+        // relations put it back, first, NOT NULL and with the key's DEFAULT when
+        // the table declared one on it.
+        let (_, key_default) = column_constraints(&info, super::KEY_COLUMN);
         let mut fields = vec![Field {
             name: super::KEY_COLUMN.to_owned(),
             kind: Kind::Text,
             declared: Some("TEXT".to_owned()),
             not_null: true,
-            default: None,
+            default: key_default.as_ref().map(default_spelling),
         }];
         fields.extend(info
             .layout
             .fields
             .iter()
             .map(|(field, kind)| {
-                let rule = info.rules.iter().find(|(name, _)| name == field);
+                let (not_null, default) = column_constraints(&info, field);
                 Field {
                     name: field.clone(),
                     kind: kind.clone(),
@@ -785,10 +824,8 @@ fn snapshot(db: &Database, graph: bool) -> SqlResult2<Snapshot> {
                         .iter()
                         .find(|(name, _)| name == field)
                         .map(|(_, declared)| declared.clone()),
-                    not_null: rule.is_some_and(|(_, rule)| rule.not_null),
-                    default: rule
-                        .and_then(|(_, rule)| rule.default.as_ref())
-                        .map(default_spelling),
+                    not_null,
+                    default: default.as_ref().map(default_spelling),
                 }
             }));
         let indexes = db

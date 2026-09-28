@@ -404,6 +404,9 @@ pub enum CandidateDriver {
     /// it to a range or prefix; with none, the whole collection's keys are
     /// walked. See `DriverPlan::Keys`.
     Keys,
+    /// The same walk from the highest key down: `ORDER BY _key DESC`, and a
+    /// keyset page that continues below the last key it showed.
+    KeysDescending,
 }
 
 /// Candidate source selected during query preparation. This is returned with

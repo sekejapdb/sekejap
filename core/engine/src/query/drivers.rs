@@ -93,6 +93,8 @@ pub(super) enum DriverPlan {
     Keys {
         predicate: EncodedScalarFilter,
         position: Option<usize>,
+        /// Walk from the highest key down (`CandidateDriver::KeysDescending`).
+        descending: bool,
     },
     /// Walk the membership set of one BOOLEAN filter position, in ascending
     /// entity id.
@@ -1036,7 +1038,9 @@ pub(super) struct CursorNeeds {
 /// `DriverKey`'s doc), so nothing ever asks this cursor to open backwards --
 /// stated, not implemented, per item KD's scope.
 pub(super) struct KeysCursor<'a> {
-    pub(super) inner: RangeIter<'a>,
+    /// Forward from the predicate's lower bound, or backward from one key
+    /// past its upper bound.
+    pub(super) inner: ScalarWalk<'a>,
     pub(super) prefix: Vec<u8>,
     pub(super) collection: CollectionId,
     pub(super) predicate: EncodedScalarFilter,
@@ -1209,6 +1213,33 @@ pub(super) fn scalar_lower(predicate: &EncodedScalarFilter) -> Option<&[u8]> {
         EncodedScalarFilter::Eq(value) => Some(value),
         EncodedScalarFilter::Range { lower, .. } => bound_bytes(lower),
         EncodedScalarFilter::IsNull | EncodedScalarFilter::IsMissing => Some(&[0]),
+    }
+}
+
+/// One past the highest mapping key a key predicate admits: where a
+/// descending keys walk starts, since a reverse range reads the keys
+/// strictly below it. A key is stored as its raw bytes after the prefix, so
+/// the key right after `v` is `v` followed by a zero byte.
+pub(super) fn keys_upper_end(prefix: &[u8], predicate: &EncodedScalarFilter) -> Vec<u8> {
+    let mut to = prefix.to_vec();
+    match predicate {
+        EncodedScalarFilter::Eq(value)
+        | EncodedScalarFilter::Range {
+            upper: EncodedBound::Included(value),
+            ..
+        } => {
+            to.extend_from_slice(value);
+            to.push(0);
+            to
+        }
+        EncodedScalarFilter::Range {
+            upper: EncodedBound::Excluded(value),
+            ..
+        } => {
+            to.extend_from_slice(value);
+            to
+        }
+        _ => prefix_successor(prefix),
     }
 }
 

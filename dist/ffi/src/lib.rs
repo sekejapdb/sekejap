@@ -1452,6 +1452,14 @@ pub unsafe extern "C" fn sekejap_describe(
                     },
                 );
                 object.insert("primary_key".into(), Value::Bool(field.primary_key));
+                object.insert("not_null".into(), Value::Bool(field.not_null));
+                object.insert(
+                    "default".into(),
+                    match &field.default {
+                        Some(text) => Value::String(text.clone()),
+                        None => Value::Null,
+                    },
+                );
                 Value::Object(object)
             })
             .collect();

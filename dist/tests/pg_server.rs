@@ -608,3 +608,48 @@ fn psql_connects_and_runs_a_statement_when_psql_is_installed() {
     );
     println!("psql ({psql}) connected and printed:\n{}", stdout.trim());
 }
+
+/// `INSERT ... RETURNING` through a stock client (found dogfooding under an
+/// application, 2026-09-28). The client PREPARES first, so the statement's
+/// `Describe` must already name the returned columns, and the tag stays
+/// `INSERT 0 n` -- the count a driver reads -- over both protocols.
+#[test]
+fn insert_returning_reaches_a_stock_client_as_typed_rows_with_the_insert_tag() {
+    let server = start(0);
+    let mut client = server.client();
+    client
+        .batch_execute("CREATE TABLE member (_key TEXT PRIMARY KEY DEFAULT ulid(), email TEXT NOT NULL, visits INT)")
+        .expect("CREATE TABLE");
+    let rows = client
+        .query(
+            "INSERT INTO member (email, visits) VALUES ($1, 3) RETURNING _key, visits",
+            &[&"ayu@example.com"],
+        )
+        .expect("INSERT ... RETURNING over the extended protocol");
+    assert_eq!(rows.len(), 1);
+    let key: String = rows[0].get("_key");
+    assert_eq!(key.len(), 26, "a ULID");
+    assert_eq!(rows[0].get::<_, i64>("visits"), 3, "typed by the declared column");
+    let found = client
+        .query_one("SELECT email FROM member WHERE _key = $1", &[&key])
+        .expect("the returned key names the committed row");
+    assert_eq!(found.get::<_, String>(0), "ayu@example.com");
+
+    let moved = client
+        .execute("INSERT INTO member (email) VALUES ('b@example.com') RETURNING _key", &[])
+        .expect("execute a RETURNING statement");
+    assert_eq!(moved, 1, "the tag is INSERT 0 1, not SELECT 1");
+
+    let messages = client
+        .simple_query("INSERT INTO member (email) VALUES ('c@example.com') RETURNING _key")
+        .expect("the simple protocol");
+    let returned = messages
+        .iter()
+        .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(returned, 1);
+    assert!(
+        messages.iter().any(|m| matches!(m, SimpleQueryMessage::CommandComplete(1))),
+        "{messages:?}"
+    );
+}

@@ -508,7 +508,8 @@ impl PreparedSql {
         &self.notices
     }
 
-    /// The columns a SELECT returns, in order. Empty for anything else.
+    /// The columns a SELECT -- or an INSERT's `RETURNING` -- returns, in
+    /// order. Empty for anything else.
     pub fn columns(&self) -> &[String] {
         match &self.plan {
             compile::Plan::Select(select) | compile::Plan::Explain(select) => &select.columns,
@@ -518,6 +519,7 @@ impl PreparedSql {
             compile::Plan::Rows(rows) => &rows.columns,
             compile::Plan::EdgeRows(edges) => &edges.columns,
             compile::Plan::Gql(gql) | compile::Plan::ExplainGql(gql) => gql.plan.columns(),
+            compile::Plan::Write(compile::WritePlan::Insert { returning, .. }) => &returning.columns,
             _ => &[],
         }
     }
@@ -772,7 +774,19 @@ impl PreparedSql {
     ///
     /// `None` for every statement that is not a row SELECT.
     pub fn source_collection(&self) -> Option<CollectionId> {
-        self.select_plan().map(|select| select.collection)
+        match &self.plan {
+            compile::Plan::Write(compile::WritePlan::Insert { collection, .. }) => Some(*collection),
+            _ => self.select_plan().map(|select| select.collection),
+        }
+    }
+
+    /// True for an INSERT whose `RETURNING` answers rows: a write that a
+    /// wire describes, and a caller reads, like a query.
+    pub fn returns_rows_from_a_write(&self) -> bool {
+        matches!(
+            &self.plan,
+            compile::Plan::Write(compile::WritePlan::Insert { returning, .. }) if !returning.columns.is_empty()
+        )
     }
 
     /// Run this compiled statement to exhaustion and assemble its answer.

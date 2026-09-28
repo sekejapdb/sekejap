@@ -635,8 +635,13 @@ impl WriterGuard<'_> {
             .db
             .sql_with(text, params, budget, &mut || interrupt.is_cancelled())?;
         if self.service.subscribers.listening() {
-            if let SqlResult::Affected(rows) = &result {
-                self.batch.note_unnamed_write(*rows);
+            match &result {
+                SqlResult::Affected(rows) => self.batch.note_unnamed_write(*rows),
+                // `INSERT ... RETURNING` wrote the rows it returns.
+                SqlResult::Rows { rows, .. } if first_word_is(text, "INSERT") => {
+                    self.batch.note_unnamed_write(rows.len() as u64)
+                }
+                _ => {}
             }
         }
         Ok(result)
@@ -717,6 +722,13 @@ fn micros(d: Duration) -> u64 {
 }
 
 /// The leading keyword when it is transaction control, `None` otherwise.
+/// True when the statement's first word is `word` (ASCII, any case).
+fn first_word_is(text: &str, word: &str) -> bool {
+    text.split_whitespace()
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case(word))
+}
+
 fn transaction_keyword(text: &str) -> Option<&'static str> {
     let first: String = text
         .trim_start()

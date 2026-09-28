@@ -9,9 +9,11 @@
 //! * `DEFAULT ulid()` / `uuid4()` on the key mints one per row, for the
 //!   built-in `_key` and for a named key column, and survives a reopen
 //!   (`a_key_default_mints_one_per_row`);
-//! * `ORDER BY _key` walks the rows in key order with no index, beside a
-//!   filter and under a LIMIT; DESC is refused by name
-//!   (`order_by_key_needs_no_index`).
+//! * `ORDER BY _key [DESC]` walks the rows in key order with no index,
+//!   beside a filter and under a LIMIT (`order_by_key_needs_no_index`);
+//! * a keyset page (`WHERE _key < $last ORDER BY _key DESC LIMIT n`) starts
+//!   after the key the previous page ended on
+//!   (`keyset_pages_walk_the_key_in_both_directions`).
 
 use kernel::{
     io::IoMode,
@@ -117,8 +119,43 @@ fn order_by_key_needs_no_index() {
         texts(&mut db, "SELECT _key FROM users WHERE city = 'Ubud' ORDER BY _key"),
         ["u1", "u3", "u4"]
     );
-    match db.sql("SELECT _key FROM users ORDER BY _key DESC", &[]) {
-        Err(e) => assert!(e.to_string().contains("DESC"), "{e}"),
-        Ok(r) => panic!("refused by name, not {r:?}"),
-    }
+    // DESC walks the same mapping backwards: newest first, for ULID keys.
+    assert_eq!(texts(&mut db, "SELECT _key FROM users ORDER BY _key DESC"), ["u4", "u3", "u2", "u1"]);
+    assert_eq!(texts(&mut db, "SELECT _key FROM users ORDER BY _key DESC LIMIT 2"), ["u4", "u3"]);
+    assert_eq!(
+        texts(&mut db, "SELECT _key FROM users WHERE city = 'Ubud' ORDER BY _key DESC"),
+        ["u4", "u3", "u1"]
+    );
+}
+
+/// Keyset paging, the answer to OFFSET: the next page starts after the last
+/// key the previous page showed, in either direction.
+#[test]
+fn keyset_pages_walk_the_key_in_both_directions() {
+    let dir = TempDir::new().unwrap();
+    let mut db = Database::create(dir.path().join("k.sekejap"), cfg()).unwrap();
+    run(&mut db, "CREATE TABLE users (_key TEXT PRIMARY KEY, name TEXT)");
+    run(
+        &mut db,
+        "INSERT INTO users (_key, name) VALUES ('u1', 'a'), ('u2', 'b'), ('u3', 'c'), ('u4', 'd'), ('u5', 'e')",
+    );
+    run(&mut db, "COMMIT");
+    assert_eq!(
+        texts(&mut db, "SELECT _key FROM users WHERE _key < 'u4' ORDER BY _key DESC LIMIT 2"),
+        ["u3", "u2"]
+    );
+    assert_eq!(
+        texts(&mut db, "SELECT _key FROM users WHERE _key <= 'u4' ORDER BY _key DESC LIMIT 2"),
+        ["u4", "u3"]
+    );
+    assert_eq!(
+        texts(&mut db, "SELECT _key FROM users WHERE _key > 'u2' ORDER BY _key LIMIT 2"),
+        ["u3", "u4"]
+    );
+    assert_eq!(
+        texts(&mut db, "SELECT _key FROM users WHERE _key > 'u1' AND _key < 'u5' ORDER BY _key DESC"),
+        ["u4", "u3", "u2"]
+    );
+    // The last page of a DESC walk ends at the smallest key.
+    assert_eq!(texts(&mut db, "SELECT _key FROM users WHERE _key < 'u2' ORDER BY _key DESC LIMIT 2"), ["u1"]);
 }

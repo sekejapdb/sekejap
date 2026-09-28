@@ -1008,7 +1008,8 @@ impl PreparedQuery<'_> {
                     direction: SortDirection::Descending,
                     ..
                 }
-        );
+        ) || (matches!(self.order, CompiledOrder::Driver(DriverKey::Key))
+            && matches!(self.driver, DriverPlan::Keys { descending: true, .. }));
         let mut meter = WorkMeter::new(budget, &mut cancelled);
         meter.check_cancelled()?;
         self.ensure_membership_sets(&mut meter)?;
@@ -1791,8 +1792,13 @@ impl PreparedQuery<'_> {
                 "vamana graph index {} ({}), node keyspace in key order",
                 info.name, info.field
             ),
-            DriverPlan::Keys { predicate, .. } => format!(
-                "external-key mapping keyspace, {}",
+            DriverPlan::Keys {
+                predicate,
+                descending,
+                ..
+            } => format!(
+                "external-key mapping keyspace{}, {}",
+                if *descending { " (highest key first)" } else { "" },
                 scalar_predicate_text(predicate)
             ),
         }

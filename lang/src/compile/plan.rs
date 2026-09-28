@@ -686,6 +686,48 @@ pub(crate) enum CompiledAlter {
     Rename { to: String },
 }
 
+/// An INSERT's `RETURNING` columns. `time[i]` is `Some(date_only)` for a
+/// declared TIMESTAMPTZ/DATE, which reads back as the ISO text a SELECT
+/// prints.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Returning {
+    pub(crate) columns: Vec<String>,
+    pub(crate) time: Vec<Option<bool>>,
+}
+
+impl Returning {
+    pub(crate) fn push(&mut self, name: &str, time: Option<bool>) {
+        self.columns.push(name.to_owned());
+        self.time.push(time);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    /// One stored row's values, read the way a SELECT reads them.
+    fn row(&self, row: &sekejap_core::collections::Entity) -> Vec<SqlValue> {
+        self.columns
+            .iter()
+            .zip(&self.time)
+            .map(|(name, time)| {
+                if crate::is_key_column(name) {
+                    return SqlValue::Text(row.key.clone());
+                }
+                match (field_value(&row.document, name), time) {
+                    (SqlValue::Int(micros), Some(false)) => {
+                        SqlValue::Text(crate::functions::format_timestamp(micros))
+                    }
+                    (SqlValue::Int(micros), Some(true)) => {
+                        SqlValue::Text(crate::functions::format_date(micros))
+                    }
+                    (value, _) => value,
+                }
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum WritePlan {
     Insert {
@@ -699,6 +741,9 @@ pub(crate) enum WritePlan {
         /// is `DO UPDATE SET c = EXCLUDED.c` for each named column. `None` is
         /// a plain INSERT, which refuses a taken key with 23505.
         on_conflict: Option<Option<Vec<String>>>,
+        /// `RETURNING`: empty for none. A row the statement did not write
+        /// (`DO NOTHING` on a taken key) returns nothing, as in PostgreSQL.
+        returning: Returning,
     },
     Update {
         collection: CollectionId,
@@ -987,8 +1032,10 @@ impl WritePlan {
                 rows,
                 key_column,
                 on_conflict,
+                returning,
             } => {
                 let mut affected = 0u64;
+                let mut returned = Vec::new();
                 for (key, mut document) in rows {
                     let key = match key {
                         Some(key) => key,
@@ -1024,8 +1071,26 @@ impl WritePlan {
                         }
                     }
                     affected += 1;
+                    // Read back after the write, so a column its DEFAULT
+                    // filled reports the stored value.
+                    if !returning.is_empty() {
+                        let row = db.get(collection, &key)?.ok_or_else(|| {
+                            SqlError::unsupported("INSERT ... RETURNING: the row just written is not found")
+                        })?;
+                        returned.push(SqlRow {
+                            id: row.id,
+                            values: returning.row(&row),
+                        });
+                    }
                 }
-                SqlResult::Affected(affected)
+                if returning.is_empty() {
+                    SqlResult::Affected(affected)
+                } else {
+                    SqlResult::Rows {
+                        columns: returning.columns,
+                        rows: returned,
+                    }
+                }
             }
             Self::Update {
                 collection,

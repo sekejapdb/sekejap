@@ -45,6 +45,7 @@ impl Compiler<'_> {
         for expr in &statement.predicates {
             filters.push(self.where_filter(c, expr)?);
         }
+        super::predicates::merge_key_bounds(&mut filters);
 
         let order = match &statement.order {
             None => OwnedOrder::Driver,
@@ -52,10 +53,10 @@ impl Compiler<'_> {
         };
         // `ORDER BY _key`: the external-key mapping is stored in key order,
         // so walking it IS the order -- no index, no sort.
-        let key_order = matches!(
-            &statement.order,
-            Some(OrderKey::Column { column, .. }) if is_key_column(column)
-        );
+        let key_order = match &statement.order {
+            Some(OrderKey::Column { column, descending }) if is_key_column(column) => Some(*descending),
+            _ => None,
+        };
 
         // The select list. `_id` is free (a row carries its id); a named
         // column is a projected field; an expression is this statement's own
@@ -177,7 +178,10 @@ impl Compiler<'_> {
                 "selecting `{KEY_COLUMN}` costs one `get_by_id` per returned row: a page cannot project the reserved field the external key lives in, so the key is fetched after the walk. `{ID_COLUMN}` is free"
             ));
         }
-        let driver = if key_order
+        let driver = if key_order == Some(true) {
+            // `ORDER BY _key DESC`: the same mapping, walked from the top.
+            CandidateDriver::KeysDescending
+        } else if key_order.is_some()
             || filters
                 .iter()
                 .any(|filter| matches!(filter, OwnedFilter::Key { .. }))
@@ -219,11 +223,8 @@ impl Compiler<'_> {
                     return Ok(OwnedOrder::EntityId);
                 }
                 if is_key_column(column) {
-                    if *descending {
-                        return Err(SqlError::unsupported(
-                            "ORDER BY _key DESC: the key mapping is walked forwards, in ascending key order; there is no reverse walk of it yet",
-                        ));
-                    }
+                    // Either direction is the key mapping's own walk; the
+                    // driver says which way (`CandidateDriver::KeysDescending`).
                     return Ok(OwnedOrder::Driver);
                 }
                 let index = self.index_for(c, column, IndexFamily::Scalar, "a scalar index")?;

@@ -70,8 +70,14 @@ pub struct Field {
     /// The SQL spelling the catalog recorded where the `Kind` does not carry
     /// it: `TIMESTAMPTZ` and `DATE` are both `Kind::Int`.
     pub declared: Option<String>,
-    /// True only for `_key`, which is the external key of every row.
+    /// True for the column that supplies each row's key: `_key`, or the
+    /// column a table named `PRIMARY KEY`.
     pub primary_key: bool,
+    /// NOT NULL: always for `_key` and a named key column.
+    pub not_null: bool,
+    /// The column's DEFAULT as a `CREATE TABLE` writes it (`ulid()`,
+    /// `now()`, `uuid5('...', '...')`), the key's own included.
+    pub default: Option<String>,
 }
 
 /// One index in the catalog.

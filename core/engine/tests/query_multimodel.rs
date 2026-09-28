@@ -1715,7 +1715,9 @@ fn approximate_vector_filters_before_shortlist_pages_and_retries_with_diagnostic
                 assert_eq!(first.work.vector_locators, 7); // 4 point probes + 3 rechecks
             }
             CandidateDriver::Entities => assert_eq!(first.driver, QueryDriver::Entities),
-            CandidateDriver::Keys => unreachable!("this test's driver list never includes Keys"),
+            CandidateDriver::Keys | CandidateDriver::KeysDescending => {
+                unreachable!("this test's driver list never includes a keys walk")
+            }
         }
     }
 }

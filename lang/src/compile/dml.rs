@@ -9,8 +9,10 @@ impl Compiler<'_> {
         columns: &[String],
         values: &[Vec<Literal>],
         on_conflict: Option<ConflictClause>,
+        returning: &[ReturningItem],
     ) -> SqlResult2<WritePlan> {
         let c = collection(self.db, table)?;
+        let returning = self.returning(c, table, returning)?;
         // Where the key comes from, as the table declares it:
         // `_key` when the statement names it; else the named PRIMARY KEY
         // column; else the key's DEFAULT, minted per row when it runs; else
@@ -94,7 +96,48 @@ impl Compiler<'_> {
             rows,
             key_column: named,
             on_conflict,
+            returning,
         })
+    }
+
+    /// The columns an INSERT's `RETURNING` answers, each with how it is read
+    /// back from the stored row: `_key` from the row's key, `*` as the
+    /// columns `SELECT *` answers, a declared TIMESTAMPTZ/DATE as the ISO
+    /// text a SELECT prints. An unknown column is PostgreSQL's 42703, raised
+    /// while the statement compiles, so nothing is written.
+    fn returning(
+        &self,
+        c: CollectionId,
+        table: &str,
+        items: &[ReturningItem],
+    ) -> SqlResult2<Returning> {
+        let mut out = Returning::default();
+        let column = |name: &str, out: &mut Returning| -> SqlResult2<()> {
+            if is_key_column(name) {
+                out.push(name, None);
+                return Ok(());
+            }
+            if self.kind_of(c, name).is_err() {
+                return Err(SqlError::coded(
+                    "42703",
+                    format!("column \"{name}\" of relation \"{table}\" does not exist"),
+                ));
+            }
+            let time = self.time_column(c, name)?.map(|declared| declared == "DATE");
+            out.push(name, time);
+            Ok(())
+        };
+        for item in items {
+            match item {
+                ReturningItem::Star => {
+                    for name in self.declared_fields(c)? {
+                        column(&name, &mut out)?;
+                    }
+                }
+                ReturningItem::Column(name) => column(name, &mut out)?,
+            }
+        }
+        Ok(out)
     }
 
     pub(super) fn update(

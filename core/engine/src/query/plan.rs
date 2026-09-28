@@ -1764,7 +1764,7 @@ impl Database {
         // keys are walked (what `count_all` needs); with one, that position
         // is the predicate and is certified the same way a driving scalar
         // range is.
-        let keys_driver = |filters: &[CompiledFilter]| -> QueryResult<DriverPlan> {
+        let keys_driver = |filters: &[CompiledFilter], descending: bool| -> QueryResult<DriverPlan> {
             let found = filters.iter().enumerate().find_map(|(position, filter)| {
                 match filter {
                     CompiledFilter::Key { predicate } => Some((position, predicate.clone())),
@@ -1775,6 +1775,7 @@ impl Database {
                 Some((position, predicate)) => DriverPlan::Keys {
                     predicate,
                     position: Some(position),
+                    descending,
                 },
                 None => DriverPlan::Keys {
                     predicate: EncodedScalarFilter::Range {
@@ -1782,6 +1783,7 @@ impl Database {
                         upper: EncodedBound::Unbounded,
                     },
                     position: None,
+                    descending,
                 },
             })
         };
@@ -1789,7 +1791,8 @@ impl Database {
             CandidateDriver::Entities => DriverPlan::Entities,
             CandidateDriver::Filter(position) => filter_driver(position)?,
             CandidateDriver::Order => order_driver()?,
-            CandidateDriver::Keys => keys_driver(&filters)?,
+            CandidateDriver::Keys => keys_driver(&filters, false)?,
+            CandidateDriver::KeysDescending => keys_driver(&filters, true)?,
             CandidateDriver::Auto => {
                 // A filtered APPROXIMATE VECTOR order whose filters the
                 // compact scan can answer index-side, over a filter broad

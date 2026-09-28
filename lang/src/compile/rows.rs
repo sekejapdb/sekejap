@@ -799,11 +799,20 @@ impl Compiler<'_> {
     fn show_create_table(&mut self, table: &str) -> SqlResult2<RowsPlan> {
         let id = crate::collection(self.db, table)?;
         let info = self.db.collection_info(id).map_err(SqlError::from)?;
-        // The external key is column one of every collection and is the
-        // PRIMARY KEY every constraint view names, so the DDL declares it
-        // first -- a statement that replayed this without it would build a
-        // collection whose rows had no key.
-        let mut lines = vec![format!("  {} TEXT PRIMARY KEY", crate::KEY_COLUMN)];
+        // The key is declared where the table declared it: a named PRIMARY
+        // KEY column carries it, and otherwise `_key` does, first -- a
+        // statement that replayed this without it would build a collection
+        // whose rows had no key. The key's DEFAULT goes with it, so an
+        // INSERT that relied on it works on the table this builds.
+        let named = info.key.as_ref().and_then(|k| k.column.clone());
+        let mut lines = Vec::new();
+        if named.is_none() {
+            let mut line = format!("  {} TEXT PRIMARY KEY", crate::KEY_COLUMN);
+            if let (_, Some(default)) = catalog::column_constraints(&info, crate::KEY_COLUMN) {
+                line.push_str(&format!(" DEFAULT {}", catalog::default_spelling(&default)));
+            }
+            lines.push(line);
+        }
         for (field, kind) in &info.layout.fields {
             let declared = info
                 .declared
@@ -812,13 +821,17 @@ impl Compiler<'_> {
                 .map(|(_, declared)| declared.clone())
                 .unwrap_or_else(|| catalog::declared_of(kind));
             let mut line = format!("  {field} {declared}");
-            if let Some((_, rule)) = info.rules.iter().find(|(name, _)| name == field) {
-                if let Some(default) = &rule.default {
-                    line.push_str(&format!(" DEFAULT {}", default_spelling(default)));
-                }
-                if rule.not_null {
-                    line.push_str(" NOT NULL");
-                }
+            let is_key = named.as_deref() == Some(field.as_str());
+            if is_key {
+                line.push_str(" PRIMARY KEY");
+            }
+            let (not_null, default) = catalog::column_constraints(&info, field);
+            if let Some(default) = default {
+                line.push_str(&format!(" DEFAULT {}", catalog::default_spelling(&default)));
+            }
+            // A primary key is NOT NULL already; saying it twice is noise.
+            if not_null && !is_key {
+                line.push_str(" NOT NULL");
             }
             lines.push(line);
         }
@@ -842,15 +855,6 @@ impl Compiler<'_> {
             distinct: false,
             explain: false,
         })
-    }
-}
-
-fn default_spelling(value: &DefaultValue) -> String {
-    match value {
-        DefaultValue::Now => "now()".into(),
-        DefaultValue::Uuid4 => "uuid4()".into(),
-        DefaultValue::Ulid => "ulid()".into(),
-        DefaultValue::Uuid5 { .. } => "uuid5(namespace, name)".into(),
     }
 }
 

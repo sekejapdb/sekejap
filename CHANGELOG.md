@@ -23,6 +23,19 @@ that work with no setup.
 - **`describe()` reports every column's SQL type** (`INT`, `REAL`,
   `VECTOR(3)`, `GEOMETRY(Point,4326)`, ...), derived from the stored kind for
   a table that recorded none, and marks a named key column as the primary key.
+- **`INSERT ... RETURNING _key, *`** answers the rows the INSERT wrote, a
+  minted key and DEFAULT-filled columns included, through SQL, the API
+  (`Db::query`) and the PostgreSQL wire (tagged `INSERT 0 n`).
+- **`ORDER BY _key DESC`** walks the keys from the highest down: newest
+  first for `ulid()` keys. Keyset pages
+  (`WHERE _key < $last ORDER BY _key DESC LIMIT n`) replace OFFSET, and a
+  lower and an upper `_key` bound together are one range.
+- **`SHOW CREATE TABLE`, `db_columns` and `describe()` report every
+  column's NOT NULL and DEFAULT, the key's own included**, and
+  `SHOW CREATE TABLE` names a named PRIMARY KEY column as the key, so
+  replaying it builds the same table. `Field` gains `not_null` and
+  `default`; `Field::primary_key` marks the one column that supplies the
+  key.
 - **`BEGIN` / `COMMIT` / `ROLLBACK` through `Db::execute` or `Db::query`**
   are refused by name. They used to answer OK and do nothing, because each
   call is already its own transaction; use `Db::transaction`.

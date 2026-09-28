@@ -107,16 +107,33 @@ impl Parser {
         } else {
             None
         };
-        if self.word().as_deref() == Some("RETURNING") {
-            return Err(SqlError::unsupported(
-                "INSERT ... RETURNING: a write reports the rows it affected, not their contents",
-            ));
+        let mut returning = Vec::new();
+        if self.eat_word("RETURNING") {
+            loop {
+                if self.eat(&Tok::Star) {
+                    returning.push(ReturningItem::Star);
+                } else {
+                    let at = self.here();
+                    let name = self.name()?;
+                    if !matches!(self.peek(), Tok::Comma | Tok::Eof | Tok::Semicolon) {
+                        return Err(SqlError::syntax(
+                            format!("RETURNING {name} ...: RETURNING takes column names and `*`; an expression is not supported"),
+                            at,
+                        ));
+                    }
+                    returning.push(ReturningItem::Column(name));
+                }
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
         }
         Ok(Stmt::Insert {
             table,
             columns,
             rows,
             on_conflict,
+            returning,
         })
     }
 

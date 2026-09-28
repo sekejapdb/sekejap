@@ -100,7 +100,7 @@ use row::*;
 
 pub(crate) use aggregate::AggregatePlan;
 pub(crate) use bind::{Binder, Rebind};
-pub(crate) use plan::{GqlSqlPlan, Plan, SelectPlan};
+pub(crate) use plan::{GqlSqlPlan, Plan, Returning, SelectPlan, WritePlan};
 pub(crate) use row::bytea_text;
 pub(crate) use rows::RowsPlan;
 
@@ -234,8 +234,14 @@ impl Compiler<'_> {
                 columns,
                 rows,
                 on_conflict,
+                returning,
             } => match self.edge_table_of(&table)? {
                 Some((c, edge)) => {
+                    if !returning.is_empty() {
+                        return Err(SqlError::unsupported(format!(
+                            "INSERT INTO {table} ... RETURNING: `{table}` is an edge table, whose rows are edges with no key to return; RETURNING is answered for a table of rows"
+                        )));
+                    }
                     Plan::Write(self.insert_edges(c, &table, &edge, columns, &rows, on_conflict)?)
                 }
                 None => {
@@ -244,7 +250,7 @@ impl Compiler<'_> {
                             "INSERT INTO {table} VALUES with no column list: name the columns, `_key` among them"
                         )));
                     }
-                    Plan::Write(self.insert(&table, &columns, &rows, on_conflict)?)
+                    Plan::Write(self.insert(&table, &columns, &rows, on_conflict, &returning)?)
                 }
             },
             Stmt::Update { table, .. } | Stmt::Delete { table, .. }

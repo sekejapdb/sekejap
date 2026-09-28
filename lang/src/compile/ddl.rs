@@ -1275,14 +1275,8 @@ pub(super) fn automatic_index(
 /// A COLUMN RULE as a `CREATE TABLE` would have written it.
 pub(super) fn written_rule(rule: &ColumnRule) -> String {
     let mut parts = Vec::new();
-    match &rule.default {
-        None => {}
-        Some(DefaultValue::Now) => parts.push("DEFAULT now()".to_owned()),
-        Some(DefaultValue::Uuid4) => parts.push("DEFAULT uuid4()".to_owned()),
-        Some(DefaultValue::Ulid) => parts.push("DEFAULT ulid()".to_owned()),
-        Some(DefaultValue::Uuid5 { name, .. }) => {
-            parts.push(format!("DEFAULT uuid5(<namespace>, '{name}')"));
-        }
+    if let Some(default) = &rule.default {
+        parts.push(format!("DEFAULT {}", crate::catalog::default_spelling(default)));
     }
     if rule.not_null {
         parts.push("NOT NULL".to_owned());

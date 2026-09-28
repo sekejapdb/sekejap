@@ -2,7 +2,7 @@
 
 use crate::catalog::{Collection, EdgeTableInfo, Field, Index};
 use crate::error::{Error, Result};
-use crate::rows::{expect_affected, expect_rows, params_of, Rows};
+use crate::rows::{expect_affected, expect_rows, is_insert, params_of, Rows};
 use crate::scan::Scan;
 use crate::{Addr, Document, Mode, Storage};
 use sekejap_core::collections::{
@@ -13,6 +13,7 @@ use sekejap_core::collections::{
 use sekejap_core::{Config, Kind, SyncMode};
 use sekejap_dist::service::{ServiceDatabase, Snapshot, WriterGuard};
 use crate::plans::{CacheStats, PlanCache, Statement};
+use sekejap_lang::catalog::{column_constraints, default_spelling};
 use sekejap_lang::{prepare_sql, Param, PreparedSql, SqlDatabase, SqlResult};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -464,13 +465,20 @@ impl Db {
         self.in_transaction(|tx| tx.execute(sql, params))
     }
 
-    /// Run one row-returning statement and assemble its answer.
+    /// Run one row-returning statement and assemble its answer. An
+    /// `INSERT ... RETURNING` is one: it runs as its own committed
+    /// transaction and answers the rows it wrote.
     ///
     /// This is the plan cache's own door: the statement text is looked up
     /// there first, and a hit REBINDS the compiled plan rather than parsing
     /// and compiling it again. `Db::cache_stats` reports what that is doing.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Rows> {
         refuse_transaction_word(sql)?;
+        // `INSERT ... RETURNING` writes: it runs, and commits, as its own
+        // transaction, and answers the rows it wrote.
+        if is_insert(sql) {
+            return self.in_transaction(|tx| tx.query(sql, params));
+        }
         let params = params_of(params);
         match self.with_cached_plan(sql, &params, |db, prepared| {
             if !(prepared.is_select() || prepared.is_aggregate()) {
@@ -663,14 +671,19 @@ impl Db {
             let mut fields = if edge.is_some() {
                 Vec::new()
             } else {
+                let (not_null, default) = column_constraints(&info, KEY);
                 vec![Field {
                     name: KEY.to_owned(),
                     kind: Kind::Text,
                     declared: Some("TEXT".to_owned()),
-                    primary_key: true,
+                    // A named key column supplies the key in its place.
+                    primary_key: info.key.as_ref().and_then(|k| k.column.as_ref()).is_none(),
+                    not_null,
+                    default: default.as_ref().map(default_spelling),
                 }]
             };
             for (name, kind) in &info.layout.fields {
+                let (not_null, default) = column_constraints(&info, name);
                 fields.push(Field {
                     name: name.clone(),
                     kind: kind.clone(),
@@ -684,6 +697,8 @@ impl Db {
                         .map(|(_, d)| d.clone())
                         .or_else(|| Some(sekejap_lang::catalog::declared_of(kind))),
                     primary_key: info.key.as_ref().and_then(|k| k.column.as_deref()) == Some(name),
+                    not_null,
+                    default: default.as_ref().map(default_spelling),
                 });
             }
             let indexes = db
@@ -853,7 +868,16 @@ impl Tx<'_> {
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
         refuse_transaction_word(sql)?;
         let params = params_of(params);
-        let result = self.database().sql(sql, &params)?;
+        // A write (`INSERT ... RETURNING`) goes through the writer the way
+        // `Tx::execute` does, so the service counts it in the change feed.
+        let result = if is_insert(sql) {
+            match &mut self.inner {
+                TxInner::Single(g) => g.sql(sql, &params)?,
+                TxInner::Service(g) => g.sql(sql, &params)?,
+            }
+        } else {
+            self.database().sql(sql, &params)?
+        };
         expect_rows(result, sql)
     }
 

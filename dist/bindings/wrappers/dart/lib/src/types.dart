@@ -60,7 +60,9 @@ class FieldInfo {
         kind = FieldKind.fromWire(json['kind'] as String),
         dimension = json['dimension'] as int?,
         declared = json['declared'] as String?,
-        primaryKey = json['primary_key'] as bool? ?? false;
+        primaryKey = json['primary_key'] as bool? ?? false,
+        notNull = json['not_null'] as bool? ?? false,
+        defaultValue = json['default'] as String?;
 
   final String name;
   final FieldKind kind;
@@ -74,6 +76,13 @@ class FieldInfo {
   final String? declared;
 
   final bool primaryKey;
+
+  /// NOT NULL: always true for the key column.
+  final bool notNull;
+
+  /// The column's DEFAULT as a `CREATE TABLE` writes it (`ulid()`,
+  /// `now()`), or null.
+  final String? defaultValue;
 
   @override
   String toString() => 'FieldInfo($name, ${kind.wire}'

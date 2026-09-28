@@ -81,7 +81,7 @@ and rewrites nothing -- a statement goes to `SqlDatabase::sql` as written.
 | item | engine call | one line |
 |---|---|---|
 | `Db::execute(sql, &[Value]) -> Result<u64>` | `SqlDatabase::sql` (`lang/src/lib.rs`) + commit; `SqlResult::Affected(n)` as `n`, `Notice` as `0` | `db.execute("INSERT INTO posts (_key, title) VALUES ($1, $2)", &[json!("p1"), json!("Hello")])?;` |
-| `Db::query(sql, &[Value]) -> Result<Rows>` | `SqlDatabase::sql` → `SqlResult::Rows` | `let rows = db.query("SELECT _key, title FROM posts", &[])?;` |
+| `Db::query(sql, &[Value]) -> Result<Rows>` | `SqlDatabase::sql` → `SqlResult::Rows`; an `INSERT ... RETURNING` runs as its own committed transaction (0.18.2) | `let rows = db.query("SELECT _key, title FROM posts", &[])?;` / `db.query("INSERT INTO posts (title) VALUES ($1) RETURNING _key", &[json!("Hello")])?` |
 | `Db::stream(sql, &[Value], page_rows, &mut f) -> Result<u64>` | `prepare_sql` + `PreparedSql::for_each_row` (`lang/src/lib.rs:399`) | `db.stream(sql, &[], 512, &mut |row| { .. Ok(()) })?;` |
 | `Db::explain(sql, &[Value]) -> Result<String>` | `SqlDatabase::sql_explain` / `explain_sql` (`lang/src/lib.rs:523`) | `println!("{}", db.explain("SELECT * FROM posts", &[])?);` |
 | `Db::prepare(sql) -> Result<Statement<'_>>` | `parse_sql` (`lang/src/lib.rs`), then `prepare_sql` on the first bind | `let mut s = db.prepare("SELECT _key FROM item WHERE bucket = $1")?;` |
@@ -282,7 +282,7 @@ one spelling and this crate does not add a second.
 | `Db::collections() -> Result<Vec<String>>` | `Database::list_qualified_collections`: a `public` table by its name, a table in a named schema as `schema.table` (0.18.1) | `for name in db.collections()? { .. }` |
 | `Db::describe(collection) -> Result<Option<Collection>>` | `Database::collection_in` + `collection_info` + `list_indexes` + `edge_table` | `let shape = db.describe("geo.places")?;` -- `shape.schema` is the table's schema, and `shape.edge` is `Some(EdgeTableInfo)` for an edge table: its REFERENCES, key, source and destination columns and tables, label and property graph; an edge table's `fields` have no `_key` (0.18.1) |
 | `Db::execute` / `Db::query` / `Tx::execute` / `Tx::query` of `BEGIN`, `COMMIT`, `ROLLBACK` (and `START TRANSACTION`, `END`, `ABORT`, `SAVEPOINT`, `RELEASE`) | refused by name, naming `Db::transaction` (0.18.2) | each call is already one transaction, so the word would do nothing or end the caller's; `BEGIN BULK` / `END BULK` still run, and the PostgreSQL wire honours the words |
-| `Field::declared` | every column's SQL type (0.18.2) | exactly as declared for a table created through SQL; derived from the stored kind (`BIGINT`, `DOUBLE PRECISION`, `VECTOR(n)`, ...) for one that recorded none; `Field::primary_key` is true for `_key` and for a named PRIMARY KEY column |
+| `Field::declared` | every column's SQL type (0.18.2) | exactly as declared for a table created through SQL; derived from the stored kind (`BIGINT`, `DOUBLE PRECISION`, `VECTOR(n)`, ...) for one that recorded none; `Field::primary_key` marks the column that supplies the key -- `_key`, or the column a table named PRIMARY KEY; `Field::not_null` and `Field::default` (the SQL spelling, `ulid()`) report the rest of the declaration, the key's own DEFAULT included |
 | collection names everywhere | `resolve`: `table`, `public.table`, or `schema.table` for a schema that exists | `db.get(("geo.places", "p1"))?`, `db.count_rows("geo.places")?`; a name whose part before the first dot is not a schema is looked up whole (0.18.1) |
 | `Db::count_rows(collection) -> Result<u64>` | `Database::row_count` (the live record) and, only where there is none, the walk | `let n = db.count_rows("posts")?;` |
 | `Db::scan_count_rows(collection) -> Result<u64>` | `Database::scan` walked to the end | `let n = db.scan_count_rows("posts")?;` |
@@ -291,7 +291,7 @@ one spelling and this crate does not add a second.
 
 ```rust,signatures
 pub struct Collection { pub name: String, pub fields: Vec<Field>, pub indexes: Vec<Index>, pub timestamps: bool, pub rows: Option<u64> }
-pub struct Field { pub name: String, pub kind: FieldKind, pub declared: Option<String>, pub primary_key: bool }
+pub struct Field { pub name: String, pub kind: FieldKind, pub declared: Option<String>, pub primary_key: bool, pub not_null: bool, pub default: Option<String> }
 pub struct Index { pub name: String, pub field: String, pub family: IndexFamily, pub unique: bool, pub ready: bool }
 ```
 
@@ -299,7 +299,8 @@ pub struct Index { pub name: String, pub field: String, pub family: IndexFamily,
 `Json`, `Geo`, `Point`, `Vector(n)`. `declared` is the SQL spelling the catalog
 recorded where the `Kind` does not carry it (`TIMESTAMPTZ` and `DATE` are both
 `Kind::Int`). The first `Field` of every collection is `_key`, `FieldKind::Text`,
-`primary_key: true`: it is a declared field of every layout
+NOT NULL, and `primary_key: true` unless the table named another PRIMARY KEY
+column: it is a declared field of every layout
 (`collections/mod.rs:1350`) and naming it is how a caller addresses a row.
 
 `Collection::rows` is the LIVE ROW COUNT, or `None` where the database keeps
@@ -323,7 +324,7 @@ its own name. Law 4: a scan is called a scan.
 |---|---|---|
 | `Db::transaction() -> Result<Tx<'_>>` | take the writer | `let mut tx = db.transaction()?;` |
 | `Tx::put/put_many/delete/link/link_with/unlink/execute` | the same calls as §2-§4, with NO commit | `tx.put(("posts","p1"), &doc)?;` |
-| `Tx::query(&mut self, sql, params) -> Result<Rows>` | a row-returning statement INSIDE the transaction: it sees the transaction's own writes and what its `SET LOCAL` set (`ef_search`); not cached | `let rows = tx.query("SELECT ...", &[])?;` |
+| `Tx::query(&mut self, sql, params) -> Result<Rows>` | a row-returning statement INSIDE the transaction -- `INSERT ... RETURNING` included, which writes through the transaction's writer (0.18.2): it sees the transaction's own writes and what its `SET LOCAL` set (`ef_search`); not cached | `let rows = tx.query("SELECT ...", &[])?;` |
 | `Tx::commit(self) -> Result<()>` | `Database::commit` (`collections/mod.rs:1957`) | `tx.commit()?;` |
 | `Tx::rollback(self) -> Result<()>` | `Database::rollback` (`:1982`) | `tx.rollback()?;` |
 

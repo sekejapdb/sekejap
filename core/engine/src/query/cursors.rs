@@ -385,20 +385,41 @@ impl<'a> DriverCursor<'a> {
                     done: false,
                 }))
             }
-            DriverPlan::Keys { predicate, position } => {
+            DriverPlan::Keys {
+                predicate,
+                position,
+                descending,
+            } => {
                 let prefix = prefix(0x20, collection);
-                let mut start = prefix.clone();
-                if let Some(lower) = scalar_lower(predicate) {
-                    start.extend_from_slice(lower);
-                }
-                if let Some(key) = resume.and_then(|after| resume_key_walk(&prefix, after)) {
-                    start = key;
-                }
-                let inner = db
-                    .store()?
-                    .range(&start)
-                    .map_err(Error::from)
-                    .map_err(QueryError::from)?;
+                let resumed = resume.and_then(|after| resume_key_walk(&prefix, after));
+                let inner = if *descending {
+                    // Keys strictly below `to`: one past the upper bound, or
+                    // the key the last page stopped on.
+                    let to = match resumed {
+                        Some(key) => key,
+                        None => keys_upper_end(&prefix, predicate),
+                    };
+                    ScalarWalk::Reverse(
+                        db.store()?
+                            .range_reverse(&to)
+                            .map_err(Error::from)
+                            .map_err(QueryError::from)?,
+                    )
+                } else {
+                    let mut start = prefix.clone();
+                    if let Some(lower) = scalar_lower(predicate) {
+                        start.extend_from_slice(lower);
+                    }
+                    if let Some(key) = resumed {
+                        start = key;
+                    }
+                    ScalarWalk::Forward(
+                        db.store()?
+                            .range(&start)
+                            .map_err(Error::from)
+                            .map_err(QueryError::from)?,
+                    )
+                };
                 // A posting-membership-style certification: every entry this
                 // cursor yields already passed `scalar_key_position` against
                 // the predicate, so there is no candidate left for
@@ -671,9 +692,12 @@ impl KeysCursor<'_> {
         loop {
             meter.charge(WorkResource::KeyPostings, 1)?;
             let decoded = {
+                // Walking down, "past the predicate" is below its lower
+                // bound and "not reached yet" is above its upper one.
+                let descending = self.inner.descending();
                 let Some((key, value)) = self
                     .inner
-                    .peek_ref()
+                    .peek()
                     .map_err(Error::from)
                     .map_err(QueryError::from)?
                 else {
@@ -686,7 +710,8 @@ impl KeysCursor<'_> {
                 }
                 let suffix = &key[self.prefix.len()..];
                 let position = scalar_key_position(&self.predicate, suffix);
-                if position == Ordering::Greater {
+                let past = if descending { Ordering::Less } else { Ordering::Greater };
+                if position == past {
                     self.done = true;
                     return Ok(None);
                 }
@@ -706,9 +731,10 @@ impl KeysCursor<'_> {
                             },
                         ))
                     }
-                    // Below the predicate's lower bound: keep walking.
-                    Ordering::Less => None,
-                    Ordering::Greater => unreachable!("handled above"),
+                    // Not inside the predicate yet (below its lower bound
+                    // walking up, above its upper one walking down): keep
+                    // walking.
+                    _ => None,
                 }
             };
             self.inner.step();

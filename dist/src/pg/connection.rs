@@ -1019,11 +1019,20 @@ impl<'a> Connection<'a> {
                 rows: vec![vec![SqlValue::Text(text)]],
                 tag: None,
             }),
-            SqlResult::Rows { columns, rows } => Outcome::Rows(Answer {
-                fields: columns.iter().map(|name| text_field(name)).collect(),
-                rows: rows.into_iter().map(|row| row.values).collect(),
-                tag: None,
-            }),
+            // `INSERT ... RETURNING`: the rows it wrote, typed as the
+            // statement's Describe said, under the tag a driver counts.
+            SqlResult::Rows { columns, rows } => {
+                let fields = self
+                    .returning_fields(sql, params)
+                    .filter(|fields| fields.len() == columns.len())
+                    .unwrap_or_else(|| columns.iter().map(|name| text_field(name)).collect());
+                let tag = command_tag(sql, rows.len() as u64);
+                Outcome::Rows(Answer {
+                    fields,
+                    rows: rows.into_iter().map(|row| row.values).collect(),
+                    tag: Some(tag),
+                })
+            }
         })
     }
 
@@ -1465,10 +1474,16 @@ impl<'a> Connection<'a> {
         oids: &[i32],
     ) -> (Option<Vec<FieldDescription>>, Vec<Option<&'static str>>) {
         let trimmed = sql.trim().trim_end_matches(';').trim();
-        if self.is_session_statement(trimmed) || !is_read(trimmed) {
+        if self.is_session_statement(trimmed) {
             return (None, Vec::new());
         }
         let probe: Vec<Param> = oids.iter().map(|oid| probe_param(*oid)).collect();
+        if !is_read(trimmed) {
+            // A write is described as NoData -- unless it is an INSERT whose
+            // RETURNING answers rows, which a client must be told the
+            // columns of before it executes.
+            return (self.returning_fields(trimmed, &probe), Vec::new());
+        }
         let budget = self.budget();
         if self.refresh_reader().is_err() {
             return (None, Vec::new());
@@ -1489,6 +1504,27 @@ impl<'a> Connection<'a> {
                 vec![text_field("QUERY PLAN")]
             };
             (Some(fields), prepared.param_types())
+        })
+    }
+
+    /// The typed columns an `INSERT ... RETURNING` answers, compiled (never
+    /// run) against the current snapshot; `None` for any other write, or
+    /// when the snapshot cannot compile it (a table created inside the open
+    /// transaction), where the caller falls back to text columns.
+    fn returning_fields(&mut self, trimmed: &str, params: &[Param]) -> Option<Vec<FieldDescription>> {
+        if word(trimmed, 0) != "INSERT" {
+            return None;
+        }
+        let budget = self.budget();
+        self.refresh_reader().ok()?;
+        let snapshot = self.reader.as_ref()?;
+        snapshot.with(|db| {
+            let db: &Database = db;
+            let prepared =
+                sekejap_lang::prepare_sql_with(db, trimmed, params, budget, &mut || false).ok()?;
+            prepared
+                .returns_rows_from_a_write()
+                .then(|| field_descriptions(db, &prepared))
         })
     }
 

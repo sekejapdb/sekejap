@@ -574,6 +574,14 @@ pub(super) struct HavingPredicate {
     pub(super) value: Literal,
 }
 
+/// One item of an INSERT's `RETURNING` list: a column by name, or `*` --
+/// the columns `SELECT *` answers.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum ReturningItem {
+    Star,
+    Column(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum SelectItem {
     Star,
@@ -878,6 +886,8 @@ pub(super) enum Stmt {
         rows: Vec<Vec<Literal>>,
         /// `ON CONFLICT (...) DO NOTHING | DO UPDATE SET c = EXCLUDED.c`.
         on_conflict: Option<ConflictClause>,
+        /// `RETURNING _key, *, col`: empty when the statement has none.
+        returning: Vec<ReturningItem>,
     },
     /// `CREATE PROPERTY GRAPH g VERTEX TABLES (...) EDGE TABLES (...)`, and
     /// `ALTER PROPERTY GRAPH g ADD ...` with `alter` set

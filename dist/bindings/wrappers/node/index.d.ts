@@ -84,7 +84,7 @@ export interface CollectionDescriptor {
   edge: EdgeTableInfo | null;
   timestamps: boolean;
   rows: number | null;
-  fields: Array<FieldDecl & { declared: string | null; primary_key: boolean }>;
+  fields: Array<FieldDecl & { declared: string | null; primary_key: boolean; not_null: boolean; default: string | null }>;
   indexes: IndexDecl[];
 }
 

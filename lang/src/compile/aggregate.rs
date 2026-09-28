@@ -176,6 +176,7 @@ impl Compiler<'_> {
         for expr in &statement.predicates {
             filters.push(self.where_filter(c, expr)?);
         }
+        super::predicates::merge_key_bounds(&mut filters);
 
         // The group key. `DISTINCT col` IS `GROUP BY col` with no
         // accumulators, so it lands on the same field.

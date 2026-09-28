@@ -1,5 +1,35 @@
 use super::*;
 
+/// `_key > $a AND _key < $b` is ONE range over the key mapping, which is how
+/// the engine takes it: it walks one key range per query. A key filter with
+/// only a lower bound and one with only an upper bound are merged into it;
+/// each `$n` fill names the side it fills, so a bind still lands where it
+/// belongs.
+pub(super) fn merge_key_bounds(filters: &mut Vec<OwnedFilter>) {
+    let lower_only = filters.iter().position(|f| {
+        matches!(f, OwnedFilter::Key { lower, upper: Bound::Unbounded, .. } if !matches!(lower, Bound::Unbounded))
+    });
+    let upper_only = filters.iter().position(|f| {
+        matches!(f, OwnedFilter::Key { lower: Bound::Unbounded, upper, .. } if !matches!(upper, Bound::Unbounded))
+    });
+    let (Some(low), Some(high)) = (lower_only, upper_only) else {
+        return;
+    };
+    let OwnedFilter::Key { upper, fills, .. } = filters.remove(high) else {
+        unreachable!("matched a key filter above");
+    };
+    let low = if high < low { low - 1 } else { low };
+    if let OwnedFilter::Key {
+        upper: slot,
+        fills: into,
+        ..
+    } = &mut filters[low]
+    {
+        *slot = upper;
+        into.extend(fills);
+    }
+}
+
 impl Compiler<'_> {
     pub(super) fn filter(&mut self, c: CollectionId, predicate: &Predicate) -> SqlResult2<OwnedFilter> {
         Ok(match predicate {

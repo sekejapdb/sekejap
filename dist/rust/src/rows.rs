@@ -181,6 +181,9 @@ pub(crate) fn expect_affected(result: SqlResult, statement: &str) -> Result<u64>
         // `BEGIN` on a writer already in a transaction. Zero rows is the
         // truth, not a swallowed error.
         SqlResult::Notice(_) => Ok(0),
+        // `INSERT ... RETURNING` wrote the rows it returns; executing it
+        // counts them, as a PostgreSQL driver's execute does.
+        SqlResult::Rows { rows, .. } if is_insert(statement) => Ok(rows.len() as u64),
         SqlResult::Rows { .. } => Err(Error::refused(
             format!("Db::execute on `{}`", first_words(statement)),
             "the statement returns rows: use Db::query or Db::stream",
@@ -190,6 +193,14 @@ pub(crate) fn expect_affected(result: SqlResult, statement: &str) -> Result<u64>
             "an EXPLAIN returns a plan: use Db::explain",
         )),
     }
+}
+
+/// True for an INSERT, the one write whose `RETURNING` answers rows.
+pub(crate) fn is_insert(statement: &str) -> bool {
+    statement
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("INSERT"))
 }
 
 /// The first three words of a statement, for a refusal that names it without
