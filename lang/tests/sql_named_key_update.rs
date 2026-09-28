@@ -64,3 +64,19 @@ fn a_declared_key_column_cannot_be_assigned() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn a_declared_key_column_cannot_be_inserted_null() {
+    let dir = TempDir::new().unwrap();
+    let mut db = Database::create(dir.path().join("key.sekejap"), cfg()).unwrap();
+    run(&mut db, "CREATE TABLE demo (id TEXT PRIMARY KEY, note TEXT)");
+    for sql in [
+        "INSERT INTO demo (id, note) VALUES (NULL, 'x')",
+        "INSERT INTO demo (note) VALUES ('x')",
+    ] {
+        if let Ok(r) = db.sql(sql, &[]) {
+            panic!("`{sql}` was accepted: {r:?}");
+        }
+        let _ = db.sql("ROLLBACK", &[]);
+    }
+}
