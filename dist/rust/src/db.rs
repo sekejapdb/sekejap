@@ -367,8 +367,7 @@ impl Db {
     /// a plan does not hold rows -- the one compiled form that holds a set
     /// of them, a semi-join, is never rebound and is compiled again instead.
     fn changes_the_catalog(sql: &str) -> bool {
-        let first = sql
-            .trim_start()
+        let first = sekejap_lang::after_leading_comments(sql)
             .split(|c: char| c.is_whitespace())
             .next()
             .unwrap_or_default();
@@ -1085,8 +1084,7 @@ fn open_or_create(path: &Path, config: Config) -> Result<Database> {
 /// does it. `BEGIN BULK` / `END BULK` are the bulk scope, not a transaction
 /// word. The PostgreSQL wire keeps honouring them: a wire session is one.
 fn refuse_transaction_word(sql: &str) -> Result<()> {
-    let words: Vec<String> = sql
-        .trim_start()
+    let words: Vec<String> = sekejap_lang::after_leading_comments(sql)
         .split(|c: char| c.is_whitespace() || c == ';')
         .filter(|w| !w.is_empty())
         .take(2)

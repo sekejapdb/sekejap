@@ -724,14 +724,14 @@ fn micros(d: Duration) -> u64 {
 /// The leading keyword when it is transaction control, `None` otherwise.
 /// True when the statement's first word is `word` (ASCII, any case).
 fn first_word_is(text: &str, word: &str) -> bool {
-    text.split_whitespace()
+    sekejap_lang::after_leading_comments(text)
+        .split_whitespace()
         .next()
         .is_some_and(|first| first.eq_ignore_ascii_case(word))
 }
 
 fn transaction_keyword(text: &str) -> Option<&'static str> {
-    let first: String = text
-        .trim_start()
+    let first: String = sekejap_lang::after_leading_comments(text)
         .chars()
         .take_while(|c| c.is_ascii_alphabetic())
         .collect::<String>()

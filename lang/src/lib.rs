@@ -124,6 +124,7 @@ mod explain;
 mod functions;
 mod gql;
 mod lexer;
+pub use lexer::after_leading_comments;
 mod parser;
 mod pgcrypto;
 mod refuse;

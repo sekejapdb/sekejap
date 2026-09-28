@@ -387,3 +387,35 @@ fn number(text: &str, bytes: &[u8], i: &mut usize, at: usize) -> SqlResult2<Tok>
     *i = j;
     Ok(Tok::Num(value, integer))
 }
+
+/// `sql` from its first token on: leading whitespace, `-- line comments` and
+/// `/* block comments */` skipped by the lexer's own rules. A guard that
+/// looks at a statement's first word must look HERE: a comment in front of
+/// a word hides nothing from the parser, so it may hide nothing from the
+/// guard either (finding vuln-a04). An unterminated comment leaves the rest
+/// as it is; the parser refuses it.
+pub fn after_leading_comments(sql: &str) -> &str {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) == Some(&b'-') && bytes.get(i + 1) == Some(&b'-') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
+            match sql[i + 2..].find("*/") {
+                Some(end) => {
+                    i += 2 + end + 2;
+                    continue;
+                }
+                None => return &sql[i..],
+            }
+        }
+        return &sql[i..];
+    }
+}
