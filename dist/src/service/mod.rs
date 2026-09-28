@@ -686,7 +686,11 @@ impl WriterGuard<'_> {
 
 impl Drop for WriterGuard<'_> {
     fn drop(&mut self) {
-        if self.batch.touched() {
+        // Whatever this guard wrote and did not commit is discarded, whether
+        // or not the change feed was recording it: the feed records only
+        // while someone subscribes, and a pending write left here was
+        // committed by the NEXT guard (finding vuln-a03).
+        if self.batch.touched() || self.db.has_uncommitted_work() {
             self.batch.clear();
             sekejap_lang::end_transaction();
             let _ = self.db.rollback();

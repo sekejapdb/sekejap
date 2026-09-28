@@ -1661,6 +1661,13 @@ impl Database {
     /// can decide the fate of, which is what stops a late build from
     /// committing or rolling back someone else's rows. The engine's own index
     /// create/build/drop steps call `ready_write` and deliberately not this.
+    /// Does this handle hold work a `commit` would make durable or a
+    /// `rollback` would discard? A caller that owns a transaction's end --
+    /// a writer guard being dropped -- asks this rather than trusting its own
+    /// bookkeeping of what it wrote.
+    pub fn has_uncommitted_work(&self) -> bool {
+        self.store.is_dirty() || self.sequence.is_some() || self.user_writes_pending
+    }
     pub(crate) fn user_write(&mut self) -> Result<()> {
         self.ready_write()?;
         self.user_writes_pending = true;

@@ -882,3 +882,31 @@ fn close_discards_uncommitted_work_and_releases_the_reader_slot() {
     );
     reopened.close().unwrap();
 }
+
+/// Finding vuln-a03 (0.18.5): a writer guard dropped without `commit` rolled
+/// back only when the change feed had recorded something, and the feed
+/// records only while someone is subscribed. With no subscriber an abandoned
+/// write stayed pending, and the NEXT guard's commit made it durable. A
+/// dropped guard's uncommitted work is gone, subscribed or not.
+#[test]
+fn a_dropped_writer_leaves_nothing_behind_with_no_subscriber() {
+    let fixture = build(8);
+    {
+        let mut abandoned = fixture.service.writer();
+        assert!(abandoned.delete(fixture.collection, "k000003").unwrap());
+        abandoned
+            .put(fixture.collection, "k999999", &document(999_999))
+            .unwrap();
+        // dropped without commit
+    }
+    {
+        let mut next = fixture.service.writer();
+        next.put(fixture.collection, "k000100", &document(100)).unwrap();
+        next.commit().unwrap();
+    }
+    drop(fixture.service);
+    let db = Database::open(&fixture.path, config()).unwrap();
+    assert!(db.get(fixture.collection, "k000003").unwrap().is_some(), "the abandoned delete was committed");
+    assert!(db.get(fixture.collection, "k999999").unwrap().is_none(), "the abandoned put was committed");
+    assert!(db.get(fixture.collection, "k000100").unwrap().is_some(), "the next writer's own commit holds");
+}
