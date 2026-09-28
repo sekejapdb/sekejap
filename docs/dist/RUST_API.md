@@ -336,6 +336,13 @@ callers were built on. `Tx` is the opposite bargain -- many writes, one barrier 
 and the two are the whole story: there is no third auto-commit toggle to get
 wrong. A `Tx` dropped without `commit` ROLLS BACK, and says so in its docs.
 
+A statement that FAILS inside a `Tx` -- `Tx::execute` or `Tx::query` returning
+an error after it started -- aborts the transaction, as in PostgreSQL (0.18.5):
+a failed statement may have written part of its rows, so every later
+statement is refused with `25P02`, `Tx::commit` rolls back and returns that
+`25P02`, and `Tx::rollback` ends it as always. A statement refused before it
+runs (a transaction word, `BEGIN`/`COMMIT`) does not abort it.
+
 `SET LOCAL ef_search = n` run through `Tx::execute` holds until the `Tx` ends
 -- commit, rollback or drop -- as in PostgreSQL, and a vector order reads it
 when the statement runs, so `Tx::query` after it is approximate with that

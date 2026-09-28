@@ -787,11 +787,13 @@ impl Db {
             Backing::Single(m) => Tx {
                 inner: TxInner::Single(m.lock().unwrap_or_else(|e| e.into_inner())),
                 done: false,
+                aborted: false,
                 db: self,
             },
             Backing::Service(s) => Tx {
                 inner: TxInner::Service(s.writer()),
                 done: false,
+                aborted: false,
                 db: self,
             },
         })
@@ -840,6 +842,12 @@ impl Db {
 pub struct Tx<'a> {
     inner: TxInner<'a>,
     done: bool,
+    /// Set by the first statement that fails once it has started: from then
+    /// on, as in PostgreSQL, the transaction is aborted -- every statement is
+    /// refused with 25P02 and `commit` rolls back (finding vuln-a07). A
+    /// failed statement may have written part of its rows; nothing the caller
+    /// does after it may make them durable.
+    aborted: bool,
     /// The handle this transaction was opened on, so a DDL statement run
     /// through [`Tx::execute`] invalidates the plan cache the same way
     /// `Db::execute` does.
@@ -866,18 +874,34 @@ impl Tx<'_> {
     /// the plan cache serves `Db::query`, which runs outside a transaction.
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
         refuse_transaction_word(sql)?;
+        self.refuse_if_aborted()?;
         let params = params_of(params);
         // A write (`INSERT ... RETURNING`) goes through the writer the way
         // `Tx::execute` does, so the service counts it in the change feed.
-        let result = if is_insert(sql) {
+        let ran = if is_insert(sql) {
             match &mut self.inner {
-                TxInner::Single(g) => g.sql(sql, &params)?,
-                TxInner::Service(g) => g.sql(sql, &params)?,
+                TxInner::Single(g) => g.sql(sql, &params).map_err(Error::from),
+                TxInner::Service(g) => g.sql(sql, &params).map_err(Error::from),
             }
         } else {
-            self.database().sql(sql, &params)?
+            self.database().sql(sql, &params).map_err(Error::from)
         };
+        let result = self.abort_on_error(ran)?;
         expect_rows(result, sql)
+    }
+
+    fn refuse_if_aborted(&self) -> Result<()> {
+        if self.aborted {
+            return Err(aborted_error());
+        }
+        Ok(())
+    }
+
+    fn abort_on_error<T>(&mut self, ran: Result<T>) -> Result<T> {
+        if ran.is_err() {
+            self.aborted = true;
+        }
+        ran
     }
 
     /// Write one document. Not durable until [`Tx::commit`].
@@ -997,11 +1021,13 @@ impl Tx<'_> {
     /// (`docs/dist/RUST_API.md` §6): the service owns the barrier.
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         refuse_transaction_word(sql)?;
+        self.refuse_if_aborted()?;
         let params = params_of(params);
-        let result: SqlResult = match &mut self.inner {
-            TxInner::Single(g) => g.sql(sql, &params)?,
-            TxInner::Service(g) => g.sql(sql, &params)?,
+        let ran = match &mut self.inner {
+            TxInner::Single(g) => g.sql(sql, &params).map_err(Error::from),
+            TxInner::Service(g) => g.sql(sql, &params).map_err(Error::from),
         };
+        let result: SqlResult = self.abort_on_error(ran)?;
         if Db::changes_the_catalog(sql) {
             self.db.catalog_changed();
         }
@@ -1021,6 +1047,14 @@ impl Tx<'_> {
         self.done = true;
         // `SET LOCAL` ends with the transaction, however it ends.
         sekejap_lang::end_transaction();
+        if self.aborted {
+            // PostgreSQL's COMMIT of an aborted transaction is a ROLLBACK.
+            match &mut self.inner {
+                TxInner::Single(g) => g.rollback()?,
+                TxInner::Service(g) => g.rollback()?,
+            }
+            return Err(aborted_error());
+        }
         match &mut self.inner {
             TxInner::Single(g) => Ok(g.commit()?),
             TxInner::Service(g) => Ok(g.commit()?),
@@ -1058,6 +1092,14 @@ impl Drop for Tx<'_> {
 }
 
 // ── the shared pieces ────────────────────────────────────────────────────
+
+/// PostgreSQL's `in_failed_sql_transaction`.
+fn aborted_error() -> Error {
+    Error::Sql(sekejap_lang::SqlError::Coded {
+        sqlstate: "25P02",
+        message: "current transaction is aborted, commands ignored until end of transaction block: an earlier statement in it failed, and Tx::commit now rolls it back".into(),
+    })
+}
 
 /// Open the database in `path`, or create it there.
 ///

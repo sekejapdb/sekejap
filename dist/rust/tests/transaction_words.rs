@@ -73,3 +73,37 @@ fn a_comment_does_not_hide_a_transaction_word() {
         }
     }
 }
+
+/// Finding vuln-a07 (0.18.5): a statement that failed part way inside a `Tx`
+/// -- a two-row INSERT whose second row repeats the first row's new key --
+/// left its first row written, and a caller that committed after the error
+/// made it durable. As in PostgreSQL, an error aborts the transaction: later
+/// statements are refused with 25P02, `commit` rolls back and reports it, and
+/// `rollback` ends it as always. Both modes.
+#[test]
+fn a_failed_statement_aborts_the_transaction() {
+    for service in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = if service { Db::open_service(&path).unwrap() } else { Db::open(&path).unwrap() };
+        db.execute("CREATE TABLE topics (_key TEXT PRIMARY KEY, name TEXT)", &[]).unwrap();
+        db.execute("INSERT INTO topics (_key, name) VALUES ('t0', 'Kept')", &[]).unwrap();
+
+        let mut tx = db.transaction().unwrap();
+        tx.execute("INSERT INTO topics (_key, name) VALUES ('t1', 'Before')", &[]).unwrap();
+        assert!(tx
+            .execute("INSERT INTO topics (_key, name) VALUES ('t2', 'A'), ('t2', 'B')", &[])
+            .is_err());
+        let refused = tx.execute("INSERT INTO topics (_key, name) VALUES ('t3', 'After')", &[]);
+        assert!(refused.unwrap_err().to_string().contains("25P02"), "service={service}");
+        let committed = tx.commit();
+        assert!(committed.unwrap_err().to_string().contains("25P02"), "service={service}: commit reports the abort");
+        for key in ["t1", "t2", "t3"] {
+            assert!(db.get(("topics", key)).unwrap().is_none(), "service={service}: `{key}` was committed");
+        }
+        assert!(db.get(("topics", "t0")).unwrap().is_some());
+        // The handle is usable afterwards.
+        db.execute("INSERT INTO topics (_key, name) VALUES ('t4', 'Next')", &[]).unwrap();
+        assert!(db.get(("topics", "t4")).unwrap().is_some());
+    }
+}
