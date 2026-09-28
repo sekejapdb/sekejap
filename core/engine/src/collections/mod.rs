@@ -2189,6 +2189,17 @@ impl Database {
         };
         column_rules::mint(&default, self.clock.unix_micros()).map(Some)
     }
+    /// Fill the column DEFAULTs of a proposed row of collection `c`, then
+    /// refuse it if a NOT NULL column is still MISSING or NULL -- what
+    /// `insert` does to a row before it is written. An upsert's `EXCLUDED`
+    /// is this proposed row, defaults included, as in PostgreSQL.
+    pub fn fill_column_defaults(&self, c: CollectionId, doc: &mut Value) -> Result<()> {
+        let catalog = self.catalog(c)?;
+        if catalog.rules.is_empty() {
+            return Ok(());
+        }
+        self.apply_column_rules(&catalog, doc)
+    }
     pub fn alter_collection(
         &mut self,
         id: CollectionId,
