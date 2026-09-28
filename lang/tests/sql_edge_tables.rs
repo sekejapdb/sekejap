@@ -20,7 +20,11 @@
 //!   (`select_reads_one_ends_edges`);
 //! * what is refused, by name (`what_is_not_mapped_is_refused_by_name`);
 //! * DROP PROPERTY GRAPH forgets the graph and keeps every edge
-//!   (`drop_property_graph_keeps_the_edges`).
+//!   (`drop_property_graph_keeps_the_edges`);
+//! * ALTER TABLE cannot change an edge table's columns, whose ends its
+//!   binding names; a renamed edge table keeps its edges
+//!   (`alter_table_leaves_an_edge_tables_columns_alone`, finding
+//!   `vuln-a10`).
 
 use kernel::{
     io::IoMode,
@@ -396,4 +400,42 @@ fn an_end_that_names_no_row_matches_no_edge() {
         ])
     );
     assert_eq!(rows(&mut db, "SELECT src FROM link WHERE dst = 'c'").len(), 2);
+}
+
+#[test]
+fn alter_table_leaves_an_edge_tables_columns_alone() {
+    let dir = TempDir::new().unwrap();
+    let mut db = db(&dir);
+    for sql in [
+        "CREATE TABLE node (_key TEXT PRIMARY KEY)",
+        "INSERT INTO node (_key) VALUES ('a'), ('b'), ('c')",
+        "CREATE TABLE link (src TEXT REFERENCES node, dst TEXT REFERENCES node, w INT, PRIMARY KEY (src, dst))",
+        "ALTER PROPERTY GRAPH base ADD EDGE TABLES (link SOURCE KEY (src) REFERENCES node (_key) DESTINATION KEY (dst) REFERENCES node (_key))",
+        "INSERT INTO link (src, dst, w) VALUES ('a', 'b', 1), ('a', 'c', 2)",
+        "COMMIT",
+    ] {
+        run(&mut db, sql);
+    }
+    for sql in [
+        "ALTER TABLE link RENAME COLUMN src TO origin",
+        "ALTER TABLE link RENAME COLUMN w TO weight",
+        "ALTER TABLE link DROP COLUMN w",
+        "ALTER TABLE link DROP COLUMN dst",
+        "ALTER TABLE link ADD COLUMN note TEXT NOT NULL",
+        "ALTER TABLE link ALTER COLUMN w TYPE BIGINT",
+    ] {
+        refused(db.sql(sql, &[]), "edge table");
+        let _ = db.sql("ROLLBACK", &[]);
+    }
+    let want = sorted_texts(vec![
+        vec![SqlValue::Text("a".into()), SqlValue::Text("b".into()), SqlValue::Int(1)],
+        vec![SqlValue::Text("a".into()), SqlValue::Text("c".into()), SqlValue::Int(2)],
+    ]);
+    assert_eq!(sorted_texts(rows(&mut db, "SELECT src, dst, w FROM link WHERE src = 'a'")), want);
+    run(&mut db, "ALTER TABLE link RENAME TO route");
+    run(&mut db, "COMMIT");
+    assert_eq!(sorted_texts(rows(&mut db, "SELECT src, dst, w FROM route WHERE src = 'a'")), want);
+    run(&mut db, "INSERT INTO route (src, dst, w) VALUES ('b', 'c', 3)");
+    run(&mut db, "COMMIT");
+    assert_eq!(rows(&mut db, "SELECT src FROM route WHERE dst = 'c'").len(), 2);
 }

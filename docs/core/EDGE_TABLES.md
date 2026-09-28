@@ -190,9 +190,9 @@ need an index over edge properties, which does not exist.
 
 ## 8. Refused, by name
 
-`ALTER TABLE`, `TRUNCATE`, triggers and `CREATE INDEX` on an edge table; an
-`UPDATE` of a key or end column; `KEY (...)` on an element table (the table's
-own key is the element key); a label's `PROPERTIES (...)`, `NO PROPERTIES`
-and `PROPERTIES ARE ALL COLUMNS EXCEPT` (a label shows every column); `DROP
-... CASCADE` on a graph's tables (removing one deletes nothing); a key that
-names no end.
+`ALTER TABLE` (except `RENAME TO`), `TRUNCATE`, triggers and `CREATE INDEX`
+on an edge table; an `UPDATE` of a key or end column; `KEY (...)` on an
+element table (the table's own key is the element key); a label's
+`PROPERTIES (...)`, `NO PROPERTIES` and `PROPERTIES ARE ALL COLUMNS EXCEPT`
+(a label shows every column); `DROP ... CASCADE` on a graph's tables
+(removing one deletes nothing); a key that names no end.

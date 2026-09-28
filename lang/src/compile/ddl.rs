@@ -586,6 +586,18 @@ impl Compiler<'_> {
         action: &AlterAction,
     ) -> SqlResult2<WritePlan> {
         let collection = collection(self.db, table)?;
+        // An edge table's binding names its end columns, and its rows are
+        // edges, not entity rows: a column change would leave the binding on
+        // the old layout and see a populated table as empty. Renaming the
+        // table itself is safe.
+        if !matches!(action, AlterAction::RenameTable { .. })
+            && self.db.edge_table(collection).map_err(SqlError::from)?.is_some()
+        {
+            return Err(SqlError::unsupported(format!(
+                "ALTER TABLE {table} {}: `{table}` is an edge table, whose columns its property graph binding names; recreate it to change them (docs/core/EDGE_TABLES.md)",
+                action.written()
+            )));
+        }
         let info = self.db.collection_info(collection).map_err(SqlError::from)?;
         let indexes = self.db.list_indexes(collection).map_err(SqlError::from)?;
         let over = |column: &str| -> Vec<(IndexId, String)> {
