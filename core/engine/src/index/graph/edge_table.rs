@@ -781,10 +781,13 @@ impl Database {
         let source = named(&bound.binding.source, bound.source_collection)?;
         let destination = named(&bound.binding.destination, bound.destination_collection)?;
         let (near, direction) = match (source, destination) {
+            // An end that names no row matches no edge -- checked FIRST: an
+            // existing source beside a missing destination used to take the
+            // walk below, where the missing end then restricted nothing, so a
+            // DELETE removed edges it never named (finding vuln-a01).
+            (Some(None), _) | (_, Some(None)) => return Ok(Vec::new()),
             (Some(Some(s)), _) => (s, Direction::Outgoing),
             (None, Some(Some(d))) => (d, Direction::Incoming),
-            // An end that names no row matches no edge.
-            (Some(None), _) | (_, Some(None)) => return Ok(Vec::new()),
             (None, None) => {
                 return Err(invalid(format!(
                     "a WHERE on `{}` must name `{}` or `{}`: without an end the read is every edge of the type, and there is no index over edge properties (docs/core/EDGE_TABLES.md §4.5)",

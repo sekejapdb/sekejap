@@ -356,3 +356,44 @@ fn drop_property_graph_keeps_the_edges() {
     );
     assert_eq!(sorted_texts(got), ["andra", "dhani"]);
 }
+
+/// Finding vuln-a01 (0.18.5): a WHERE naming BOTH ends, one of which is a
+/// row that does not exist, matched every edge of the other end -- a
+/// `DELETE` then removed edges it never named. An end that names no row
+/// matches no edge, whichever end it is and whichever statement reads it.
+#[test]
+fn an_end_that_names_no_row_matches_no_edge() {
+    let dir = TempDir::new().unwrap();
+    let mut db = db(&dir);
+    for sql in [
+        "CREATE TABLE node (_key TEXT PRIMARY KEY)",
+        "INSERT INTO node (_key) VALUES ('a'), ('b'), ('c')",
+        "CREATE TABLE link (src TEXT REFERENCES node, dst TEXT REFERENCES node, w INT, PRIMARY KEY (src, dst))",
+        "ALTER PROPERTY GRAPH base ADD EDGE TABLES (link SOURCE KEY (src) REFERENCES node (_key) DESTINATION KEY (dst) REFERENCES node (_key))",
+        "INSERT INTO link (src, dst, w) VALUES ('a', 'b', 1), ('a', 'c', 2), ('b', 'c', 3)",
+        "COMMIT",
+    ] {
+        run(&mut db, sql);
+    }
+    for (where_clause, what) in [
+        ("src = 'a' AND dst = 'missing'", "a missing destination"),
+        ("src = 'missing' AND dst = 'c'", "a missing source"),
+    ] {
+        assert!(
+            rows(&mut db, &format!("SELECT src, dst FROM link WHERE {where_clause}")).is_empty(),
+            "SELECT with {what} matched edges"
+        );
+        run(&mut db, &format!("UPDATE link SET w = 99 WHERE {where_clause}"));
+        run(&mut db, &format!("DELETE FROM link WHERE {where_clause}"));
+        run(&mut db, "COMMIT");
+    }
+    // Every edge is still there, unchanged.
+    assert_eq!(
+        sorted_texts(rows(&mut db, "SELECT src, dst, w FROM link WHERE src = 'a'")),
+        sorted_texts(vec![
+            vec![SqlValue::Text("a".into()), SqlValue::Text("b".into()), SqlValue::Int(1)],
+            vec![SqlValue::Text("a".into()), SqlValue::Text("c".into()), SqlValue::Int(2)],
+        ])
+    );
+    assert_eq!(rows(&mut db, "SELECT src FROM link WHERE dst = 'c'").len(), 2);
+}
