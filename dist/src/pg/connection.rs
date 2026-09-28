@@ -688,8 +688,25 @@ impl<'a> Connection<'a> {
             }
             return;
         }
-        // A portal. Running it now is what lets its columns be described,
-        // and the run is held so `Execute` does not repeat it.
+        // A portal that has not run and is not a read: describe its shape
+        // from the statement, never by running it. Running a write here
+        // applied it before -- or without -- the client's `Execute`
+        // (finding vuln-a06). `Execute` runs it.
+        if let Some(portal) = self.portals.get(&name) {
+            let trimmed = portal.sql.trim().trim_end_matches(';').trim().to_owned();
+            if !portal.executed && portal.refused.is_none() && !is_read(&trimmed) {
+                let formats = portal.result_formats.clone();
+                let oids = vec![oid::TEXT; portal.params.len()];
+                let (fields, _) = self.describe_columns(&trimmed, &oids);
+                match fields {
+                    Some(fields) => f::row_description(out, &apply_formats(&fields, &formats)),
+                    None => f::no_data(out),
+                }
+                return;
+            }
+        }
+        // A read portal. Running it now is what lets its columns be
+        // described, and the run is held so `Execute` does not repeat it.
         match self.portal_answer(&name, out) {
             Ok(Some(fields)) => f::row_description(out, &fields),
             Ok(None) => f::no_data(out),

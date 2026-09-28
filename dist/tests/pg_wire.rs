@@ -1297,3 +1297,39 @@ fn set_local_ef_search_lasts_for_its_transaction_block_on_the_wire() {
     let _ = ask(&mut connection, "SET LOCAL ef_search = 1");
     assert_eq!(rows_of(&ask(&mut connection, top3)).len(), 3, "outside a block it ended with its statement");
 }
+
+/// Finding vuln-a06 (0.18.5): `Describe` of a portal RAN its statement so
+/// its columns could be described -- for a `DELETE`, the rows were gone
+/// before the client sent `Execute`, or without it ever sending one. A
+/// portal's Describe reports the shape; only a read may run early (its rows
+/// are held for the Execute), and a write runs on `Execute` alone.
+#[test]
+fn describing_a_write_portal_does_not_run_it() {
+    let fixture = build(4);
+    let mut connection = connect(&fixture.service, 1);
+    let count = |connection: &mut Connection<'_>| rows_of(&ask(connection, "SELECT id FROM place")).len();
+    assert_eq!(count(&mut connection), 4);
+
+    // Parse, Bind, Describe the portal, Close it: never executed.
+    let mut batch = parse_message("del", "DELETE FROM place WHERE id = $1", &[oid::TEXT]);
+    batch.extend_from_slice(&bind_message("p", "del", &[Some(b"k000001")], &[]));
+    batch.extend_from_slice(&describe_message(b'P', "p"));
+    let mut close = vec![b'P'];
+    cstring(&mut close, "p");
+    batch.extend_from_slice(&framed(b'C', &close));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    assert!(first(&got, b'E').is_none(), "no error: {:?}", types_of(&got));
+    assert!(first(&got, b'n').is_some(), "a DELETE describes as NoData: {:?}", types_of(&got));
+    assert_eq!(count(&mut connection), 4, "Describe deleted a row the client never executed");
+
+    // Described, then executed: the row goes exactly once.
+    let mut batch = bind_message("p", "del", &[Some(b"k000001")], &[]);
+    batch.extend_from_slice(&describe_message(b'P', "p"));
+    batch.extend_from_slice(&execute_message("p", 0));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    assert!(first(&got, b'E').is_none(), "no error: {:?}", types_of(&got));
+    assert_eq!(tag(&got), "DELETE 1");
+    assert_eq!(count(&mut connection), 3);
+}
