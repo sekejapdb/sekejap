@@ -1364,3 +1364,42 @@ fn a_failed_autocommit_statement_leaves_nothing_behind() {
     keys.sort();
     assert_eq!(keys, ["t1", "t3", "t5"], "the failed statement's first row was committed by the next one");
 }
+
+/// Finding vuln-a11 (0.18.5): Describe counted parameters by scanning the
+/// text for `$n`, so a `$n` in a comment or a quoted identifier counted, and
+/// a number as large as `$1000000000` made Describe allocate that many type
+/// OIDs. The count is now the lexer's, and a parameter number past the
+/// protocol's 65,535 is refused at Parse.
+#[test]
+fn a_parameter_in_a_comment_is_not_a_parameter() {
+    let fixture = build(4);
+    let mut connection = connect(&fixture.service, 1);
+    for sql in [
+        "SELECT id FROM place /* $3 */",
+        "SELECT id FROM place -- $3\n",
+        "SELECT id AS \"$3\" FROM place",
+    ] {
+        let mut batch = parse_message("s", sql, &[]);
+        batch.extend_from_slice(&describe_message(b'S', "s"));
+        batch.extend_from_slice(&sync_message());
+        let got = frames(&connection.feed(&batch));
+        assert!(first(&got, b'E').is_none(), "`{sql}`: {:?}", types_of(&got));
+        let description = first(&got, b't').expect("ParameterDescription");
+        assert_eq!(
+            i16::from_be_bytes([description.body[0], description.body[1]]),
+            0,
+            "`{sql}` has no parameter"
+        );
+        let mut close = vec![b'S'];
+        cstring(&mut close, "s");
+        let mut batch = framed(b'C', &close);
+        batch.extend_from_slice(&sync_message());
+        connection.feed(&batch);
+    }
+    let mut batch = parse_message("big", "SELECT id FROM place WHERE id = $70000", &[]);
+    batch.extend_from_slice(&describe_message(b'S', "big"));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    assert!(first(&got, b'E').is_some(), "$70000 is past the protocol's parameter limit: {:?}", types_of(&got));
+    assert!(first(&got, b't').is_none(), "no ParameterDescription for a refused statement");
+}

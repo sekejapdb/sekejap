@@ -152,6 +152,27 @@ pub(super) struct Token {
     pub(super) at: usize,
 }
 
+/// The highest `$n` a statement may write: a PostgreSQL `Bind` counts its
+/// parameters in 16 bits.
+pub const MAX_PARAMETER: usize = 65_535;
+
+/// The highest `$n` in `sql` as the lexer reads it, so a `$n` inside a
+/// comment, a string or a quoted identifier is not one (finding vuln-a11).
+/// `0` when there is none or the text does not lex -- the parse that follows
+/// refuses that text anyway.
+pub fn highest_parameter(sql: &str) -> usize {
+    tokenize(sql).map_or(0, |tokens| {
+        tokens
+            .iter()
+            .filter_map(|t| match t.tok {
+                Tok::Param(n) => Some(n),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    })
+}
+
 /// Statement text in, tokens out. The only thing this stage decides is where
 /// one token ends and the next begins; what a word means is the parser's.
 pub(super) fn tokenize(text: &str) -> SqlResult2<Vec<Token>> {
@@ -259,7 +280,14 @@ pub(super) fn tokenize(text: &str) -> SqlResult2<Vec<Token>> {
                 }
                 let n: usize = text[i + 1..j]
                     .parse()
-                    .map_err(|_| SqlError::syntax("parameter number is out of range", at))?;
+                    .ok()
+                    .filter(|&n| n <= MAX_PARAMETER)
+                    .ok_or_else(|| {
+                        SqlError::syntax(
+                            "parameter number is out of range: the PostgreSQL protocol carries at most $65535",
+                            at,
+                        )
+                    })?;
                 if n == 0 {
                     return Err(SqlError::syntax("parameters are numbered from $1", at));
                 }

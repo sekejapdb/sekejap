@@ -1827,32 +1827,11 @@ fn command_tag(sql: &str, rows: u64) -> String {
 }
 
 /// The highest `$n` a statement writes. Used only to pad a
-/// `ParameterDescription` that a `Parse` left short.
+/// `ParameterDescription` that a `Parse` left short. The lexer's count, so
+/// a `$n` in a comment or a quoted identifier is not one, and never past
+/// `MAX_PARAMETER` (finding vuln-a11).
 fn count_parameters(sql: &str) -> usize {
-    let bytes = sql.as_bytes();
-    let mut highest = 0usize;
-    let mut at = 0usize;
-    let mut in_string = false;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'\'' => in_string = !in_string,
-            b'$' if !in_string => {
-                let mut end = at + 1;
-                while end < bytes.len() && bytes[end].is_ascii_digit() {
-                    end += 1;
-                }
-                if end > at + 1 {
-                    if let Ok(n) = sql[at + 1..end].parse::<usize>() {
-                        highest = highest.max(n);
-                    }
-                }
-                at = end.saturating_sub(1);
-            }
-            _ => {}
-        }
-        at += 1;
-    }
-    highest
+    sekejap_lang::highest_parameter(sql).min(sekejap_lang::MAX_PARAMETER)
 }
 
 /// A zero value of the type an OID names, for the describe-time probe.
