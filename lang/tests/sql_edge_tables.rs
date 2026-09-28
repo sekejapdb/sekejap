@@ -24,7 +24,11 @@
 //! * ALTER TABLE cannot change an edge table's columns, whose ends its
 //!   binding names; a renamed edge table keeps its edges
 //!   (`alter_table_leaves_an_edge_tables_columns_alone`, finding
-//!   `vuln-a10`).
+//!   `vuln-a10`);
+//! * an edge table's NOT NULL and DEFAULT hold as a row table's do: an end
+//!   declared NOT NULL admits an edge, an explicit NULL is kept, and
+//!   INSERT, UPDATE and ON CONFLICT all refuse a NULL in a NOT NULL column
+//!   (`edge_columns_keep_their_rules`, finding `vuln-a13`).
 
 use kernel::{
     io::IoMode,
@@ -438,4 +442,47 @@ fn alter_table_leaves_an_edge_tables_columns_alone() {
     run(&mut db, "INSERT INTO route (src, dst, w) VALUES ('b', 'c', 3)");
     run(&mut db, "COMMIT");
     assert_eq!(rows(&mut db, "SELECT src FROM route WHERE dst = 'c'").len(), 2);
+}
+
+#[test]
+fn edge_columns_keep_their_rules() {
+    let dir = TempDir::new().unwrap();
+    let mut db = db(&dir);
+    for sql in [
+        "CREATE TABLE node (_key TEXT PRIMARY KEY)",
+        "INSERT INTO node (_key) VALUES ('a'), ('b'), ('c')",
+        "CREATE TABLE link (src TEXT NOT NULL REFERENCES node, dst TEXT REFERENCES node, note TEXT NOT NULL, w INT DEFAULT 7, PRIMARY KEY (src, dst))",
+        "ALTER PROPERTY GRAPH base ADD EDGE TABLES (link SOURCE KEY (src) REFERENCES node (_key) DESTINATION KEY (dst) REFERENCES node (_key))",
+        // An end declared NOT NULL admits an edge that names it.
+        "INSERT INTO link (src, dst, note) VALUES ('a', 'b', 'x')",
+        // An explicit NULL is kept: the DEFAULT fills only a left-out column.
+        "INSERT INTO link (src, dst, note, w) VALUES ('a', 'c', 'y', NULL)",
+        "COMMIT",
+    ] {
+        run(&mut db, sql);
+    }
+    assert_eq!(
+        sorted_texts(rows(&mut db, "SELECT dst, w FROM link WHERE src = 'a'")),
+        sorted_texts(vec![
+            vec![SqlValue::Text("b".into()), SqlValue::Int(7)],
+            vec![SqlValue::Text("c".into()), SqlValue::Null],
+        ])
+    );
+    for sql in [
+        "INSERT INTO link (src, dst) VALUES ('b', 'c')",
+        "INSERT INTO link (src, dst, note) VALUES ('b', 'c', NULL)",
+        "UPDATE link SET note = NULL WHERE src = 'a'",
+        "INSERT INTO link (src, dst, note) VALUES ('a', 'b', NULL) ON CONFLICT (src, dst) DO UPDATE SET note = EXCLUDED.note",
+    ] {
+        let got = db.sql(sql, &[]);
+        let _ = db.sql("ROLLBACK", &[]);
+        assert_eq!(sqlstate(got), "23502", "`{sql}`");
+    }
+    assert_eq!(
+        sorted_texts(rows(&mut db, "SELECT dst, note FROM link WHERE src = 'a'")),
+        sorted_texts(vec![
+            vec![SqlValue::Text("b".into()), SqlValue::Text("x".into())],
+            vec![SqlValue::Text("c".into()), SqlValue::Text("y".into())],
+        ])
+    );
 }

@@ -414,6 +414,7 @@ impl Database {
                         }
                     }
                 }
+                self.refuse_null_properties(&bound, &merged)?;
                 self.check_properties(&bound, &merged)?;
                 let result = (|| {
                     self.write_edge_bag(taken.edge, &merged)?;
@@ -454,6 +455,7 @@ impl Database {
                     bag[column.as_str()] = value.clone();
                 }
             }
+            self.refuse_null_properties(&bound, &bag)?;
             self.check_properties(&bound, &bag)?;
             rewritten.push((f.edge, bag));
         }
@@ -643,20 +645,27 @@ impl Database {
         };
         let source = end(&bound.binding.source, bound.source_collection)?;
         let destination = end(&bound.binding.destination, bound.destination_collection)?;
-        let mut bag = serde_json::Map::new();
-        for (column, value) in row {
-            if !bound.is_end(column) && !value.is_null() {
-                bag.insert(column.clone(), value.clone());
-            }
-        }
-        let mut bag = Value::Object(bag);
+        // The column rules meet the whole logical row, ends and explicit
+        // NULLs included, as a row table's do: a DEFAULT fills only a column
+        // the statement left out, and a NOT NULL end is the end the edge
+        // names (finding vuln-a13). The bag keeps the properties that hold
+        // a value.
+        let mut full = Value::Object(row.clone());
         let catalog = self.catalog(bound.collection)?;
         if !catalog.rules.is_empty() {
-            self.apply_column_rules(&catalog, &mut bag).map_err(|e| match e {
+            self.apply_column_rules(&catalog, &mut full).map_err(|e| match e {
                 Error::InvalidInput(m) if m.contains("NOT NULL") => constraint(NOT_NULL_VIOLATION, m),
                 other => other,
             })?;
         }
+        let bag: serde_json::Map<String, Value> = full
+            .as_object()
+            .expect("built from an object")
+            .iter()
+            .filter(|(column, value)| !bound.is_end(column) && !value.is_null())
+            .map(|(column, value)| (column.clone(), value.clone()))
+            .collect();
+        let bag = Value::Object(bag);
         for column in &bound.table.key {
             if !bound.is_end(column) && bag.get(column).is_none_or(Value::is_null) {
                 return Err(constraint(
@@ -675,6 +684,25 @@ impl Database {
             },
             bag,
         ))
+    }
+
+    /// A property a NOT NULL rule covers that `bag` leaves NULL or missing
+    /// refuses the write with 23502: an UPDATE or an ON CONFLICT DO UPDATE
+    /// meets the rule an INSERT does (finding vuln-a13). The ends are never
+    /// in a bag; an edge always has both.
+    fn refuse_null_properties(&self, bound: &Bound, bag: &Value) -> Result<()> {
+        for (field, rule) in &self.catalog(bound.collection)?.rules {
+            if rule.not_null && !bound.is_end(field) && bag.get(field).is_none_or(Value::is_null) {
+                return Err(constraint(
+                    NOT_NULL_VIOLATION,
+                    format!(
+                        "null value in column \"{field}\" of relation \"{}\" violates not-null constraint",
+                        bound.name
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The bag's values are the kinds the layout declares, checked with the
