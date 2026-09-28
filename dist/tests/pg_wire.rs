@@ -1333,3 +1333,34 @@ fn describing_a_write_portal_does_not_run_it() {
     assert_eq!(tag(&got), "DELETE 1");
     assert_eq!(count(&mut connection), 3);
 }
+
+/// Finding vuln-f02 (0.18.5): an autocommit statement that failed on the
+/// wire left the shared writer holding its work or its failure. A UNIQUE
+/// violation left the handle failed, so every later write from any
+/// connection was refused; a multi-row INSERT failing on its second row left
+/// its first row pending, and the next successful statement committed it.
+/// A failed autocommit statement leaves nothing behind.
+#[test]
+fn a_failed_autocommit_statement_leaves_nothing_behind() {
+    let fixture = build(4);
+    let mut one = connect(&fixture.service, 1);
+    let mut two = connect(&fixture.service, 2);
+    assert!(first(&ask(&mut one, "CREATE TABLE tag (_key TEXT PRIMARY KEY, label TEXT UNIQUE)"), b'E').is_none());
+    assert!(first(&ask(&mut one, "INSERT INTO tag (_key, label) VALUES ('t1', 'reef')"), b'E').is_none());
+
+    // A UNIQUE violation, then another connection writes.
+    assert!(first(&ask(&mut one, "INSERT INTO tag (_key, label) VALUES ('t2', 'reef')"), b'E').is_some());
+    let got = ask(&mut two, "INSERT INTO tag (_key, label) VALUES ('t3', 'lagoon')");
+    assert!(first(&got, b'E').is_none(), "a later write from another connection was refused: {:?}", got.iter().map(|f| f.typ as char).collect::<String>());
+
+    // A two-row INSERT whose second row repeats the first row's new key.
+    assert!(first(&ask(&mut one, "INSERT INTO tag (_key, label) VALUES ('t4', 'surf'), ('t4', 'dive')"), b'E').is_some());
+    assert!(first(&ask(&mut two, "INSERT INTO tag (_key, label) VALUES ('t5', 'temple')"), b'E').is_none());
+    let keys: Vec<String> = rows_of(&ask(&mut one, "SELECT _key FROM tag"))
+        .into_iter()
+        .filter_map(|r| r[0].clone())
+        .collect();
+    let mut keys = keys;
+    keys.sort();
+    assert_eq!(keys, ["t1", "t3", "t5"], "the failed statement's first row was committed by the next one");
+}
