@@ -949,8 +949,11 @@ impl Database {
         // cheapest complete enumeration of a collection -- the same choice
         // `popsim`'s and `q7_budget`'s `count_all` make
         // (`CandidateDriver::Keys`, `src/query/plan.rs`'s `keys_driver`).
+        // A HAVING is evaluated over the walked group, so it takes the walk
+        // (finding vuln-a16).
         let count_all = request.filters.is_empty()
             && request.group.is_none()
+            && request.having.is_empty()
             && !accumulators.is_empty()
             && accumulators
                 .iter()
@@ -1341,7 +1344,10 @@ impl PreparedAggregate<'_> {
         // is the whole point of the record. It is one group, once, and then
         // the aggregate is done.
         if let Some(rows) = self.live_count {
-            if self.done {
+            // `LIMIT 0` answers no group, from the record as from a walk
+            // (finding vuln-a16).
+            if self.done || self.total_limit == Some(0) {
+                self.done = true;
                 return Ok(GroupPage {
                     groups: Vec::new(),
                     done: true,
