@@ -1403,3 +1403,47 @@ fn a_parameter_in_a_comment_is_not_a_parameter() {
     assert!(first(&got, b'E').is_some(), "$70000 is past the protocol's parameter limit: {:?}", types_of(&got));
     assert!(first(&got, b't').is_none(), "no ParameterDescription for a refused statement");
 }
+
+/// Finding vuln-a12 (0.18.5): a simple-query SELECT, documented as
+/// streaming, encoded every row into one buffer, copied it into a second,
+/// and handed the socket nothing until the last row -- memory grew with the
+/// whole answer, past the ceilings the held path keeps. With a sink, the
+/// rows reach it while the statement runs, and what is held at once stays
+/// near `STREAM_FLUSH_BYTES`.
+#[test]
+fn a_streamed_answer_reaches_the_sink_while_it_runs() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    struct Shared(Arc<Mutex<(Vec<u8>, usize)>>);
+    impl Write for Shared {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let mut held = self.0.lock().unwrap();
+            held.1 = held.1.max(bytes.len());
+            held.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let fixture = build(5_000);
+    let mut connection = connect(&fixture.service, 1);
+    let seen = Arc::new(Mutex::new((Vec::new(), 0usize)));
+    connection.set_sink(Box::new(Shared(seen.clone())));
+    let reply = connection.feed(&query("SELECT id, name, n, born, alive FROM place"));
+    let (spilled, largest) = {
+        let held = seen.lock().unwrap();
+        (held.0.clone(), held.1)
+    };
+    let limit = sekejap_dist::pg::connection::STREAM_FLUSH_BYTES + 1024;
+    assert!(!spilled.is_empty(), "nothing reached the sink before the statement ended");
+    assert!(largest <= limit, "one write carried {largest} bytes");
+    assert!(reply.len() <= limit, "feed still held {} bytes", reply.len());
+    let mut all = spilled;
+    all.extend_from_slice(&reply);
+    let got = frames(&all);
+    assert_eq!(got.first().map(|f| f.typ), Some(b'T'), "RowDescription first");
+    assert_eq!(rows_of(&got).len(), 5_000);
+    assert_eq!(tag(&got), "SELECT 5000");
+    assert_eq!(got.last().map(|f| f.typ), Some(b'Z'));
+}

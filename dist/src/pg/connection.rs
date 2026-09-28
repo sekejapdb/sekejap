@@ -56,6 +56,7 @@
 //! running the statement again would pass a new one off as its rest.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,6 +80,12 @@ pub const CURSOR_ROW_CAP: usize = 65_536;
 /// 16 MiB. The second half of the same bound, because 65,536 rows of one
 /// column and 65,536 rows of a hundred are not the same quantity.
 pub const CURSOR_BYTES_CAP: usize = 16 << 20;
+/// Encoded bytes a streamed answer holds before they go to the sink:
+/// 64 KiB. A connection with a sink (`Connection::set_sink`, the socket in
+/// `sekejap-pg`) writes its pending output there whenever a streamed answer
+/// passes this, so an answer of any size holds about this much at once
+/// (Law 1; finding vuln-a12).
+pub const STREAM_FLUSH_BYTES: usize = 64 << 10;
 /// Rows one page of a walk asks for. The same 8,192 `sekejap_lang` pages at.
 const PAGE_ROWS: usize = 8_192;
 /// The `server_version` this surface reports.
@@ -224,6 +231,9 @@ pub struct Connection<'a> {
     changes: Option<Receiver>,
     /// Notifications drained from the feed but not yet written out.
     pending_notifications: Vec<(String, String)>,
+    /// Where a streamed answer's output goes while it runs; `None` holds it
+    /// all for `feed` to return.
+    sink: Option<Box<dyn Write + Send + 'a>>,
 }
 
 impl<'a> Connection<'a> {
@@ -249,7 +259,15 @@ impl<'a> Connection<'a> {
             listening: Vec::new(),
             changes: None,
             pending_notifications: Vec::new(),
+            sink: None,
         }
+    }
+
+    /// Send streamed output to `sink` as it is produced instead of holding
+    /// it for `feed` to return (`STREAM_FLUSH_BYTES`). What `feed` returns
+    /// is the output after the last write to the sink, in order.
+    pub fn set_sink(&mut self, sink: Box<dyn Write + Send + 'a>) {
+        self.sink = Some(sink);
     }
 
     /// The pair this connection published in `BackendKeyData`.
@@ -820,17 +838,42 @@ impl<'a> Connection<'a> {
             return Ok(());
         }
         if is_read(trimmed) {
-            let mut rendered: Vec<u8> = Vec::new();
+            // Rows go straight into `out`, the `RowDescription` in front of
+            // the first, and past `STREAM_FLUSH_BYTES` everything pending
+            // goes to the sink: an answer of any size is held about that
+            // much at once (finding vuln-a12). A walk that fails after some
+            // rows leaves them in front of its `ErrorResponse`, as
+            // PostgreSQL's own do.
+            let mut sink = self.sink.take();
+            let mut lost: Option<std::io::Error> = None;
+            let mut described = !describe;
             let mut count = 0u64;
-            let fields = self.walk(trimmed, params, &mut |row, fields| {
-                emit_row(&mut rendered, &row.values, fields);
+            let walked = self.walk(trimmed, params, &mut |row, fields| {
+                if !described {
+                    f::row_description(out, fields);
+                    described = true;
+                }
+                emit_row(out, &row.values, fields);
                 count += 1;
+                if out.len() >= STREAM_FLUSH_BYTES {
+                    if let Some(sink) = sink.as_mut() {
+                        if let Err(error) = sink.write_all(out) {
+                            lost = Some(error);
+                            return Err(SqlError::Unsupported("the client connection was lost mid-answer".into()));
+                        }
+                        out.clear();
+                    }
+                }
                 Ok(())
-            }, formats)?;
-            if describe {
+            }, formats);
+            self.sink = sink;
+            if lost.is_some() {
+                self.closed = true;
+            }
+            let fields = walked?;
+            if !described {
                 f::row_description(out, &fields);
             }
-            out.extend_from_slice(&rendered);
             f::command_complete(out, &format!("SELECT {count}"));
             return Ok(());
         }

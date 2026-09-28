@@ -78,7 +78,10 @@ the connection's ordinal, and **stated as not cryptographic**
 `Q` runs a `;`-separated statement list, in order, abandoning the rest at the
 first error — PostgreSQL's rule. A row-returning statement answers
 `RowDescription`, then one `DataRow` per row, then `CommandComplete`; the
-rows are STREAMED page by page and nothing is held.
+rows are STREAMED: the server writes them to the socket whenever 64 KiB is
+pending (`STREAM_FLUSH_BYTES`), so an answer of any size holds about that
+much at once. A statement that fails after some rows sends those rows, then
+its `ErrorResponse`, as PostgreSQL does.
 
 `CommandComplete` tags: `SELECT <n>`, `INSERT 0 <n>`, `UPDATE <n>`,
 `DELETE <n>`, `FETCH <n>`, `MOVE <n>`, `CREATE TABLE`, `DROP TABLE`,
