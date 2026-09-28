@@ -234,6 +234,21 @@ impl Wal {
                  buf: Vec::with_capacity(WAL_BUF), flushed: scan.end, limit: None })
     }
 
+    /// Cut the log back to `end`, the end of its last committed transaction,
+    /// once recovery has replayed it. Frames after it were never committed;
+    /// left in the file, the next commit's marker would follow them and the
+    /// open after that would take them for committed (finding vuln-a02).
+    pub(crate) fn cut_to_committed(&mut self, end: u64) -> Result<()> {
+        if end < self.end {
+            self.buf.clear();
+            self.file.set_len(end)?;
+            self.file.sync_data()?;
+            self.end = end;
+            self.flushed = end;
+        }
+        Ok(())
+    }
+
     /// Walk the log without opening it for use and without changing a byte
     /// of it -- no `set_len`, no `sync_data`, and no refusal either: the
     /// caller gets the `Stop` and decides. `recover()` is the caller, and it

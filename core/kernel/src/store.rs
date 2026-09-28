@@ -531,7 +531,12 @@ impl Store {
             self.apply(kind, &payload, off)?;
             off = next;
         }
-        Ok(())
+        // What follows the last commit never happened: remove it before
+        // anything is appended after it.
+        self.wal
+            .as_mut()
+            .ok_or(crate::Error::ReadOnly)?
+            .cut_to_committed(committed_end)
     }
 
     fn apply(&mut self, kind: RecKind, payload: &[u8], wal_offset: u64) -> Result<()> {
