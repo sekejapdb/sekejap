@@ -416,6 +416,21 @@ fn number(text: &str, bytes: &[u8], i: &mut usize, at: usize) -> SqlResult2<Tok>
     Ok(Tok::Num(value, integer))
 }
 
+/// A statement that commits on its own: sekejap's DDL (`CREATE`, `DROP`,
+/// `ALTER`, `REINDEX`, `TRUNCATE`) is not transactional, and running it
+/// commits whatever the handle holds. An explicit transaction refuses one
+/// after writes of its own, so a later ROLLBACK cannot silently fail to undo
+/// them (finding vuln-f03).
+pub fn commits_on_its_own(sql: &str) -> bool {
+    let first = after_leading_comments(sql)
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default();
+    ["CREATE", "DROP", "ALTER", "REINDEX", "TRUNCATE"]
+        .iter()
+        .any(|word| first.eq_ignore_ascii_case(word))
+}
+
 /// `sql` from its first token on: leading whitespace, `-- line comments` and
 /// `/* block comments */` skipped by the lexer's own rules. A guard that
 /// looks at a statement's first word must look HERE: a comment in front of

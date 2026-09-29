@@ -425,7 +425,10 @@ Three things this states rather than implies:
 3. **DDL is not transactional.** `CREATE TABLE`, `ALTER TABLE` and the drop
    steps commit inside their own statement (`lang/src/compile/plan.rs`), so a
    `ROLLBACK` after one does not undo it. PostgreSQL's DDL is transactional;
-   sekejap's is not, and there is no savepoint to make it so.
+   sekejap's is not, and there is no savepoint to make it so. Because it
+   would also commit the block's earlier writes, DDL after a block has
+   written is refused with `25001` and fails the block; DDL as a block's
+   first statement runs.
 
 Inside a `BEGIN` block a read goes through the held writer, so the block
 sees its own uncommitted writes, as in PostgreSQL; no other connection sees

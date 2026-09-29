@@ -1033,6 +1033,15 @@ impl<'a> Connection<'a> {
         debug_assert!(!self.txn_failed, "session_statement refuses a failed block first");
         let result = if self.txn.is_some() {
             let guard = self.txn.as_mut().expect("checked above");
+            // DDL commits on its own; after this block's writes it would
+            // commit them too, and the block's ROLLBACK would undo nothing
+            // (finding vuln-f03).
+            if sekejap_lang::commits_on_its_own(sql) && guard.database().has_uncommitted_work() {
+                return Err(WireError::new(
+                    "25001",
+                    "DDL inside a transaction block that has written: sekejap's DDL commits on its own and would commit the block's writes with it; COMMIT or ROLLBACK first, or run the DDL first",
+                ));
+            }
             guard.sql(sql, params)
         } else {
             match self.service.try_writer() {

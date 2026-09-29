@@ -1022,6 +1022,13 @@ impl Tx<'_> {
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         refuse_transaction_word(sql)?;
         self.refuse_if_aborted()?;
+        // DDL commits on its own; after this transaction's writes it would
+        // commit them too, and a later rollback would undo nothing
+        // (finding vuln-f03).
+        if sekejap_lang::commits_on_its_own(sql) && self.database().has_uncommitted_work() {
+            self.aborted = true;
+            return Err(ddl_after_writes_error());
+        }
         let params = params_of(params);
         let ran = match &mut self.inner {
             TxInner::Single(g) => g.sql(sql, &params).map_err(Error::from),
@@ -1094,6 +1101,13 @@ impl Drop for Tx<'_> {
 // ── the shared pieces ────────────────────────────────────────────────────
 
 /// PostgreSQL's `in_failed_sql_transaction`.
+fn ddl_after_writes_error() -> Error {
+    Error::Sql(sekejap_lang::SqlError::Coded {
+        sqlstate: "25001",
+        message: "DDL inside a transaction that has written: sekejap's DDL commits on its own and would commit this transaction's writes with it; commit or roll back first, or run the DDL first".into(),
+    })
+}
+
 fn aborted_error() -> Error {
     Error::Sql(sekejap_lang::SqlError::Coded {
         sqlstate: "25P02",

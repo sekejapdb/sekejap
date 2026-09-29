@@ -1494,3 +1494,25 @@ fn an_idle_reader_connection_does_not_stop_the_log_folding() {
     }
     assert_eq!(rows_of(&ask(&mut reader, "SELECT _key FROM note WHERE _key = 'n0399-19'")).len(), 1);
 }
+
+/// Finding vuln-f03 (0.18.5), the wire half: DDL inside a `BEGIN` block
+/// committed the block's earlier writes, so the ROLLBACK that followed undid
+/// nothing. DDL after the block has written is refused with 25001 and fails
+/// the block; DDL as a block's first statement still runs.
+#[test]
+fn ddl_after_writes_in_a_block_is_refused() {
+    let fixture = build(4);
+    let mut one = connect(&fixture.service, 1);
+    let count = |c: &mut Connection<'_>| rows_of(&ask(c, "SELECT id FROM place")).len();
+    assert!(first(&ask(&mut one, "BEGIN"), b'E').is_none());
+    assert!(first(&ask(&mut one, "INSERT INTO place (id, name, n, born, alive) VALUES ('k900000', 'new', 900000, 1, true)"), b'E').is_none());
+    let refused = ask(&mut one, "CREATE TABLE later (_key TEXT PRIMARY KEY)");
+    let error = first(&refused, b'E').expect("DDL after a write in a block is refused");
+    assert!(String::from_utf8_lossy(&error.body).contains("25001"), "{}", String::from_utf8_lossy(&error.body));
+    assert!(first(&ask(&mut one, "ROLLBACK"), b'E').is_none());
+    assert_eq!(count(&mut one), 4, "the block's insert was committed by the DDL");
+    // First in a block, DDL runs.
+    assert!(first(&ask(&mut one, "BEGIN"), b'E').is_none());
+    assert!(first(&ask(&mut one, "CREATE TABLE later (_key TEXT PRIMARY KEY)"), b'E').is_none());
+    assert!(first(&ask(&mut one, "COMMIT"), b'E').is_none());
+}

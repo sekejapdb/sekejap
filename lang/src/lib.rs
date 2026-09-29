@@ -124,7 +124,7 @@ mod explain;
 mod functions;
 mod gql;
 mod lexer;
-pub use lexer::{after_leading_comments, highest_parameter, MAX_PARAMETER};
+pub use lexer::{after_leading_comments, commits_on_its_own, highest_parameter, MAX_PARAMETER};
 mod parser;
 mod pgcrypto;
 mod refuse;

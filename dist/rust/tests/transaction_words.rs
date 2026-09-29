@@ -107,3 +107,39 @@ fn a_failed_statement_aborts_the_transaction() {
         assert!(db.get(("topics", "t4")).unwrap().is_some());
     }
 }
+
+/// Finding vuln-f03 (0.18.5): DDL commits on its own in sekejap, and inside
+/// a transaction it used to commit the rows written before it too, so a
+/// later `rollback` returned Ok having undone nothing. DDL after writes in a
+/// transaction is now refused with 25001 (and aborts it); DDL as the
+/// transaction's first statement still runs. Both modes.
+#[test]
+fn ddl_after_writes_in_a_transaction_is_refused() {
+    for service in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = if service { Db::open_service(&path).unwrap() } else { Db::open(&path).unwrap() };
+        db.execute("CREATE TABLE topics (_key TEXT PRIMARY KEY, name TEXT)", &[]).unwrap();
+        for ddl in [
+            "CREATE TABLE later (_key TEXT PRIMARY KEY)",
+            "/* note */ CREATE INDEX topics_name ON topics USING btree (name)",
+            "DROP TABLE topics",
+            "ALTER TABLE topics ADD COLUMN extra TEXT",
+            "REINDEX TABLE topics",
+        ] {
+            let mut tx = db.transaction().unwrap();
+            tx.execute("INSERT INTO topics (_key, name) VALUES ('t1', 'Pending')", &[]).unwrap();
+            let refused = tx.execute(ddl, &[]);
+            assert!(
+                refused.as_ref().is_err_and(|e| e.to_string().contains("25001")),
+                "service={service} `{ddl}`: {refused:?}"
+            );
+            tx.rollback().unwrap();
+            assert!(db.get(("topics", "t1")).unwrap().is_none(), "service={service} `{ddl}`: the pending row was committed");
+        }
+        // DDL first in a transaction runs.
+        let mut tx = db.transaction().unwrap();
+        tx.execute("CREATE TABLE later (_key TEXT PRIMARY KEY)", &[]).unwrap();
+        tx.commit().unwrap();
+    }
+}
