@@ -1179,3 +1179,38 @@ fn one_database_handle_serves_two_threads_at_once_and_each_keeps_its_own_error_s
     assert_eq!(unsafe { sekejap_last_error_code(db) }, SekejapStatus::Ok);
     unsafe { sekejap_close(db) };
 }
+
+/// Finding vuln-f11 (0.18.5): `sekejap_next_change` held the handle's whole
+/// subscription table locked while it waited, so a second subscription's
+/// poll -- even with a zero timeout, promised to return at once -- waited
+/// out the first one's timeout. A wait now holds only its own subscription.
+#[test]
+fn a_waiting_subscription_does_not_hold_up_another() {
+    struct Shared(*mut SekejapDb);
+    unsafe impl Send for Shared {}
+    unsafe impl Sync for Shared {}
+    let db = Fixture::service();
+    let first = unsafe { sekejap_subscribe(db.db) };
+    let second = unsafe { sekejap_subscribe(db.db) };
+    assert!(first >= 0 && second >= 0);
+    let shared = std::sync::Arc::new(Shared(db.db));
+    let waiter = {
+        let shared = std::sync::Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let shared = shared;
+            // A quiet feed: this waits its whole 3 seconds.
+            unsafe { sekejap_next_change(shared.0, first, 3_000) }.is_null()
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    assert!(unsafe { sekejap_next_change(db.db, second, 0) }.is_null());
+    let third = unsafe { sekejap_subscribe(db.db) };
+    let waited = started.elapsed();
+    assert!(third >= 0);
+    assert!(
+        waited < std::time::Duration::from_millis(1_000),
+        "a zero-timeout poll and a subscribe waited {waited:?} behind another subscription's wait"
+    );
+    assert!(waiter.join().unwrap());
+}

@@ -67,7 +67,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_long};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sekejap::core::collections::Error as CoreError;
@@ -410,8 +410,10 @@ pub struct SekejapDb {
     db: Db,
     /// The change-feed subscriptions this handle holds open, by the id
     /// `sekejap_subscribe` returned. A `Receiver` is owned by one reader,
-    /// so the handle owns them and hands out ids instead of pointers.
-    subscriptions: Mutex<BTreeMap<u64, Receiver>>,
+    /// so the handle owns them and hands out ids instead of pointers. Each
+    /// has its own lock: a wait on one holds only that one, never the table
+    /// (finding vuln-f11).
+    subscriptions: Mutex<BTreeMap<u64, Arc<Mutex<Receiver>>>>,
 }
 
 /// One statement, parsed once at `sekejap_prepare` and compiled by its
@@ -1908,7 +1910,7 @@ pub unsafe extern "C" fn sekejap_subscribe(db: *mut SekejapDb) -> c_long {
             .subscriptions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id, receiver);
+            .insert(id, Arc::new(Mutex::new(receiver)));
         Ok(id as c_long)
     })
 }
@@ -1939,16 +1941,21 @@ pub unsafe extern "C" fn sekejap_next_change(
             invalid("`subscription` is not an id sekejap_subscribe returned");
             return Err(());
         }
-        let mut open = handle
+        // The table is locked only to find the subscription; the wait holds
+        // that subscription's own lock (finding vuln-f11).
+        let found = handle
             .subscriptions
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let Some(receiver) = open.get_mut(&(subscription as u64)) else {
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(subscription as u64))
+            .cloned();
+        let Some(receiver) = found else {
             invalid(format!(
                 "subscription {subscription} is not open on this handle"
             ));
             return Err(());
         };
+        let mut receiver = receiver.lock().unwrap_or_else(|e| e.into_inner());
         let event = if timeout_ms == 0 {
             receiver.try_recv()
         } else {
