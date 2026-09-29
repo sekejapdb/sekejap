@@ -88,8 +88,13 @@ three 2081-byte catalog records.
   uses the lowest version that can express the content, so ordinary writes
   never raise the minimum reader.
 - **Limits** (checked at write, refused by name): entry value 8,128 bytes;
-  1,024 live columns per table; 1,024 indexes per owner; 64 running jobs;
-  64 kinds; 128 census lines.
+  1,600 live columns per table (PostgreSQL's limit); 1,024 indexes per owner;
+  64 running jobs; 64 kinds; 128 census lines. These bound METADATA only: the
+  8,128 bytes are one supportive entry (a column's definition, an index's
+  parameters), never a row value -- row values of any size live in core (1.b)
+  and spill to overflow chains past one page. The column cap is a check at
+  DDL; a row costs what its table's own columns cost, never the cap
+  (gated at 50K rows on narrow tables, section 5).
 - **Publish rule.** One statement is one page-WAL transaction holding every
   entry it changes, their name-index entries and the Anchor if the census
   grew. A heavy change is a 2.f job (below).
@@ -213,10 +218,11 @@ two decoders on the hot path). **No row, edge or posting is rewritten.**
    posting resolves.
 6. The verifier passes on a read-only open through the new roots.
 
-`--verify` adds a full streaming pass over rows, edges and postings (cost
-proportional to the file; recommended for production, optional by default).
-One review asked for it always; the other found the catalog checks
-sufficient. Owner to choose the default.
+**Verify is on by default** (owner decision 2026-09-29): after the catalog
+checks, a full streaming pass reads every row, edge and posting and confirms
+each decodes under the new catalog before any old record is removed. It costs
+one read of the file; a database is upgraded once in its life. `--no-verify`
+skips it for a caller who accepts the catalog checks alone.
 
 **3.d Cost on 1M rows and 3M edges** (10 tables, 100 columns, 20 indexes)
 
@@ -226,7 +232,7 @@ sufficient. Owner to choose the default.
 | Register built | about 100 KiB; O(declarations), under a second |
 | Legacy records freed | about 360 KiB, returned to the free list |
 | Backup | one copy of the database; dominates |
-| `--verify` | one streaming pass over the file |
+| Verify (default on) | one streaming pass over the file |
 
 ---
 
@@ -250,7 +256,9 @@ ids; backfill is the existing conversion job. No new kind, no new node.
 | C. jobs | Steps of at most 256 rows between foreground commits | Insert wall time once ready: 0%. During a build: p99 reported |
 | Carrier | Register read on a cache miss only; `NEXT` and statistics share a leaf | Pages written per insert commit: at most today's. Reopen page accesses: at most today's |
 
-The gate: the fixed measurement set at 50K then 1M on one device, plus reopen
+The gate: the fixed measurement set at 50K then 1M on one device -- including
+narrow tables at 50K, so the 1,600-column cap is shown to cost nothing at small
+scale -- plus reopen
 at 1, 100 and 10,000 tables and WAL bytes per DDL commit. Every metric and
 operation at most 1.05 of 0.18.5, never averaged. Two arms: an upgraded 0.18.5
 file and a new file, both with tables never altered (row, edge and posting
@@ -276,9 +284,10 @@ last step.
 6. The release: new files default to the Register, the upgrader is enabled,
    the gate runs on every arm.
 
-## 7. For the owner to decide
+## 7. Owner decisions
 
-1. Approve this document (it becomes the format, frozen like core).
-2. The default of `--verify` in the upgrader: on (safer, slower) or off.
-3. The limits in 2.0.2 (entry size, columns and indexes per owner, jobs,
-   kinds, census lines).
+- 2026-09-29: verify on by default in the upgrader (`--no-verify` to skip).
+- 2026-09-29: 1,600 columns per table; the other limits as written; the cap
+  must cost nothing at small scale.
+- Open: approval of this document as the frozen format, and the kind-code
+  notation (four letters, PNG-style: the first letter's case is the class).
