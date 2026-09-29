@@ -4,6 +4,7 @@ pub mod collections;
 mod index;
 mod query;
 pub mod store;
+pub(crate) mod supportive;
 
 // The public module paths this crate has always offered. The tree below them
 // moved; the names did not, and neither did what they export.
