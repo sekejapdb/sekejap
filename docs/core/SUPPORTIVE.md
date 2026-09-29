@@ -371,7 +371,11 @@ writes a Register file before the last step.
 2. The carrier (2.0: Anchor, Register, census, framing, fixed tree ids) and
    its verifier, behind a create switch; the released 0.18.5 binary's refusal
    of an `E4COLL3` file tested here. New-file arm only; carrier operations
-   measured.
+   measured. The refusal test is
+   `supportive::anchor_tests::the_released_0185_binary_refuses_an_anchored_file`:
+   it runs when `SEKEJAP_0185_OPEN_CHECK` names `core/engine/examples/open_check`
+   built from the v0.18.5 tag (copied into a worktree at the tag, as the
+   release fixtures are), and is skipped otherwise.
 3. The entry kinds of 2.a-2.g, including `LAYT` parts, replacing their legacy
    readers and writers on Register files; code modules mirror the nodes.
    New-file arm; DDL WAL bytes and reopen measured from here.
