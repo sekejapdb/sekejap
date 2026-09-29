@@ -251,7 +251,7 @@ property with the whole answer in one string, because `Db::query` assembles a
 | `int32_t sekejap_link(SekejapDb*, const char *from_collection, const char *from_key, const char *edge_type, const char *to_collection, const char *to_key)` | `Db::link` | link two rows with a typed edge in the base graph context, committed | `0` / `-1` |
 | `int32_t sekejap_link_with(..., const char *properties_json)` | `Db::link_with` | the same, carrying a JSON properties object | `0` / `-1` |
 | `int32_t sekejap_unlink(SekejapDb*, ...)` | `Db::unlink` | remove one edge, committed | `1` / `0` / `-1` |
-| `char *sekejap_neighbours(SekejapDb*, const char *collection, const char *key, const char *edge_type, SekejapDirection, uintptr_t limit)` | `Db::neighbours` | the rows one hop away, in one direction. `edge_type` may be `NULL` for every type | JSON array (free) / `NULL` |
+| `char *sekejap_neighbours(SekejapDb*, const char *collection, const char *key, const char *edge_type, int32_t direction, uintptr_t limit)` | `Db::neighbours` | the rows one hop away, in one direction. `edge_type` may be `NULL` for every type; `direction` is a `SekejapDirection` value, and any other is `SekejapStatus_Invalid` | JSON array (free) / `NULL` |
 
 Both endpoints must EXIST: a missing one is `SekejapStatus_UnknownRow`, never
 a dangling identity (`docs/core/GRAPH_CONTRACT.md` §4).

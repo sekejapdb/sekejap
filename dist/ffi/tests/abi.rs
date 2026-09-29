@@ -545,7 +545,7 @@ fn a_link_is_visible_to_neighbours_in_the_direction_it_was_made_and_an_unlink_re
                 c("people").as_ptr(),
                 c(key).as_ptr(),
                 c("knows").as_ptr(),
-                direction,
+                direction as i32,
                 16,
             )
         });
@@ -897,12 +897,22 @@ fn every_failure_returns_its_sentinel_and_leaves_a_message_and_a_code_on_this_th
             c("t").as_ptr(),
             c("here").as_ptr(),
             ptr::null(),
-            SekejapDirection::Outgoing,
+            SekejapDirection::Outgoing as i32,
             100_000,
         )
     }
     .is_null());
     assert_eq!(last(db.db).1, SekejapStatus::Refused);
+
+    // A direction that is none of the three (finding vuln-f06): received as
+    // an int and refused, never turned into an enum value it cannot hold.
+    for direction in [3, -1, i32::MAX] {
+        assert!(unsafe {
+            sekejap_neighbours(db.db, c("t").as_ptr(), c("here").as_ptr(), ptr::null(), direction, 16)
+        }
+        .is_null());
+        assert_eq!(last(db.db).1, SekejapStatus::Invalid, "direction {direction}");
+    }
 
     // A field kind that is not one of the eight.
     assert_eq!(

@@ -421,13 +421,17 @@ int32_t sekejap_unlink(SekejapDb *db,
 // neighbour can be in another collection and its name is part of the
 // answer. `NULL` on failure.
 //
+// `direction` is a `SekejapDirection` value, received as the `int32_t` it
+// is in C: any other value is `SekejapStatus_Invalid`, never undefined
+// behaviour (finding vuln-f06).
+//
 // # Safety
 // As `sekejap_link`; `edge_type` may be NULL.
 char *sekejap_neighbours(SekejapDb *db,
                          const char *collection,
                          const char *key,
                          const char *edge_type,
-                         SekejapDirection direction,
+                         int32_t direction,
                          uintptr_t limit);
 
 // Declare a collection. `fields_json` is a JSON array of

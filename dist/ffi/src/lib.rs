@@ -1220,6 +1220,10 @@ pub unsafe extern "C" fn sekejap_unlink(
 /// neighbour can be in another collection and its name is part of the
 /// answer. `NULL` on failure.
 ///
+/// `direction` is a `SekejapDirection` value, received as the `int32_t` it
+/// is in C: any other value is `SekejapStatus_Invalid`, never undefined
+/// behaviour (finding vuln-f06).
+///
 /// # Safety
 /// As `sekejap_link`; `edge_type` may be NULL.
 #[no_mangle]
@@ -1228,7 +1232,7 @@ pub unsafe extern "C" fn sekejap_neighbours(
     collection: *const c_char,
     key: *const c_char,
     edge_type: *const c_char,
-    direction: SekejapDirection,
+    direction: i32,
     limit: usize,
 ) -> *mut c_char {
     guard_str(|| {
@@ -1241,9 +1245,15 @@ pub unsafe extern "C" fn sekejap_neighbours(
             false => Some(required(edge_type, "edge_type").ok_or(())?),
         };
         let direction = match direction {
-            SekejapDirection::Outgoing => Direction::Outgoing,
-            SekejapDirection::Incoming => Direction::Incoming,
-            SekejapDirection::Both => Direction::Both,
+            d if d == SekejapDirection::Outgoing as i32 => Direction::Outgoing,
+            d if d == SekejapDirection::Incoming as i32 => Direction::Incoming,
+            d if d == SekejapDirection::Both as i32 => Direction::Both,
+            other => {
+                invalid(format!(
+                    "`direction` is {other}; it is SekejapDirection_Outgoing (0), SekejapDirection_Incoming (1) or SekejapDirection_Both (2)"
+                ));
+                return Err(());
+            }
         };
         let found = record(
             handle

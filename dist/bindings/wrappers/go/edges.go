@@ -105,7 +105,7 @@ func (db *DB) NeighboursJSON(collection, key, edgeType string, direction Directi
 		cedge = C.CString(edgeType)
 		defer C.free(unsafe.Pointer(cedge))
 	}
-	out := C.sekejap_neighbours(db.ptr, ccol, ckey, cedge, C.SekejapDirection(direction), C.uintptr_t(limit))
+	out := C.sekejap_neighbours(db.ptr, ccol, ckey, cedge, C.int32_t(direction), C.uintptr_t(limit))
 	if out == nil {
 		return "", lastError()
 	}
