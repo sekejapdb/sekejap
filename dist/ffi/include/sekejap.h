@@ -119,10 +119,13 @@ typedef struct SekejapStmt SekejapStmt;
 // consumed by `sekejap_tx_commit` or `sekejap_tx_rollback`; a handle
 // dropped any other way ROLLS BACK.
 //
-// Bound to the thread that began it: it holds the writer's mutex guard,
-// and a mutex released from another thread is undefined behaviour. A call
-// from another thread is refused before the guard is touched (finding
-// vuln-f05).
+// The transaction lives on a WORKER THREAD of its own, which begins it,
+// runs every call on it and commits or rolls it back (finding vuln-f05). It
+// holds the writer's mutex guard, and a mutex released from a thread that
+// did not take it is undefined behaviour; a wrapper whose calls move
+// between OS threads (Go, Kotlin coroutines, Swift concurrency) or that
+// rolls back from a finalizer would do exactly that. Any thread may call,
+// one at a time; the guard never leaves the worker.
 typedef struct SekejapTx SekejapTx;
 
 #ifdef __cplusplus
@@ -555,8 +558,7 @@ long sekejap_tx_execute(SekejapTx *tx, const char *sql, const char *params_json)
 
 // Commit the transaction and FREE the handle, whether the commit succeeded
 // or not. `0` on success, `-1` on failure. The pointer is dangling after
-// this call in both cases -- except a call from a thread other than the
-// one that began it, which is refused and frees nothing.
+// this call in both cases. Any thread may call it.
 //
 // # Safety
 // `tx` must be a live handle that has not been committed or rolled back.

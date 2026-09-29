@@ -427,31 +427,37 @@ pub struct SekejapStmt {
 /// consumed by `sekejap_tx_commit` or `sekejap_tx_rollback`; a handle
 /// dropped any other way ROLLS BACK.
 ///
-/// Bound to the thread that began it: it holds the writer's mutex guard,
-/// and a mutex released from another thread is undefined behaviour. A call
-/// from another thread is refused before the guard is touched (finding
-/// vuln-f05).
+/// The transaction lives on a WORKER THREAD of its own, which begins it,
+/// runs every call on it and commits or rolls it back (finding vuln-f05). It
+/// holds the writer's mutex guard, and a mutex released from a thread that
+/// did not take it is undefined behaviour; a wrapper whose calls move
+/// between OS threads (Go, Kotlin coroutines, Swift concurrency) or that
+/// rolls back from a finalizer would do exactly that. Any thread may call,
+/// one at a time; the guard never leaves the worker.
 pub struct SekejapTx {
-    inner: Option<Tx<'static>>,
-    owner: std::thread::ThreadId,
+    /// The line to the worker; `None` once finished.
+    link: Mutex<Option<TxLink>>,
 }
 
-/// Refuse a transaction call from a thread other than the one that began it.
-///
-/// # Safety
-/// `tx` must be NULL or a live handle from `sekejap_tx_begin`.
-unsafe fn on_owner_thread(tx: *mut SekejapTx) -> Option<()> {
-    if tx.is_null() {
-        invalid("`tx` is NULL");
-        return None;
-    }
-    if (*tx).owner != std::thread::current().id() {
-        invalid(
-            "this transaction was begun on another thread: a SekejapTx is bound to the thread that began it (it holds the writer's lock), so pin the calling thread -- runtime.LockOSThread in Go, one dispatch thread in Swift or Kotlin",
-        );
-        return None;
-    }
-    Some(())
+/// One call's answer from a transaction's worker: a value, or the status
+/// and message the CALLING thread's error slot then carries.
+type TxOutcome = std::result::Result<i64, (SekejapStatus, String)>;
+type TxJob = Box<dyn FnOnce(&mut Tx<'static>) -> TxOutcome + Send>;
+
+enum TxMessage {
+    Run(TxJob),
+    Finish { commit: bool },
+}
+
+struct TxLink {
+    jobs: std::sync::mpsc::Sender<TxMessage>,
+    answers: std::sync::mpsc::Receiver<TxOutcome>,
+    worker: std::thread::JoinHandle<()>,
+}
+
+/// A crate result as a worker's answer.
+fn outcome<T>(out: sekejap::Result<T>) -> std::result::Result<T, (SekejapStatus, String)> {
+    out.map_err(|e| (status_of(&e), e.to_string()))
 }
 
 /// A paged walk: of one collection (`sekejap_scan_open`) or of one
@@ -1634,24 +1640,91 @@ pub unsafe extern "C" fn sekejap_tx_begin(db: *mut SekejapDb) -> *mut SekejapTx 
     guard_ptr(|| {
         clear_error();
         let handle = handle(db).ok_or(())?;
-        let tx = record(handle.db.transaction())?;
-        let tx: Tx<'static> = std::mem::transmute::<Tx<'_>, Tx<'static>>(tx);
-        Ok(Box::into_raw(Box::new(SekejapTx {
-            inner: Some(tx),
-            owner: std::thread::current().id(),
-        })))
+        struct SendDb(*const SekejapDb);
+        unsafe impl Send for SendDb {}
+        let shared = SendDb(handle as *const SekejapDb);
+        let (jobs, inbox) = std::sync::mpsc::channel::<TxMessage>();
+        let (reply, answers) = std::sync::mpsc::channel::<TxOutcome>();
+        let worker = std::thread::Builder::new()
+            .name("sekejap-tx".into())
+            .spawn(move || {
+                let shared = shared;
+                // SAFETY: the caller frees this transaction before
+                // `sekejap_close` (C_ABI.md section 3), and `finish` joins
+                // this thread, so the handle outlives every use here.
+                let handle: &'static SekejapDb = unsafe { &*shared.0 };
+                let mut tx = match outcome(handle.db.transaction()) {
+                    Ok(tx) => tx,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                };
+                let _ = reply.send(Ok(0));
+                while let Ok(message) = inbox.recv() {
+                    match message {
+                        TxMessage::Run(job) => {
+                            let out = catch_unwind(AssertUnwindSafe(|| job(&mut tx))).unwrap_or_else(|_| {
+                                Err((SekejapStatus::Unknown, "a panic was caught at the C boundary".into()))
+                            });
+                            let _ = reply.send(out);
+                        }
+                        TxMessage::Finish { commit } => {
+                            let out = if commit { tx.commit() } else { tx.rollback() };
+                            let _ = reply.send(outcome(out).map(|()| 0));
+                            return;
+                        }
+                    }
+                }
+                // The line was dropped without a finish: `tx` drops here,
+                // on its own thread, and rolls back.
+            })
+            .map_err(|e| set_error(SekejapStatus::Unknown, format!("could not start the transaction's thread: {e}")))?;
+        match answers.recv() {
+            Ok(Ok(_)) => Ok(Box::into_raw(Box::new(SekejapTx {
+                link: Mutex::new(Some(TxLink { jobs, answers, worker })),
+            }))),
+            Ok(Err((status, message))) => {
+                let _ = worker.join();
+                set_error(status, message);
+                Err(())
+            }
+            Err(_) => {
+                let _ = worker.join();
+                set_error(SekejapStatus::Unknown, "the transaction's thread stopped");
+                Err(())
+            }
+        }
     })
 }
 
+/// Run `job` on the transaction's worker and answer on this thread.
+///
 /// # Safety
-/// `tx` must be a live handle from `sekejap_tx_begin`.
-unsafe fn tx_of<'a>(tx: *mut SekejapTx) -> Option<&'a mut Tx<'static>> {
-    on_owner_thread(tx)?;
-    match (*tx).inner.as_mut() {
-        Some(inner) => Some(inner),
-        None => {
-            invalid("this transaction has already been committed or rolled back");
-            None
+/// `tx` must be NULL or a live handle from `sekejap_tx_begin`.
+unsafe fn tx_run(tx: *mut SekejapTx, job: TxJob) -> Result<i64, ()> {
+    if tx.is_null() {
+        invalid("`tx` is NULL");
+        return Err(());
+    }
+    let link = (*tx).link.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(link) = link.as_ref() else {
+        invalid("this transaction has already been committed or rolled back");
+        return Err(());
+    };
+    if link.jobs.send(TxMessage::Run(job)).is_err() {
+        set_error(SekejapStatus::Unknown, "the transaction's thread stopped");
+        return Err(());
+    }
+    match link.answers.recv() {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err((status, message))) => {
+            set_error(status, message);
+            Err(())
+        }
+        Err(_) => {
+            set_error(SekejapStatus::Unknown, "the transaction's thread stopped");
+            Err(())
         }
     }
 }
@@ -1669,11 +1742,13 @@ pub unsafe extern "C" fn sekejap_tx_put(
 ) -> i32 {
     guard_i32(|| {
         clear_error();
-        let tx = tx_of(tx).ok_or(())?;
-        let collection = required(collection, "collection").ok_or(())?;
-        let key = required(key, "key").ok_or(())?;
+        let collection = required(collection, "collection").ok_or(())?.to_owned();
+        let key = required(key, "key").ok_or(())?.to_owned();
         let document = json_arg(document_json, "document").ok_or(())?;
-        record(tx.put((collection, key), &document))?;
+        tx_run(
+            tx,
+            Box::new(move |tx| outcome(tx.put((collection.as_str(), key.as_str()), &document)).map(|_| 0)),
+        )?;
         Ok(0)
     })
 }
@@ -1691,10 +1766,13 @@ pub unsafe extern "C" fn sekejap_tx_delete(
 ) -> i32 {
     guard_i32(|| {
         clear_error();
-        let tx = tx_of(tx).ok_or(())?;
-        let collection = required(collection, "collection").ok_or(())?;
-        let key = required(key, "key").ok_or(())?;
-        Ok(i32::from(record(tx.delete((collection, key)))?))
+        let collection = required(collection, "collection").ok_or(())?.to_owned();
+        let key = required(key, "key").ok_or(())?.to_owned();
+        let gone = tx_run(
+            tx,
+            Box::new(move |tx| outcome(tx.delete((collection.as_str(), key.as_str()))).map(i64::from)),
+        )?;
+        Ok(gone as i32)
     })
 }
 
@@ -1713,10 +1791,16 @@ pub unsafe extern "C" fn sekejap_tx_link(
 ) -> i32 {
     guard_i32(|| {
         clear_error();
-        let tx = tx_of(tx).ok_or(())?;
-        let (from, edge_type, to) =
+        let ((fc, fk), edge_type, (tc, tk)) =
             edge_args(from_collection, from_key, edge_type, to_collection, to_key)?;
-        record(tx.link(from, edge_type, to))?;
+        let (fc, fk, edge_type, tc, tk) =
+            (fc.to_owned(), fk.to_owned(), edge_type.to_owned(), tc.to_owned(), tk.to_owned());
+        tx_run(
+            tx,
+            Box::new(move |tx| {
+                outcome(tx.link((fc.as_str(), fk.as_str()), &edge_type, (tc.as_str(), tk.as_str()))).map(|_| 0)
+            }),
+        )?;
         Ok(0)
     })
 }
@@ -1734,17 +1818,19 @@ pub unsafe extern "C" fn sekejap_tx_execute(
 ) -> c_long {
     guard_int(|| {
         clear_error();
-        let tx = tx_of(tx).ok_or(())?;
-        let sql = required(sql, "sql").ok_or(())?;
+        let sql = required(sql, "sql").ok_or(())?.to_owned();
         let params = params(params_json).ok_or(())?;
-        Ok(record(tx.execute(sql, &params))? as c_long)
+        let moved = tx_run(
+            tx,
+            Box::new(move |tx| outcome(tx.execute(&sql, &params)).map(|rows| rows as i64)),
+        )?;
+        Ok(moved as c_long)
     })
 }
 
 /// Commit the transaction and FREE the handle, whether the commit succeeded
 /// or not. `0` on success, `-1` on failure. The pointer is dangling after
-/// this call in both cases -- except a call from a thread other than the
-/// one that began it, which is refused and frees nothing.
+/// this call in both cases. Any thread may call it.
 ///
 /// # Safety
 /// `tx` must be a live handle that has not been committed or rolled back.
@@ -1768,17 +1854,33 @@ pub unsafe extern "C" fn sekejap_tx_rollback(tx: *mut SekejapTx) -> i32 {
 unsafe fn finish(tx: *mut SekejapTx, commit: bool) -> i32 {
     guard_i32(|| {
         clear_error();
-        // Checked before the handle is taken: a refused call leaves the
-        // transaction live for the thread that owns it.
-        on_owner_thread(tx).ok_or(())?;
-        let mut handle = Box::from_raw(tx);
-        let Some(inner) = handle.inner.take() else {
+        if tx.is_null() {
+            invalid("`tx` is NULL");
+            return Err(());
+        }
+        let handle = Box::from_raw(tx);
+        let link = handle.link.into_inner().unwrap_or_else(|e| e.into_inner());
+        let Some(TxLink { jobs, answers, worker }) = link else {
             invalid("this transaction has already been committed or rolled back");
             return Err(());
         };
-        let out = if commit { inner.commit() } else { inner.rollback() };
-        record(out)?;
-        Ok(0)
+        // The worker commits or rolls back on its own thread, where it took
+        // the writer, and the handle is freed only once it has.
+        let sent = jobs.send(TxMessage::Finish { commit }).is_ok();
+        let answer = if sent { answers.recv().ok() } else { None };
+        drop(jobs);
+        let _ = worker.join();
+        match answer {
+            Some(Ok(_)) => Ok(0),
+            Some(Err((status, message))) => {
+                set_error(status, message);
+                Err(())
+            }
+            None => {
+                set_error(SekejapStatus::Unknown, "the transaction's thread stopped");
+                Err(())
+            }
+        }
     })
 }
 
