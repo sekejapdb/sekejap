@@ -26,6 +26,9 @@ Vamana indexes (the Vamana one on a column no exact index covers, so the
 graph is what answers), an edge table fixed through `base`, untyped edges in
 `base` and in a graph context, a named property graph with an alias and
 labels, a dropped table, and rows that were updated, deleted and upserted.
+From 0.18.5 on, also a table whose shape changed while it held rows (ADD
+COLUMN, then DROP COLUMN), so its rows sit under three layouts -- the case the
+0.19 upgrader converts (`docs/core/SUPPORTIVE.md`).
 `INDEX.json` records each database's logical feature word.
 
 A value is recorded exactly: an integer as `{"int": n}`, a float by its bits

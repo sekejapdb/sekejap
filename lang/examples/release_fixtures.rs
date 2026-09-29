@@ -220,6 +220,16 @@ fn populate(db: &mut Database) {
         run(db, &format!("INSERT INTO review (_key, body) VALUES ('r{i:03}', '{a} {b} visit number {i}')"));
     }
     run(db, "CREATE INDEX review_text ON review USING gin (to_tsvector('simple', body))");
+    // A table whose shape changed while it held rows, so its rows sit under
+    // three layouts: ADD then DROP COLUMN (added for the 0.18.5 fixtures; a
+    // dropped name is never added back, which 0.18 would show wrongly).
+    run(db, "CREATE TABLE stay (_key TEXT PRIMARY KEY, name TEXT, nights INT)");
+    run(db, "INSERT INTO stay (_key, name, nights) VALUES ('s1', 'Cliff Villa', 3), ('s2', 'Rice Hut', 2), ('s3', 'Reef Bungalow', 5)");
+    run(db, "ALTER TABLE stay ADD COLUMN host TEXT");
+    run(db, "INSERT INTO stay (_key, name, nights, host) VALUES ('s4', 'Garden Room', 1, 'made'), ('s5', 'Lake Lodge', 4, 'ketut')");
+    run(db, "UPDATE stay SET host = 'nyoman' WHERE _key = 's1'");
+    run(db, "ALTER TABLE stay DROP COLUMN name");
+    run(db, "INSERT INTO stay (_key, nights, host) VALUES ('s6', 6, 'wayan')");
     run(db, "COMMIT");
 }
 
@@ -273,6 +283,8 @@ const QUERIES: &[&str] = &[
     "SELECT _key, taste <=> '[0.9, 0.1, 0.0, 0.0]' AS d FROM place ORDER BY taste <=> '[0.9, 0.1, 0.0, 0.0]' LIMIT 3",
     "SELECT _key FROM review WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'market & beach') ORDER BY _key",
     "SELECT count(*) FROM review WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'sunset')",
+    // A table read across three layouts.
+    "SELECT _key, nights, host FROM stay ORDER BY _key",
     // Row identity: a stored row keeps its id.
     "SELECT _id, _key FROM place ORDER BY _key",
     // The graph: base labels, the edge table, untyped edges, a context, the

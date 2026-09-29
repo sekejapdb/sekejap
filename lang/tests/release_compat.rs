@@ -48,11 +48,18 @@ const ROOT: &str = "../docs/release-fixtures";
 
 /// Every preserved release, the SHA-256 of its `INDEX.json`, and its
 /// databases. A release is added here when its fixtures are; none is removed.
-const RELEASES: &[(&str, &str, &[&str])] = &[(
-    "0.18.3",
-    "1ea602464cc54258da33cd1ec53b7ee53d1afae17ff81d3d326e0f1a47c16e08",
-    &["checkpointed", "wal-pending"],
-)];
+const RELEASES: &[(&str, &str, &[&str])] = &[
+    (
+        "0.18.3",
+        "1ea602464cc54258da33cd1ec53b7ee53d1afae17ff81d3d326e0f1a47c16e08",
+        &["checkpointed", "wal-pending"],
+    ),
+    (
+        "0.18.5",
+        "fac2891114c37938dd7405967eb85b93018c338e15c909fd52bdc96a92b53a73",
+        &["checkpointed", "wal-pending"],
+    ),
+];
 
 struct Fixture {
     release: String,
