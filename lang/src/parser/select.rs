@@ -337,8 +337,11 @@ impl Parser {
             });
         }
         let at = self.here();
-        let _ = self.expression(0)?;
-        Ok(SelectItem::OrderValue(format!("expression at byte {at}")))
+        let expression = self.expression(0)?;
+        Ok(SelectItem::OrderValue {
+            what: format!("expression at byte {at}"),
+            key: super::expr::order_key_of(expression, false).ok(),
+        })
     }
 
 }

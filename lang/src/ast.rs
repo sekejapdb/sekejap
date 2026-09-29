@@ -533,6 +533,22 @@ pub(super) enum OrderKey {
     },
 }
 
+impl OrderKey {
+    /// This key with its direction set to ascending: two keys that order by
+    /// the same value compare equal whatever their directions.
+    pub(super) fn ascending(&self) -> Self {
+        let mut key = self.clone();
+        match &mut key {
+            Self::Column { descending, .. }
+            | Self::Distance { descending, .. }
+            | Self::Vector { descending, .. }
+            | Self::Bm25 { descending, .. }
+            | Self::Score { descending, .. } => *descending = false,
+        }
+        key
+    }
+}
+
 /// The aggregate functions `docs/lang/QL_CONTRACT.md` §4.7 accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AggFunc {
@@ -600,7 +616,10 @@ pub(super) enum SelectItem {
     Key,
     Column(String),
     /// The ranking value of this statement's own `ORDER BY`, under an alias.
-    OrderValue(String),
+    /// `key` is the written expression as an ORDER BY key (ascending), or
+    /// `None` when it is none; only an expression equal to the ORDER BY's
+    /// reports its value (finding vuln-a17).
+    OrderValue { what: String, key: Option<OrderKey> },
     /// `count(*)`, `count(col)`, `sum(col)`, `min(col)`, `max(col)`,
     /// `avg(col)`.
     Aggregate {

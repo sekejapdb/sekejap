@@ -191,14 +191,29 @@ impl Compiler<'_> {
                     functions.push(compiled);
                     outputs.push(Output::Row(functions.len() - 1));
                 }
-                SelectItem::OrderValue(_) | SelectItem::Divided { .. } => {
-                    let what = match &item {
+                SelectItem::OrderValue { .. } | SelectItem::Divided { .. } => {
+                    let (what, key) = match &item {
                         SelectItem::Divided { column, divisor } => {
-                            format!("`{column} / {divisor}`")
+                            (format!("`{column} / {divisor}`"), None)
                         }
-                        SelectItem::OrderValue(what) => what.clone(),
+                        SelectItem::OrderValue { what, key } => (what.clone(), key.as_ref()),
                         _ => unreachable!("this arm took both"),
                     };
+                    // The select list evaluates no arithmetic: an expression
+                    // reports the ORDER BY's value only when it IS the ORDER
+                    // BY's expression (finding vuln-a17). `col / n` is a
+                    // group key, and outside GROUP BY it is refused.
+                    if let (Some(order), Some(key)) = (&statement.order, key) {
+                        if order.ascending() != key.ascending() {
+                            return Err(SqlError::unsupported(format!(
+                                "{what} in a select list: it is not this statement's ORDER BY expression, and the only expression a row can report here is that ranking value; select the columns themselves"
+                            )));
+                        }
+                    } else if statement.order.is_some() {
+                        return Err(SqlError::unsupported(format!(
+                            "{what} in a select list: arithmetic is not evaluated here, and the only expression a row can report is this statement's ORDER BY value, written the same way"
+                        )));
+                    }
                     if statement.order.is_none() {
                         return Err(SqlError::unsupported(format!(
                             "{what} in a select list: the only expression a row can report here is this statement's own ranking value, and this statement has no ORDER BY"

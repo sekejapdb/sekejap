@@ -322,7 +322,7 @@ impl Compiler<'_> {
                         "an entity id or external key with an aggregate: a group is not a row and has neither",
                     ))
                 }
-                SelectItem::OrderValue(what) => {
+                SelectItem::OrderValue { what, .. } => {
                     return Err(SqlError::unsupported(format!(
                         "{what} with an aggregate: the only expressions a folded answer reports are its group key and its accumulators"
                     )))
