@@ -15,20 +15,29 @@ another, and what was asked one way can be asked another.
 
 ```
 1. Core — the multimodel data. Designed to last; never changed for a feature.
-   1.a Pages and log      the page format, the write-ahead log, checkpoints
-   1.b Rows               the row encoding; every row names its layout
+   1.a Pages and log      the page format, the write-ahead log, checkpoints;
+                          the publication hint and free-page links (their
+                          meaning is owned by 2.a)
+   1.b Rows               the row encoding (every row names its layout), the
+                          key map, vector sidecars
    1.c Edges              adjacency postings and property bags
-   1.d Index postings     scalar, text, trigram, vector, spatial
+   1.d Index postings     scalar, text, trigram, vector, spatial, endpoint
+                          sets
 
 2. Supportive — everything that describes, finds or maintains the core.
-   2.a Paging and space   allocation, free space, reclamation
-   2.b Identity and names ids never reused; a name is a label on an id
-   2.c Schema             layouts with column ids, defaults, rules, keys
+   2.0 Anchor             the one entry point: the roots of 2.a-2.g and the
+                          census of entry kinds and versions the file uses
+   2.a Paging and space   tree ownership, allocation, reclamation, limits
+   2.b Identity and names ids and their counters, never reused; names of
+                          tables, columns, indexes, schemas, edge types and
+                          contexts -- a name is a label on an id
+   2.c Schema             tables, columns (id, type, rules, defaults, state),
+                          layouts, keys
    2.d Access paths       index definitions: columns, expression, analyzer,
-                          parameters
-   2.e Graph              edge types, table bindings, labels, graphs
+                          parameters, state
+   2.e Graph              graphs, table bindings, labels
    2.f Jobs               resumable state of long work: builds, drops,
-                          conversions
+                          conversions, swaps
    2.g Statistics         counts and hints; always ignorable
 ```
 
@@ -45,11 +54,35 @@ another, and what was asked one way can be asked another.
    never a new bit, tail or keyspace.
 4. **Older readers stay honest.** A release that meets an unknown entry skips
    it when it is ignorable, and refuses the file by name when it is critical
-   ("needs a newer sekejap"), never as corruption. Law 8 lives here.
+   ("needs a newer sekejap"), never as corruption. Law 8 lives here. A writer
+   that meets an unknown 2.g entry deletes it before its first write to that
+   entry's owner, so a stale statistic never answers a question.
 5. **Every change of format carries its upgrader.** Moving a file to a new
    entry kind is done by the upgrade that ships in the same release.
 6. **Fix the node that matters.** A problem in one node is fixed in that node.
    Developers improve algorithms; the tree stays.
+7. **The tree is physical.** On disk, every supportive entry is keyed by its
+   node first, so a node's entries sit together and one node can be read,
+   verified or rebuilt alone. In the code, modules mirror the tree: one place
+   per node, so a reader of the source sees which part a change disturbs and
+   which parts stay still.
+
+### Adding something new
+
+1. Does it grow with rows, edges or postings? Then it is core: stop; that is
+   a board decision.
+2. Pick the one node by the question it answers: where is it stored (2.a),
+   what is it called (2.b), what shape is it (2.c), how is it found (2.d),
+   how is it connected (2.e), what is unfinished (2.f), how many (2.g).
+3. Use an existing entry kind at a new version; register a new kind only when
+   none fits.
+4. If a reader that skipped it could give a wrong answer, constraint or
+   identity, it is critical; otherwise it is ignorable, with its rebuild
+   stated.
+5. State its size and count bounds. Long work is a 2.f job, never its own
+   state.
+6. Ship it with a release fixture, the previous release's refuse-or-skip test,
+   its upgrader step when old files need one, and the performance gate.
 
 ### The foundations every interface stands on
 
@@ -63,10 +96,11 @@ another, and what was asked one way can be asked another.
 - **D. Bounded memory, unbounded answers.** Memory is always bounded; past a
   limit the work pages, spills or resumes instead of refusing.
 
-Status: the code does not fully match yet. Today's supportive metadata is
-partly scattered (catalog tails and feature bits added release by release).
-The design that folds it into section 2, with its upgrader, is the next format
-decision; until it ships, new work must not add to the scatter.
+Status: the code does not fully match yet. Supportive metadata was added
+release by release (catalog tails, feature bits, per-need descriptors) and is
+scattered. **0.19 is the purification**: it folds all of it into section 2,
+mirrors the tree on disk and in the code, and ships the upgrader that converts
+a 0.18 file once. Until it ships, new work must not add to the scatter.
 
 ## North Star — the 8 laws
 
@@ -103,7 +137,12 @@ may require newer engines.
 
 - **Scope starts at the first declared stable sekejap format.** Name that
   baseline before release and retain support for it in subsequent sekejap
-  releases. This is not a promise to migrate data written by the prototype
+  releases. **The baseline is the 0.19 format** (the hyper contract's tree,
+  decided 2026-09-29). The 0.18 formats grew one need at a time; 0.19 returns
+  sekejap to core plus supportive, once. A 0.18 file is converted by an
+  explicit `sekejap-upgrade`, which backs it up first; 0.19 refuses to open an
+  unconverted 0.18 file, naming that command, before touching a byte. This is
+  the one recorded exception; from 0.19 on the law holds without one. This is not a promise to migrate data written by the prototype
   formats that came before it, nor a claim that those prototype formats are
   already stable. A major version number does not excuse dropping support for
   an earlier released sekejap format.
