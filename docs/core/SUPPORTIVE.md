@@ -23,6 +23,19 @@ Paths are relative to the repository; `E/` = `core/engine/src/`,
   links (their meaning is owned by 2.a; no second free list).
 - **1.b Rows.** Row keys, the dense row encoding whose header names its layout
   (`E/store/dense_v3.rs`), the key map, vector sidecars.
+  **Reserved places** (owner decision 2026-09-29: the place is fixed now, the
+  algorithm and tests come later; nothing reads or writes them yet, so they
+  cost nothing):
+  - value kind **8 = BYTES** (SQL `BYTEA`, also spelled `BLOB`): a binary
+    value, encoded exactly as TEXT is (length-prefixed bytes, spilling to
+    overflow pages), so a table without such a column is unaffected. Kinds 0-7
+    are TEXT, INT, REAL, BOOL, JSON, GEO, VECTOR, POINT.
+  - keyspace **0x61 = large-object chunks**, beside the vector sidecar 0x60:
+    key `0x61 | collection | object id | chunk number`, obeying the keyspace
+    invariant (the key begins with its owner). For values past one
+    transaction's log allowance, streamed in pieces, as PostgreSQL's large
+    objects are; the row holds the object id. Its id counter is a 2.b `NEXT`
+    class and its metadata a 2.c `COLM` type when it is built.
 - **1.c Edges.** Adjacency keys with the optional id segment, and property
   bags (`E/index/graph/mod.rs`). The bytes stay; what the names inside a bag
   mean moves to 2.c (a column's stored token).

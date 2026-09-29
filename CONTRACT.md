@@ -19,7 +19,9 @@ another, and what was asked one way can be asked another.
                           the publication hint and free-page links (their
                           meaning is owned by 2.a)
    1.b Rows               the row encoding (every row names its layout), the
-                          key map, vector sidecars
+                          key map, vector sidecars; RESERVED (no code yet):
+                          value kind 8 = BYTES, and keyspace 0x61 for
+                          large-object chunks
    1.c Edges              adjacency postings and property bags
    1.d Index postings     scalar, text, trigram, vector, spatial, endpoint
                           sets
