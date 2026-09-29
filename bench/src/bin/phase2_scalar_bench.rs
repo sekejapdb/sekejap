@@ -71,10 +71,14 @@ fn verify(actual: Vec<usize>, n: usize, round: usize, lo: usize, hi: usize) {
     assert_eq!(actual, expected(n, round, lo, hi));
 }
 fn main() -> R<()> {
-    let a: Vec<_> = std::env::args().collect();
+    // `--pages` (e4 only) adds each churn round's pool accesses; without it
+    // the report is unchanged.
+    let pages = std::env::args().any(|x| x == "--pages");
+    let a: Vec<_> = std::env::args().filter(|x| x != "--pages").collect();
     if !(4..=5).contains(&a.len()) {
         return Err(
-            "usage: phase2_scalar_bench e4|sqlite N FRESH_DIRECTORY [resumable|atomic]".into(),
+            "usage: phase2_scalar_bench e4|sqlite N FRESH_DIRECTORY [resumable|atomic] [--pages]"
+                .into(),
         );
     }
     let engine = &a[1];
@@ -207,6 +211,7 @@ fn main() -> R<()> {
         report["queries"] = json!(queries);
         let mut rounds = Vec::new();
         for round in 1..=3 {
+            let pages0 = db.pool_accesses()?;
             let start = Instant::now();
             for i in 0..n {
                 db.update(c, &key(i), &json!({"age":age(i,round)}))?;
@@ -217,6 +222,7 @@ fn main() -> R<()> {
             }
             db.commit()?;
             let update = start.elapsed().as_secs_f64();
+            let pages1 = db.pool_accesses()?;
             let start = Instant::now();
             for (j, i) in (0..n).step_by(10).enumerate() {
                 assert!(db.delete(c, &key(i))?);
@@ -227,6 +233,7 @@ fn main() -> R<()> {
             }
             db.commit()?;
             let delete = start.elapsed().as_secs_f64();
+            let pages2 = db.pool_accesses()?;
             let start = Instant::now();
             for (j, i) in (0..n).step_by(10).enumerate() {
                 db.put(c, &key(i), &doc(i, round))?;
@@ -237,6 +244,7 @@ fn main() -> R<()> {
             }
             db.commit()?;
             let insert = start.elapsed().as_secs_f64();
+            let pages3 = db.pool_accesses()?;
             let ids = db.query_scalar(
                 idx,
                 ScalarPredicate::Range {
@@ -260,7 +268,13 @@ fn main() -> R<()> {
             );
             sample(root, &mut peak);
             db.checkpoint()?;
-            rounds.push(json!({"round":round,"update_s":update,"delete_s":delete,"reinsert_s":insert,"bytes":sizes(root),"verified":true}));
+            let mut entry = json!({"round":round,"update_s":update,"delete_s":delete,"reinsert_s":insert,"bytes":sizes(root),"verified":true});
+            if pages {
+                entry["update_pages"] = json!(pages1 - pages0);
+                entry["delete_pages"] = json!(pages2 - pages1);
+                entry["reinsert_pages"] = json!(pages3 - pages2);
+            }
+            rounds.push(entry);
         }
         report["churn"] = json!(rounds);
         drop(db);

@@ -49,7 +49,7 @@
 //! than just a bigger number.
 //!
 //!     cargo run --release --features compact-cells,sqlite-balance,\
-//!         keyspace-append,slotref-split --bin two_ways -- [rows] [--scale] [--only substr]
+//!         keyspace-append,slotref-split --bin two_ways -- [rows] [--scale] [--only substr] [--pages]
 
 use sekejap_core::{
     collections::{
@@ -998,6 +998,14 @@ fn run(rows: u64, only: Option<&str>, root: &Path) -> R<Report> {
         }
 
         let (e4_micros, e4_rows) = bench(|| f(&ctx).map(|v| v.len()).unwrap_or(usize::MAX));
+        if PAGES.load(std::sync::atomic::Ordering::Relaxed) {
+            // `--pages`: the pool accesses of ONE warm execution, printed as
+            // its own line so the report below is unchanged.
+            let before = ctx.db.pool_accesses()?;
+            std::hint::black_box(f(&ctx).map(|v| v.len()).unwrap_or(usize::MAX));
+            let accesses = ctx.db.pool_accesses()? - before;
+            println!("pages {}/{} {accesses}", c.family, c.name);
+        }
         let lite_micros = c
             .lite
             .map(|sql| bench(|| lite_keys(&connection, sql).len()).0);
@@ -1245,18 +1253,22 @@ fn scratch(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("two_ways-{tag}-{}-{stamp}", std::process::id()))
 }
 
+/// `--pages`: also print each E4 case's pool accesses per execution.
+static PAGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn main() -> R<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         eprintln!(
-            "two_ways [rows] [--scale] [--only substr]\n\n\
+            "two_ways [rows] [--scale] [--only substr] [--pages]\n\n\
              Two arms on identical data in one process: E4's embedded API and SQLite, ranked\n\
              worst-ratio-first. Durability is MATCHED AND ON in both arms (E4 publishes every\n\
              commit with a FULL barrier and refuses anything else; SQLite runs WAL +\n\
              synchronous=FULL + fullfsync=ON). Cases E4's API cannot express are listed as\n\
              UNSUPPORTED with a reason; none is faked.\n\n\
              --scale   also run at 100,000 rows and print the exponent per case\n\
-             --only s  keep cases whose family or name contains s"
+             --only s  keep cases whose family or name contains s\n\
+             --pages   also print `pages <family>/<case> <n>`: E4 pool accesses of one execution"
         );
         return Ok(());
     }
@@ -1271,6 +1283,10 @@ fn main() -> R<()> {
         .and_then(|i| args.get(i + 1))
         .cloned();
     let scale = args.iter().any(|a| a == "--scale");
+    PAGES.store(
+        args.iter().any(|a| a == "--pages"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     let root = scratch("a");
     let report = run(rows, only.as_deref(), &root)?;

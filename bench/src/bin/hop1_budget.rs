@@ -6,7 +6,7 @@
 //! so the difference between two rows is the cost of what was added.
 //!
 //!     cargo run --release --features compact-cells,sqlite-balance,\
-//!         keyspace-append,slotref-split --bin hop1_budget -- [rows] [iters]
+//!         keyspace-append,slotref-split --bin hop1_budget -- [rows] [iters] [--pages]
 
 use sekejap_core::{
     collections::{
@@ -265,7 +265,11 @@ fn query_rows(
 }
 
 fn main() -> R<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    // `--pages` adds the two-hop BFS stage and each graph stage's pool
+    // accesses as a section of their own; without it the output is unchanged.
+    let pages = all.iter().any(|a| a == "--pages");
+    let args: Vec<&String> = all.iter().filter(|a| !a.starts_with("--")).collect();
     let rows: u64 = args.first().and_then(|a| a.parse().ok()).unwrap_or(20_000);
     let iters: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(100_000);
     let root = std::env::temp_dir().join(format!("hop1_budget_{rows}_{}", std::process::id()));
@@ -483,6 +487,30 @@ fn main() -> R<()> {
         get("L") - get("M"),
         (get("L") - get("M")) / 8.0
     );
+    if pages {
+        // The same seed and the same requests as B, E and G, plus B at depth
+        // 2: the two-hop walk without the query engine around it.
+        let hop2 = time(iters, || {
+            c.db.traverse_bfs(bfs(&c, SEED, 2)).map(|r| r.nodes.len()).unwrap()
+        });
+        println!();
+        println!("graph walk (--pages): pool accesses of one warm execution");
+        println!("B2 traverse_bfs(depth 2)      {hop2:>10.3} µs");
+        let accesses = |f: &mut dyn FnMut() -> usize| -> R<u64> {
+            f();
+            let before = c.db.pool_accesses()?;
+            std::hint::black_box(f());
+            Ok(c.db.pool_accesses()? - before)
+        };
+        let b1 = accesses(&mut || c.db.traverse_bfs(bfs(&c, SEED, 1)).map(|r| r.nodes.len()).unwrap())?;
+        let b2 = accesses(&mut || c.db.traverse_bfs(bfs(&c, SEED, 2)).map(|r| r.nodes.len()).unwrap())?;
+        let e = accesses(&mut || query_rows(&c, &graph1, Projection::Ids).unwrap())?;
+        let g = accesses(&mut || query_rows(&c, &graph2, Projection::Ids).unwrap())?;
+        println!("pages B  {b1}");
+        println!("pages B2 {b2}");
+        println!("pages E  {e}");
+        println!("pages G  {g}");
+    }
     let _ = fs::remove_dir_all(&root);
     Ok(())
 }

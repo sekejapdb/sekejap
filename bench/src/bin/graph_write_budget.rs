@@ -17,7 +17,7 @@
 //!     cargo run --release --features compact-cells,sqlite-balance,\
 //!         keyspace-append,slotref-split --bin graph_write_budget -- \
 //!         <jsonl> <fixture dir> [--rows N] [--commit N] [--many] [--reopen]
-//!         [--hops-only]
+//!         [--hops-only] [--bytes]
 //!
 //! `--many` writes the same edge set through `link_many` instead of one
 //! `put_edge` per edge; everything else about the run is identical, so the
@@ -25,6 +25,8 @@
 //! the edges on a handle that allocated nothing, which is the shape a
 //! `--reuse --graph` battery run has. `--hops-only` skips the load and the
 //! edge writes and runs only the hop cases on a fixture an earlier run built.
+//! `--bytes` prints one more line: the checkpointed directory size before and
+//! after the edges, and the difference per edge.
 //!
 //! The run ends with the battery's `graph_2hop` and `graph_2hop_born` shapes
 //! beside a THIRD, `graph_2hop_born_1day`: the same node predicate over a
@@ -295,6 +297,7 @@ fn main() -> R<()> {
     let mut many = false;
     let mut fresh_handle = true;
     let mut hops_only = false;
+    let mut bytes = false;
     let rest: Vec<String> = args.collect();
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -304,6 +307,7 @@ fn main() -> R<()> {
             "--many" => many = true,
             "--reopen" => fresh_handle = false,
             "--hops-only" => hops_only = true,
+            "--bytes" => bytes = true,
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -321,6 +325,7 @@ fn main() -> R<()> {
     let at = Instant::now();
     let (db, place) = load(root, &rows)?;
     let fixture_s = at.elapsed().as_secs_f64();
+    let fixture_bytes = dir_bytes(root);
     eprintln!("[fixture] loaded in {fixture_s:.1}s");
 
     let mut db = if fresh_handle {
@@ -463,6 +468,16 @@ fn main() -> R<()> {
         );
     }
     println!("{:<14} {:>10.3}", "commit", commit_ns as f64 / 1000.0 / n);
+    if bytes {
+        // `--bytes`: the checkpointed size before and after the edges, taken
+        // before the hop cases build their index. One line, flag only.
+        db.checkpoint()?;
+        let after = dir_bytes(root);
+        println!(
+            "bytes fixture {fixture_bytes} after_edges {after} per_edge {:.3}",
+            after.saturating_sub(fixture_bytes) as f64 / n
+        );
+    }
 
     // ── anomaly B: the per-hop node predicate ─────────────────────────────
     let at = Instant::now();
@@ -538,6 +553,20 @@ fn report_hops(
         );
     }
     Ok(())
+}
+
+/// Every regular file directly under `root`, summed.
+fn dir_bytes(root: &Path) -> u64 {
+    fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 /// The battery's `born_range(i)`, unchanged.

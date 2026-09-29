@@ -9,7 +9,7 @@
 //! handle's fresh-identity map by the time the edges are written.
 //!
 //!     cargo run --release --features compact-cells,sqlite-balance,\
-//!         keyspace-append,slotref-split --bin g2_budget -- <rows> <edges> <db-dir>
+//!         keyspace-append,slotref-split --bin g2_budget -- <rows> <edges> <db-dir> [--bytes]
 
 use sekejap_core::{
     collections::{
@@ -111,11 +111,21 @@ fn main() -> R<()> {
     let mut args = env::args().skip(1);
     let rows: u64 = args.next().map_or(Ok(200_000), |a| a.parse())?;
     let edges: u64 = args.next().map_or(Ok(99_840), |a| a.parse())?;
-    let root = args.next().map(std::path::PathBuf::from).ok_or("usage: g2_budget <rows> <edges> <db-dir>")?;
+    let root = args.next().map(std::path::PathBuf::from).ok_or("usage: g2_budget <rows> <edges> <db-dir> [--bytes]")?;
     let root = root.as_path();
+    // `--bytes` adds one line after the report: the checkpointed directory
+    // size before and after the edges. Without it the output is unchanged.
+    let mut bytes = false;
+    for flag in args {
+        match flag.as_str() {
+            "--bytes" => bytes = true,
+            other => return Err(format!("unknown argument {other}").into()),
+        }
+    }
     let build = Instant::now();
     let mut f = load(root, rows)?;
     let fixture_s = build.elapsed().as_secs_f64();
+    let fixture_bytes = dir_bytes(root);
 
     let people = f.people;
     let organizations = f.organizations;
@@ -234,5 +244,27 @@ fn main() -> R<()> {
         "commit",
         commit_ns as f64 / 1000.0 / n
     );
+    if bytes {
+        f.db.checkpoint()?;
+        let after = dir_bytes(root);
+        println!(
+            "bytes fixture {fixture_bytes} after_edges {after} per_edge {:.3}",
+            after.saturating_sub(fixture_bytes) as f64 / n
+        );
+    }
     Ok(())
+}
+
+/// Every regular file directly under `root`, summed.
+fn dir_bytes(root: &Path) -> u64 {
+    fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
 }

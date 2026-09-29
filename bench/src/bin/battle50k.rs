@@ -4,6 +4,7 @@
 //!     battle50k <arm: e4|e4-sql|postgres|sqlite> --data <jsonl> --queries <json>
 //!               --out <report.json> [--db-dir <dir|sqlite .db file>] [--dsn <dsn>]
 //!               [--only <case-substring>] [--reuse] [--graph] [--dump <dir>]
+//!               [--heap]
 //!     battle50k compare <a.json> <b.json> [<c.json>] [<d.json>]
 //!
 //! PURPOSE. `popsim` compares E4 against SQLite and Postgres on a generated
@@ -261,6 +262,72 @@ use std::{
 };
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
+
+// ── `--heap`: the live-heap high-water mark of each E4 case ───────────────
+//
+// A pass-through allocator. Counting is OFF unless `--heap` switched it on at
+// the start of `main`, and then costs one relaxed load per call; with it on,
+// `HEAP_LIVE` is the bytes allocated and not yet freed, and `HEAP_PEAK` its
+// maximum since the last `heap_mark`. A case's peak is reported relative to
+// the live heap at its start, so the corpus and the open database are not in
+// it.
+
+struct HeapCount;
+static HEAP_ON: AtomicBool = AtomicBool::new(false);
+static HEAP_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static HEAP_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn heap_add(bytes: i64) {
+    let now = HEAP_LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    HEAP_PEAK.fetch_max(now, Ordering::Relaxed);
+}
+
+// SAFETY: every method forwards to `System` unchanged; the counters are side
+// effects that never touch the returned pointer.
+unsafe impl std::alloc::GlobalAlloc for HeapCount {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc(layout) };
+        if !p.is_null() && HEAP_ON.load(Ordering::Relaxed) {
+            heap_add(layout.size() as i64);
+        }
+        p
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !p.is_null() && HEAP_ON.load(Ordering::Relaxed) {
+            heap_add(layout.size() as i64);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, layout) };
+        if HEAP_ON.load(Ordering::Relaxed) {
+            HEAP_LIVE.fetch_sub(layout.size() as i64, Ordering::Relaxed);
+        }
+    }
+    unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, new: usize) -> *mut u8 {
+        let q = unsafe { std::alloc::System.realloc(p, layout, new) };
+        if !q.is_null() && HEAP_ON.load(Ordering::Relaxed) {
+            heap_add(new as i64 - layout.size() as i64);
+        }
+        q
+    }
+}
+
+#[global_allocator]
+static HEAP_COUNT: HeapCount = HeapCount;
+
+/// Start a case: the peak restarts at the live heap, which is returned.
+fn heap_mark() -> i64 {
+    let live = HEAP_LIVE.load(Ordering::Relaxed);
+    HEAP_PEAK.store(live, Ordering::Relaxed);
+    live
+}
+
+/// The case's peak above the live heap `heap_mark` returned, in bytes.
+fn heap_peak_since(base: i64) -> u64 {
+    (HEAP_PEAK.load(Ordering::Relaxed) - base).max(0) as u64
+}
 
 // ── constants ─────────────────────────────────────────────────────────────
 
@@ -6462,6 +6529,9 @@ pub struct Options {
     /// itself still runs unprepared, so the report carries BOTH numbers and
     /// the comparison shows what the parse and the compile were costing.
     pub prepared: bool,
+    /// `e4` only: add `peak_heap_bytes` to every case, the live-heap
+    /// high-water mark of its measured passes above the heap at its start.
+    pub heap: bool,
 }
 
 impl Options {
@@ -6478,6 +6548,7 @@ impl Options {
             graph: false,
             dump: None,
             prepared: false,
+            heap: false,
         }
     }
 }
@@ -6573,8 +6644,10 @@ pub fn run_arm(options: &Options) -> R<Value> {
                     ));
                     continue;
                 }
+                let heap = heap_mark();
                 let result = measure(|i| e4_case(&ctx, &corpus, &queries, spec.name, i))
                     .map_err(|e| format!("case {}: {e}", spec.name))?;
+                let peak = heap_peak_since(heap);
                 eprintln!(
                     "[e4] {:<20} {:>12.1} us  rows={}",
                     spec.name, result.median_us, result.total_rows
@@ -6583,7 +6656,11 @@ pub fn run_arm(options: &Options) -> R<Value> {
                     dump_case(dir, spec.name, |i| e4_case(&ctx, &corpus, &queries, spec.name, i))
                         .map_err(|e| format!("case {} dump: {e}", spec.name))?;
                 }
-                cases.push(case_json(spec.name, spec.kind, Some(&result), None, ""));
+                let mut entry = case_json(spec.name, spec.kind, Some(&result), None, "");
+                if options.heap {
+                    entry["peak_heap_bytes"] = Value::from(peak);
+                }
+                cases.push(entry);
             }
             // The approximate recall-vs-latency sweep: EF_SWEEP points for
             // each of vec_ann_10 and vec_ann_10_kind. See "APPROXIMATE
@@ -6594,8 +6671,10 @@ pub fn run_arm(options: &Options) -> R<Value> {
                     if !selected(&name) {
                         continue;
                     }
+                    let heap = heap_mark();
                     let result = measure(|i| e4_case(&ctx, &corpus, &queries, &name, i))
                         .map_err(|e| format!("case {name}: {e}"))?;
+                    let peak = heap_peak_since(heap);
                     let twin = exact_twin(&name)
                         .ok_or_else(|| format!("case {name}: no exact twin"))?;
                     let recall = mean_recall(
@@ -6612,7 +6691,12 @@ pub fn run_arm(options: &Options) -> R<Value> {
                             .map_err(|e| format!("case {name} dump: {e}"))?;
                     }
                     let note = format!("ef={ef}");
-                    cases.push(case_json(&name, CaseKind::Approx, Some(&result), Some(recall), &note));
+                    let mut entry =
+                        case_json(&name, CaseKind::Approx, Some(&result), Some(recall), &note);
+                    if options.heap {
+                        entry["peak_heap_bytes"] = Value::from(peak);
+                    }
+                    cases.push(entry);
                 }
             }
             drop(ctx);
@@ -7454,7 +7538,7 @@ pub fn compare(paths: &[&Path]) -> R<bool> {
 fn usage() -> String {
     "usage: battle50k <e4|e4-sql|postgres|sqlite> --data <jsonl> --queries <json> \
      --out <report.json> [--db-dir <dir|sqlite .db file>] [--dsn <dsn>] \
-     [--only <case-substring>] [--reuse] [--graph] [--dump <dir>] [--prepared]\n\
+     [--only <case-substring>] [--reuse] [--graph] [--dump <dir>] [--prepared] [--heap]\n\
      \x20      battle50k compare <a.json> <b.json> [<c.json>] [<d.json>]"
         .into()
 }
@@ -7474,6 +7558,7 @@ fn parse(args: &[String]) -> R<Options> {
     let mut graph = false;
     let mut dump: Option<PathBuf> = None;
     let mut prepared = false;
+    let mut heap = false;
     let mut rest = args[1..].iter();
     while let Some(flag) = rest.next() {
         let mut value = || {
@@ -7492,6 +7577,7 @@ fn parse(args: &[String]) -> R<Options> {
             "--graph" => graph = true,
             "--dump" => dump = Some(PathBuf::from(value()?)),
             "--prepared" => prepared = true,
+            "--heap" => heap = true,
             other => return Err(format!("unknown flag {other}\n{}", usage()).into()),
         }
     }
@@ -7512,6 +7598,10 @@ fn parse(args: &[String]) -> R<Options> {
     options.graph = graph;
     options.dump = dump;
     options.prepared = prepared;
+    options.heap = heap;
+    if heap && !matches!(arm, Arm::E4) {
+        return Err(format!("--heap is the `e4` arm's flag\n{}", usage()).into());
+    }
     if prepared && !matches!(arm, Arm::E4Sql) {
         return Err(format!(
             "--prepared is the `e4-sql` arm's flag: it prepares each case's statement once and re-binds it per instance, and no other arm here has a statement of its own to prepare\n{}",
@@ -7536,6 +7626,9 @@ fn main() -> R<()> {
         return Ok(());
     }
     let options = parse(&args)?;
+    if options.heap {
+        HEAP_ON.store(true, Ordering::Relaxed);
+    }
     run_arm(&options)?;
     Ok(())
 }
