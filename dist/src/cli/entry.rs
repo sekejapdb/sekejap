@@ -33,7 +33,7 @@ fn layout(shape: &str) -> Layout {
     if shape != "scalar" {
         fields.push(("profile".into(), Kind::Json));
     }
-    Layout { id: 1, fields }
+    Layout { id: 1, fields, absent: Default::default() }
 }
 fn row(id: u64, shape: &str) -> Value {
     let mut d = json!({"_key":format!("p{id:08}"),"fullname":format!("Person {id:08}"),"born":(1940+id%80)*10000+(1+id%12)*100+1+id%28,"born_year":1940+id%80,"location":{"type":"Point","coordinates":[144.0+(id*37%2000)as f64/1000.0,-38.5+(id*53%2000)as f64/1000.0]}});

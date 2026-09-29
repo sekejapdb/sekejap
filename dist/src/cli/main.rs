@@ -36,7 +36,7 @@ fn layout(dim: usize) -> Layout {
             ("location".into(), Kind::Geo),
             ("nickname".into(), Kind::Text),
             ("embedding".into(), Kind::Vector(dim)),
-        ],
+        ], absent: Default::default(),
     }
 }
 fn cat_key(copy: u64) -> Vec<u8> {

@@ -64,7 +64,7 @@ fn layout() -> Layout {
             ("income".into(), Kind::Real),
             ("location".into(), Kind::Point),
             ("profile".into(), Kind::Json),
-        ],
+        ], absent: Default::default(),
     }
 }
 fn key(id: u64) -> Vec<u8> {
