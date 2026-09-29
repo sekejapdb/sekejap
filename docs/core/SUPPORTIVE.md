@@ -377,11 +377,17 @@ writes a Register file before the last step.
    New-file arm; DDL WAL bytes and reopen measured from here.
 4. The upgrader with the isolated 0.18 code, its marker and crash states, the
    0.18.5-fixture conversion tests. Upgraded arm measured.
-5. The flexibility items on Register files, each measured against step 4: F1
-   rows, F2, F4, F1 edges, F5, F6, F3, F7, N13, N6, N7 (F4 and F5 after their
-   posting grammar is approved, 1.d).
+5. The 0.19 versatility items on Register files, each measured against
+   step 4: F1 on rows, F1 on edges, F2, N1, N6, N7.
 6. The release: new files default to the Register, the upgrader is enabled,
    the gate runs on every arm.
+
+Owner decision 2026-09-29: **the whole supportive structure ships enabled in
+0.19** (steps 1-6); 0.19 is the versatility foundation. The remaining
+flexibility (F3, F4, F5, F6, F7, N3, N10, N13 and the items needing no
+format) is 0.20, as new entry versions on this format; F4 and F5 wait for
+their posting grammar (1.d). Search (the text skip table, field weights and
+fusion, analyzers, snippets, facets) is 0.21. The trigram index is in 0.19.
 
 ## 7. Owner decisions
 
