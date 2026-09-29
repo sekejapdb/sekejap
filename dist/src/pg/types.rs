@@ -456,26 +456,6 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// PostgreSQL's `boolin`: surrounding whitespace ignored, any case, and a
-/// unique prefix of `true`, `false`, `yes`, `no`, `on` (two letters at
-/// least), `off` (two letters at least), or exactly `1` / `0`. Anything else
-/// is `None`, never `false` (finding vuln-a15).
-fn parse_bool(text: &str) -> Option<bool> {
-    let word = text.trim().to_ascii_lowercase();
-    let prefix_of = |full: &str, least: usize| word.len() >= least && full.starts_with(word.as_str());
-    match word.as_bytes().first()? {
-        b't' if prefix_of("true", 1) => Some(true),
-        b'f' if prefix_of("false", 1) => Some(false),
-        b'y' if prefix_of("yes", 1) => Some(true),
-        b'n' if prefix_of("no", 1) => Some(false),
-        b'o' if prefix_of("on", 2) => Some(true),
-        b'o' if prefix_of("off", 2) => Some(false),
-        b'1' if word == "1" => Some(true),
-        b'0' if word == "0" => Some(false),
-        _ => None,
-    }
-}
-
 // ── one `$n`, in ─────────────────────────────────────────────────────────
 
 /// Decode one bound parameter into a [`Param`].
@@ -498,7 +478,7 @@ pub fn decode_param(bytes: Option<&[u8]>, type_oid: i32, format: i16) -> Result<
         return decode_array_text(&text, element);
     }
     Ok(match type_oid {
-        oid::BOOL => Param::Bool(parse_bool(&text).ok_or_else(|| {
+        oid::BOOL => Param::Bool(sekejap_lang::parse_bool(&text).ok_or_else(|| {
             SqlError::Parameter(format!("invalid input syntax for type boolean: \"{text}\""))
         })?),
         oid::INT2 | oid::INT4 | oid::INT8 => Param::Int(text.trim().parse().map_err(|_| {
@@ -746,11 +726,17 @@ fn decode_array_binary(bytes: &[u8], type_oid: i32, element: i32) -> Result<Para
 
 /// An undeclared text parameter, read by shape.
 fn sniff(text: String) -> Param {
-    if let Ok(n) = text.trim().parse::<i64>() {
-        return Param::Int(n);
+    // Only a number's own canonical spelling is read as that number, so
+    // nothing the client sent is lost: '00123', ' 7' and '1e3' stay text,
+    // and '1001' as a number is exactly '1001' again wherever the binder
+    // wants text (finding vuln-f08).
+    if let Ok(n) = text.parse::<i64>() {
+        if n.to_string() == text {
+            return Param::Int(n);
+        }
     }
-    if let Ok(f) = text.trim().parse::<f64>() {
-        if f.is_finite() {
+    if let Ok(f) = text.parse::<f64>() {
+        if serde_json::Number::from_f64(f).is_some_and(|number| number.to_string() == text) {
             return Param::Float(f);
         }
     }

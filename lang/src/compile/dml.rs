@@ -251,8 +251,15 @@ impl Compiler<'_> {
                 }
                 document
             }
+            // A bound parameter takes the column's type the way PostgreSQL
+            // reads an untyped one: numeric text into a number column, a
+            // number into a TEXT column as its spelling (finding
+            // vuln-f08). A literal written in the SQL keeps its own type.
             Kind::Int => match &value {
                 Value::Number(n) if n.is_i64() => value,
+                Value::String(text) if matches!(literal, Literal::Param(_)) && text.trim().parse::<i64>().is_ok() => {
+                    Value::from(text.trim().parse::<i64>().expect("checked"))
+                }
                 other => {
                     return Err(SqlError::Parameter(format!(
                         "`{column}` is an integer column and the value is {other}"
@@ -261,6 +268,12 @@ impl Compiler<'_> {
             },
             Kind::Real => match &value {
                 Value::Number(_) => value,
+                Value::String(text)
+                    if matches!(literal, Literal::Param(_))
+                        && text.trim().parse::<f64>().is_ok_and(f64::is_finite) =>
+                {
+                    Value::from(text.trim().parse::<f64>().expect("checked"))
+                }
                 other => {
                     return Err(SqlError::Parameter(format!(
                         "`{column}` is REAL and the value is {other}"
@@ -269,6 +282,7 @@ impl Compiler<'_> {
             },
             Kind::Text => match &value {
                 Value::String(_) => value,
+                Value::Number(n) if matches!(literal, Literal::Param(_)) => Value::String(n.to_string()),
                 other => {
                     return Err(SqlError::Parameter(format!(
                         "`{column}` is TEXT and the value is {other}"
@@ -277,6 +291,11 @@ impl Compiler<'_> {
             },
             Kind::Bool => match &value {
                 Value::Bool(_) => value,
+                Value::String(text)
+                    if matches!(literal, Literal::Param(_)) && crate::parse_bool(text).is_some() =>
+                {
+                    Value::Bool(crate::parse_bool(text).expect("checked"))
+                }
                 other => {
                     return Err(SqlError::Parameter(format!(
                         "`{column}` is BOOLEAN and the value is {other}"

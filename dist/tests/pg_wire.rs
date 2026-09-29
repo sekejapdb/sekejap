@@ -1567,3 +1567,40 @@ fn describing_a_read_portal_leaves_its_execute_streaming() {
     assert_eq!(rows_of(&got).len(), 9_000);
     assert_eq!(tag(&got), "SELECT 9000");
 }
+
+/// Finding vuln-f08 (0.18.5): a parameter the client left untyped (OID 0,
+/// or 705 `unknown`) was read by its shape at Bind, so '1001' bound as a
+/// row key and '00123' bound to a TEXT column became integers and were
+/// refused -- unless the client happened to Describe the statement first,
+/// which resolves untyped positions from the statement. Bind now resolves
+/// them the same way, once per statement.
+#[test]
+fn an_untyped_text_parameter_takes_its_columns_type() {
+    let fixture = build(4);
+    let mut connection = connect(&fixture.service, 1);
+    for (statement, unknown) in [("s0", 0), ("s705", 705)] {
+        let key = format!("{statement}-1001").replace("s0-", "").replace("s705-", "7");
+        let sql = "INSERT INTO place (id, name, n, born, alive) VALUES ($1, $2, $3, $4, $5)";
+        let mut batch = parse_message(statement, sql, &[unknown, unknown, unknown, unknown, unknown]);
+        let n = if unknown == 0 { b"900001".as_slice() } else { b"900002".as_slice() };
+        batch.extend_from_slice(&bind_message(
+            "p",
+            statement,
+            &[Some(key.as_bytes()), Some(b"00123"), Some(n), Some(b"1"), Some(b"t")],
+            &[],
+        ));
+        batch.extend_from_slice(&execute_message("p", 0));
+        batch.extend_from_slice(&sync_message());
+        let got = frames(&connection.feed(&batch));
+        assert!(
+            first(&got, b'E').is_none(),
+            "OID {unknown}: {:?}",
+            first(&got, b'E').map(|f| String::from_utf8_lossy(&f.body).into_owned())
+        );
+        assert_eq!(
+            rows_of(&ask(&mut connection, &format!("SELECT name FROM place WHERE id = '{key}'"))),
+            [[Some("00123".to_owned())]],
+            "OID {unknown}: the text kept its spelling"
+        );
+    }
+}

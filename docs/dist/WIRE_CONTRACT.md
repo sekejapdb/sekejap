@@ -296,10 +296,15 @@ the statement then decodes that position by that OID at `Bind`, so the value
 is read as the type the client was told. Every statement compiled today
 gives none, so such a position is answered `text` (25) — a real type whose
 value maps onto `Param::Text` with nothing inferred — and a text parameter
-with no declared OID at all is read
-by SHAPE (a whole number, then a number, then text), because `Param`'s type
-is read from WHERE it is used and handing `Param::Text("42")` to an `INT`
-column refuses where `Param::Int(42)` does not.
+with no declared OID at all (0, or 705 `unknown`) is read by SHAPE: a whole
+number or a number only when the text is that number's own canonical
+spelling (`42`, `1.5`), otherwise text, so `00123`, ` 7` and `1e3` keep
+their spelling (0.18.5). Where it is used, a BOUND parameter then takes the
+place's type as PostgreSQL reads an untyped literal: a number where text is
+wanted (a key, a `TEXT` column) is its spelling, and numeric or boolean text
+into an `INT`, `REAL` or `BOOLEAN` column is that value. A literal written in
+the SQL keeps its own type. One looser edge than PostgreSQL, named: a
+parameter DECLARED `text` bound to a number column is read the same way.
 
 **So a client that wants an INT parameter says so.** `rust-postgres` spells
 that `prepare_typed(sql, &[Type::INT8])`; pgjdbc spells it `setLong`; psycopg

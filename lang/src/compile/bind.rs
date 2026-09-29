@@ -121,6 +121,11 @@ impl<'a> Binder<'a> {
     pub(crate) fn text_of(&self, literal: &Literal) -> SqlResult2<String> {
         match self.value_of(literal)? {
             Value::String(s) => Ok(s),
+            // A bound number where text is wanted is its own spelling: an
+            // untyped wire parameter that looked like a number arrives as
+            // one, and a key '1001' is still the key '1001' (finding
+            // vuln-f08). A number written in the SQL is not text.
+            Value::Number(n) if matches!(literal, Literal::Param(_)) => Ok(n.to_string()),
             other => Err(SqlError::Parameter(format!("expected text, found {other}"))),
         }
     }
