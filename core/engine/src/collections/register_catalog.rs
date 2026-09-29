@@ -124,7 +124,10 @@ pub(crate) fn read_catalog(s: &(impl Trees + ?Sized), sup: &Supportive, id: Coll
             rules.push(rule);
         }
     }
-    let tail = |key: crate::supportive::carrier::Key| -> Result<Option<Vec<u8>>> {
+    let tail = |key: crate::supportive::carrier::Key, bit: u8| -> Result<Option<Vec<u8>>> {
+        if table.parts & bit == 0 {
+            return Ok(None);
+        }
         match sup.register.get(s, &key)? {
             Some((1, p)) => Ok(Some(p)),
             Some(_) => Err(corrupt("table entry version")),
@@ -139,15 +142,15 @@ pub(crate) fn read_catalog(s: &(impl Trees + ?Sized), sup: &Supportive, id: Coll
             Ok(out)
         }
     }
-    let key = tail(sch::keys_key(t))?.map(|p| column_rules::decode_key_spec(reading(&p))).transpose()?;
-    let edge = tail(sch::bind_key(t))?
+    let key = tail(sch::keys_key(t), sch::TABLE_KEYS)?.map(|p| column_rules::decode_key_spec(reading(&p))).transpose()?;
+    let edge = tail(sch::bind_key(t), sch::TABLE_BIND)?
         .map(|p| crate::index::graph::edge_table::EdgeTableRecord::decode(reading(&p)))
         .transpose()?;
-    let graphs = tail(sch::memb_key(t))?
+    let graphs = tail(sch::memb_key(t), sch::TABLE_MEMB)?
         .map(|p| crate::index::graph::property_graph::decode_memberships(reading(&p)))
         .transpose()?
         .unwrap_or_default();
-    let drop = match tail(sch::drop_job_key(t))? {
+    let drop = match tail(sch::drop_job_key(t), sch::TABLE_DROP)? {
         Some(p) if p.len() == 10 => Some(DropState {
             phase: DropPhase::from_byte(p[0])?,
             mode: DropMode::from_byte(p[1])?,
@@ -182,8 +185,16 @@ pub(crate) fn write_catalog<W: TreesMut + Trees>(
     let t = u64::from(c.id.0);
     let schema = schema_id(w, sup, c.schema.as_deref())?
         .ok_or_else(|| invalid(format!("schema `{}` does not exist", c.schema.as_deref().unwrap_or(""))))?;
-    let table = Table { timestamps: c.timestamps, layout: c.layout, schema };
-    if old.is_none_or(|o| o.timestamps != c.timestamps || o.layout != c.layout || o.schema != c.schema) {
+    let parts = |c: &Catalog| {
+        (if c.key.is_some() { sch::TABLE_KEYS } else { 0 })
+            | (if c.edge.is_some() { sch::TABLE_BIND } else { 0 })
+            | (if c.graphs.is_empty() { 0 } else { sch::TABLE_MEMB })
+            | (if c.drop.is_some() { sch::TABLE_DROP } else { 0 })
+    };
+    let table = Table { timestamps: c.timestamps, layout: c.layout, schema, parts: parts(c) };
+    if old.is_none_or(|o| {
+        o.timestamps != c.timestamps || o.layout != c.layout || o.schema != c.schema || parts(o) != parts(c)
+    }) {
         sup.put(w, &sch::table_key(t), line(b"TABL", 1, 0), &table.encode())?;
     }
     if old.is_none_or(|o| o.name != c.name || o.schema != c.schema) {

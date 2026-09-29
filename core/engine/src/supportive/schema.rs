@@ -241,17 +241,25 @@ impl Name {
     }
 }
 
-/// `TABL` version 1: `flags u8 (bit 0 timestamps) | current layout u32 |
-/// schema u64 (0 is public)`.
+/// `TABL` version 1: `flags u8 | current layout u32 | schema u64 (0 is
+/// public)`. Flags: bit 0 timestamps; bits 1-4 say which of the table's
+/// optional entries exist -- `KEYS`, `BIND`, `MEMB`, the table-drop `JOBS` --
+/// so reading a table looks up only those it has.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Table {
     pub(crate) timestamps: bool,
     pub(crate) layout: u32,
     pub(crate) schema: u64,
+    /// Bits 1-4 of the flags byte.
+    pub(crate) parts: u8,
 }
+pub(crate) const TABLE_KEYS: u8 = 1 << 1;
+pub(crate) const TABLE_BIND: u8 = 1 << 2;
+pub(crate) const TABLE_MEMB: u8 = 1 << 3;
+pub(crate) const TABLE_DROP: u8 = 1 << 4;
 impl Table {
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut b = vec![u8::from(self.timestamps)];
+        let mut b = vec![u8::from(self.timestamps) | self.parts];
         b.extend_from_slice(&self.layout.to_be_bytes());
         b.extend_from_slice(&self.schema.to_be_bytes());
         b
@@ -259,7 +267,7 @@ impl Table {
     pub(crate) fn decode(p: &[u8]) -> Result<Self> {
         let mut r = Reader::new(p);
         let flags = r.u8()?;
-        if flags & !1 != 0 {
+        if flags & !(1 | TABLE_KEYS | TABLE_BIND | TABLE_MEMB | TABLE_DROP) != 0 {
             return Err(corrupt("TABL flags"));
         }
         let layout = r.u32()?;
@@ -268,7 +276,7 @@ impl Table {
         if layout == 0 {
             return Err(corrupt("TABL layout"));
         }
-        Ok(Self { timestamps: flags & 1 == 1, layout, schema })
+        Ok(Self { timestamps: flags & 1 == 1, layout, schema, parts: flags & !1 })
     }
 }
 

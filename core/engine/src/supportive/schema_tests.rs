@@ -75,7 +75,7 @@ fn a_table_lives_in_the_register_only() {
 
 #[test]
 fn entry_payloads_round_trip() {
-    let table = Table { timestamps: true, layout: 7, schema: 2 };
+    let table = Table { timestamps: true, layout: 7, schema: 2, parts: TABLE_KEYS | TABLE_MEMB };
     assert_eq!(Table::decode(&table.encode()).unwrap(), table);
     let name = Name { parent: 3, name: "orders".into() };
     assert_eq!(Name::decode(&name.encode().unwrap()).unwrap(), name);
