@@ -5,6 +5,7 @@
 //! - `anchor` -- 2.0.2, the Anchor in the header copies.
 //! - `carrier` -- 2.0, the byte formats of the Anchor and the Register.
 //! - `register` -- 2.0.3, the Register on disk: three fixed trees.
+//! - `verify` -- every copy of every entry, checked before it is trusted.
 //!
 //! The nodes 2.a-2.g arrive as their entry kinds are built (build step 3).
 
@@ -15,6 +16,7 @@
 pub(crate) mod anchor;
 pub(crate) mod carrier;
 pub(crate) mod register;
+pub(crate) mod verify;
 
 #[cfg(test)]
 #[path = "anchor_tests.rs"]
@@ -25,3 +27,6 @@ mod carrier_tests;
 #[cfg(test)]
 #[path = "register_tests.rs"]
 mod register_tests;
+#[cfg(test)]
+#[path = "verify_tests.rs"]
+mod verify_tests;
