@@ -801,6 +801,13 @@ const ARC_BYTES: u64 = 2 * size_of::<usize>() as u64;
 /// One path step or start, with its `Arc` counters.
 const PATH_NODE_BYTES: u64 = ARC_BYTES + size_of::<PathNode>() as u64;
 
+/// One JSON node, STATED rather than measured: `size_of::<Value>()` on a
+/// 64-bit target with serde_json's default map. Measuring it would let a
+/// feature a host crate turns on (`serde_json/preserve_order` swaps in a
+/// larger map) change what every list and edge bag is charged, so one
+/// query could fit its budget in one build and be refused in another.
+const JSON_NODE_BYTES: u64 = 32;
+
 fn json_bytes(value: &Value) -> u64 {
     ARC_BYTES + json_tree_bytes(value)
 }
@@ -808,7 +815,7 @@ fn json_bytes(value: &Value) -> u64 {
 /// A JSON value's own node plus what it owns: string bytes, array items,
 /// and per object entry the key's `String` and bytes.
 fn json_tree_bytes(value: &Value) -> u64 {
-    let own = size_of::<Value>() as u64;
+    let own = JSON_NODE_BYTES;
     own + match value {
         Value::String(s) => s.len() as u64,
         Value::Array(items) => items.iter().map(json_tree_bytes).sum(),
