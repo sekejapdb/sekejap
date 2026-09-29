@@ -535,6 +535,9 @@ fn the_set_answers_the_same_question_after_a_reopen() {
 /// resumable pass builds the set it was missing.
 #[test]
 fn a_backfill_of_a_database_written_before_the_bit_equals_the_derived_set() {
+    // It writes and reads 0.18-format header or descriptor bytes: pinned
+    // to that format (a Register file's are `supportive::*_tests`).
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, place, ids) = fixture(&path, 40);
@@ -623,6 +626,9 @@ fn a_backfill_of_a_database_written_before_the_bit_equals_the_derived_set() {
 /// predates it as `Unsupported`, before a record is read -- never as damage.
 #[test]
 fn an_endpoint_set_file_is_unsupported_to_a_binary_that_predates_the_bit() {
+    // It writes and reads 0.18-format header or descriptor bytes: pinned
+    // to that format (a Register file's are `supportive::*_tests`).
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     assert_eq!(ENDPOINT_FEATURE, 0x4000);
     assert_eq!(
         SUPPORTED_LOGICAL_FEATURES & ENDPOINT_FEATURE,

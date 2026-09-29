@@ -346,6 +346,14 @@ pub(crate) fn name_lookup_key(kind: u8, name: &str) -> Vec<u8> {
     key
 }
 
+/// The base graph's encoding and flags, as a Register file's `GRPH`
+/// payload holds them (`docs/core/SUPPORTIVE.md` 2.e).
+pub(crate) fn graph_flags() -> Vec<u8> {
+    let mut b = GRAPH_ENCODING.to_be_bytes().to_vec();
+    b.extend(REVERSE_REQUIRED.to_be_bytes());
+    b
+}
+
 fn encode_graph_header(h: GraphHeader) -> Result<Vec<u8>> {
     let mut body = GRAPH_ENCODING.to_be_bytes().to_vec();
     body.extend(REVERSE_REQUIRED.to_be_bytes());
@@ -804,6 +812,15 @@ fn encode_properties(value: &Value) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// A stored bag of an edge of type `t`, under its table's column names
+/// (F1 on edges, `crate::collections::columns::BagMap`).
+pub(crate) fn named_bag(db: &Database, t: EdgeTypeId, bag: Value) -> Result<Value> {
+    Ok(match db.bag_map(t)? {
+        Some(m) => m.names(&bag),
+        None => bag,
+    })
+}
+
 pub(crate) fn decode_properties(bytes: &[u8]) -> Result<Value> {
     if bytes.first() != Some(&1) || bytes.len() > MAX_EDGE_PROPERTY_BYTES {
         return Err(corrupt("edge property encoding/size"));
@@ -1040,6 +1057,7 @@ impl Hop<'_> {
                 deferred.push((adjacent.key, adjacent.id, adjacent.far));
                 continue;
             };
+            let properties = named_bag(db, adjacent.key.edge_type, properties)?;
             self.follow(properties, adjacent.key, adjacent.id, adjacent.far, next, work)?;
         }
         // The walk holds a pinned leaf; the reads below do not share it.
@@ -1060,6 +1078,7 @@ impl Hop<'_> {
             self.count(scanned)?;
             work.primary_read()?;
             let properties = decode_properties(&adjacency::primary_posting(db, edge, id)?)?;
+            let properties = named_bag(db, edge.edge_type, properties)?;
             self.follow(properties, edge, id, far, next, work)?;
         }
         Ok(())
@@ -1231,9 +1250,21 @@ pub(crate) fn validate_graph(
     enabled: bool,
     endpoints_enabled: bool,
     edge_ids_enabled: bool,
+    sup: Option<&crate::supportive::header::Supportive>,
 ) -> Result<()> {
     endpoints::validate_endpoint_sets(s, endpoints_enabled)?;
-    validate_edge_id_allocator(s, enabled, edge_ids_enabled)?;
+    if sup.is_none() {
+        validate_edge_id_allocator(s, enabled, edge_ids_enabled)?;
+    }
+    if let Some(sup) = sup {
+        // A Register file's graph header and names are entries; the Register
+        // verifier owns their damage. What is checked here is agreement.
+        let h = crate::collections::register_catalog::read_graph(s, sup)?;
+        if enabled != h.is_some() {
+            return Err(corrupt("graph census and GRPH disagree"));
+        }
+        return Ok(());
+    }
     if !enabled {
         // A single prefix probe per family is bounded. Edge rows are
         // authoritative data and must never become invisible merely because
@@ -1355,12 +1386,31 @@ impl Database {
         if let Some(cached) = self.graph_header_cache.get() {
             return Ok(cached);
         }
-        let h = read_graph_header(|key| self.store()?.get(key).map_err(Error::from))?;
+        let h = match &self.supportive {
+            Some(sup) => crate::collections::register_catalog::read_graph(self.store()?, sup)?
+                .ok_or_else(|| corrupt("graph feature without GRPH"))?,
+            None => read_graph_header(|key| self.store()?.get(key).map_err(Error::from))?,
+        };
         self.graph_header_cache.set(Some(h));
         Ok(h)
     }
 
     fn save_graph_header(&mut self, h: GraphHeader) -> Result<()> {
+        if let Some(mut sup) = self.supportive.take() {
+            let old = self.graph_header_cache.get();
+            self.graph_header_cache.set(None);
+            let r = self.writer().and_then(|w| {
+                let old = match old {
+                    Some(o) => Some(o),
+                    None => crate::collections::register_catalog::read_graph(w, &sup)?,
+                };
+                crate::collections::register_catalog::write_graph(w, &mut sup, old, h)
+            });
+            self.supportive = Some(sup);
+            r?;
+            self.graph_header_cache.set(Some(h));
+            return Ok(());
+        }
         let bytes = encode_graph_header(h)?;
         // Publish the cache only once all three replicas are on their way, so
         // a failed write leaves the cache empty rather than ahead of the file.
@@ -1373,6 +1423,13 @@ impl Database {
     }
 
     fn save_graph_name(&mut self, n: &GraphName) -> Result<()> {
+        if let Some(mut sup) = self.supportive.take() {
+            let r = self.writer().and_then(|w| {
+                crate::collections::register_catalog::put_graph_name(w, &mut sup, n.kind, n.id, &n.name)
+            });
+            self.supportive = Some(sup);
+            return r;
+        }
         let bytes = encode_name(n)?;
         for copy in 0..3 {
             self.writer()?
@@ -1384,6 +1441,9 @@ impl Database {
     }
 
     fn lookup_graph_name(&self, kind: u8, name: &str) -> Result<Option<u64>> {
+        if let Some(sup) = &self.supportive {
+            return crate::collections::register_catalog::graph_name_id(self.store()?, sup, kind, name);
+        }
         let Some(value) = self.store()?.get(&name_lookup_key(kind, name))? else {
             return Ok(None);
         };
@@ -1466,6 +1526,16 @@ impl Database {
             return Ok((types, contexts));
         }
         self.graph_header()?;
+        if let Some(sup) = &self.supportive {
+            let store = self.store()?;
+            for (name, id) in crate::collections::register_catalog::graph_name_list(store, sup, 0)? {
+                types.push((EdgeTypeId(id), name));
+            }
+            for (name, id) in crate::collections::register_catalog::graph_name_list(store, sup, 1)? {
+                contexts.push((GraphContextId(id), name));
+            }
+            return Ok((types, contexts));
+        }
         for row in self.store()?.range(&[NAME_LOOKUP])? {
             let (key, value) = row?;
             if key.first() != Some(&NAME_LOOKUP) {
@@ -2406,6 +2476,34 @@ impl Database {
 
     /// The next edge id, advanced in memory; `commit` writes the allocator.
     fn allocate_edge_id(&mut self) -> Result<u64> {
+        if self.supportive.is_some() {
+            // A Register file reserves edge ids in blocks, as it does row
+            // ids (`collections::ROW_ID_BLOCK`).
+            let (next, mut reserved) = match (self.edge_id_next, self.edge_id_block) {
+                (Some(next), Some((_, reserved))) => (next, reserved),
+                (None, Some(block)) => block,
+                _ if self.edge_identity_present() => {
+                    let p = self
+                        .entry_get(&crate::supportive::schema::edge_id_key(), &[])?
+                        .ok_or_else(|| corrupt("edge-id allocator NEXT missing"))?;
+                    let n = u64::from_be_bytes(p.try_into().map_err(|_| corrupt("edge-id allocator NEXT"))?);
+                    (n, n)
+                }
+                _ => (1, 1),
+            };
+            if next >= reserved {
+                reserved = next
+                    .checked_add(crate::collections::ROW_ID_BLOCK)
+                    .ok_or_else(|| invalid("graph edge identities exhausted"))?;
+                self.edge_id_dirty = true;
+            }
+            let following = next
+                .checked_add(1)
+                .ok_or_else(|| invalid("graph edge identities exhausted"))?;
+            self.edge_id_next = Some(following);
+            self.edge_id_block = Some((following, reserved));
+            return Ok(next);
+        }
         let next = match self.edge_id_next {
             Some(next) => next,
             None if self.edge_identity_present() => {
@@ -2429,9 +2527,18 @@ impl Database {
             let next = self
                 .edge_id_next
                 .ok_or_else(|| corrupt("edge-id allocator marked dirty without a value"))?;
-            let bytes = encode_edge_id_allocator(next)?;
-            for copy in 0..3 {
-                self.writer()?.put(&edge_id_allocator_key(copy), &bytes)?;
+            if let Some((_, reserved)) = self.edge_id_block.filter(|_| self.supportive.is_some()) {
+                self.entry_put(
+                    &crate::supportive::schema::edge_id_key(),
+                    crate::supportive::schema::line(b"NEXT", 1, crate::supportive::schema::NEXT_EDGE_ID as u32),
+                    &[],
+                    &reserved.to_be_bytes(),
+                )?;
+            } else {
+                let bytes = encode_edge_id_allocator(next)?;
+                for copy in 0..3 {
+                    self.writer()?.put(&edge_id_allocator_key(copy), &bytes)?;
+                }
             }
             self.edge_id_dirty = false;
         }
@@ -2817,7 +2924,7 @@ impl Database {
             out.push(Edge {
                 key,
                 id,
-                properties: decode_properties(&value)?,
+                properties: named_bag(self, key.edge_type, decode_properties(&value)?)?,
             });
         }
         Ok(out)
@@ -3185,7 +3292,16 @@ impl Database {
 
     /// The name an edge type was interned under: an edge table's label.
     pub fn edge_type_name(&self, id: EdgeTypeId) -> Result<String> {
-        Ok(read_name(|key| self.store()?.get(key).map_err(Error::from), 0, id.0)?.name)
+        self.graph_name_of(0, id.0)
+    }
+
+    /// An interned edge-type (kind 0) or context (kind 1) name by id.
+    pub(crate) fn graph_name_of(&self, kind: u8, id: u64) -> Result<String> {
+        if let Some(sup) = &self.supportive {
+            return crate::collections::register_catalog::graph_name(self.store()?, sup, kind, id)?
+                .ok_or_else(|| corrupt("all metadata copies missing or damaged"));
+        }
+        Ok(read_name(|key| self.store()?.get(key).map_err(Error::from), kind, id)?.name)
     }
 
     /// The name a context was interned under, for a refusal that has to name
@@ -3194,7 +3310,7 @@ impl Database {
         if id == GraphContextId::BASE {
             return Ok("(base graph)".to_owned());
         }
-        Ok(read_name(|key| self.store()?.get(key).map_err(Error::from), 1, id.0)?.name)
+        self.graph_name_of(1, id.0)
     }
 
     /// Parent `Database::delete` calls this before any entity/index mutation.

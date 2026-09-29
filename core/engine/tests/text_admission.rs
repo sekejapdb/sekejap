@@ -147,6 +147,10 @@ fn query(db: &Database, index: IndexId) -> sekejap_core::collections::Result<Vec
 
 #[test]
 fn intact_future_text_family_versions_or_options_refuse_without_mutation() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     for (damage, copy) in (0..3u8).flat_map(|copy| (0..6u8).map(move |damage| (damage, copy))) {
         let path = temp.path().join(format!("future-text-{damage}-{copy}"));
@@ -182,6 +186,10 @@ fn intact_future_text_family_versions_or_options_refuse_without_mutation() {
 /// nothing.
 #[test]
 fn a_trigram_descriptor_without_its_feature_bit_is_refused() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("trigram-without-bit");
     fixture(&path);
@@ -210,6 +218,10 @@ fn a_trigram_descriptor_without_its_feature_bit_is_refused() {
 
 #[test]
 fn clearing_text_feature_cannot_hide_descriptor_or_any_text_keyspace() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("hidden-text-family");
     fixture(&path);
@@ -271,6 +283,10 @@ fn every_text_prefix_without_explicit_feature_is_refused() {
 
 #[test]
 fn malformed_posting_norm_term_and_corpus_stats_are_corrupt_at_exact_access() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     for damage in 0..11u8 {
         let path = temp.path().join(format!("text-damage-{damage}"));

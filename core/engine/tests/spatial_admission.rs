@@ -156,6 +156,10 @@ fn assert_unsupported_unchanged(path: &Path) {
 
 #[test]
 fn intact_future_spatial_family_version_or_options_refuse_without_mutation() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     for (damage, copy) in (0..3u8).flat_map(|copy| [(0u8, copy), (1, copy), (2, copy)]) {
         let path = temp.path().join(format!("future-spatial-{damage}-{copy}"));
@@ -184,6 +188,10 @@ fn intact_future_spatial_family_version_or_options_refuse_without_mutation() {
 
 #[test]
 fn clearing_spatial_feature_cannot_hide_descriptor_or_postings() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("hidden-spatial-family");
     fixture(&path);

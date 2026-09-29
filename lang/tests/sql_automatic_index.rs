@@ -605,14 +605,14 @@ fn the_override_is_statement_scoped_and_a_later_add_column_indexes_whatever_it_s
 }
 
 #[test]
-fn a_rename_of_an_automatically_indexed_column_re_earns_the_index_under_the_new_name() {
+fn a_rename_of_an_automatically_indexed_column_keeps_its_index() {
     let (_dir, mut db) = open();
     run(&mut db, "CREATE TABLE ren (a TEXT)");
     assert_eq!(names(&db, "ren"), ["ren_a_btree"]);
-    // The collection is empty, which `RENAME COLUMN` already required, so the
-    // index over the old name holds no entry to move.
+    // The index names the column by id (0.19), so it follows the rename with
+    // its entries and keeps its own name, as PostgreSQL keeps it.
     run(&mut db, "ALTER TABLE ren RENAME COLUMN a TO b");
-    assert_eq!(names(&db, "ren"), ["ren_b_btree"]);
+    assert_eq!(names(&db, "ren"), ["ren_a_btree"]);
     run(&mut db, "INSERT INTO ren (_key, b) VALUES ('k', 'x')");
     run(&mut db, "COMMIT");
     assert_eq!(
@@ -620,15 +620,12 @@ fn a_rename_of_an_automatically_indexed_column_re_earns_the_index_under_the_new_
         ["k".to_owned()]
     );
 
-    // A HAND-WRITTEN index still refuses the rename by name: the caller chose
-    // that name and the statement will not take it away silently.
+    // A HAND-WRITTEN index follows the same way, under the name its caller
+    // chose.
     run(&mut db, "CREATE TABLE held (a TEXT) WITH (index: none)");
     run(&mut db, "CREATE INDEX mine ON held USING btree (a)");
-    let said = refuse(&mut db, "ALTER TABLE held RENAME COLUMN a TO b");
-    assert!(
-        said.contains("the index `mine` names `a`"),
-        "a hand-written index is still the refusal it was: {said}"
-    );
+    run(&mut db, "ALTER TABLE held RENAME COLUMN a TO b");
+    assert_eq!(names(&db, "held"), ["mine"]);
 }
 
 #[test]

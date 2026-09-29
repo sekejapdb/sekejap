@@ -115,8 +115,12 @@ pub(crate) mod catalog;
 pub(crate) mod column_rules;
 pub(crate) mod drop_collection;
 pub(crate) mod row_count;
+pub(crate) mod register_catalog;
+pub(crate) mod columns;
+pub(crate) use columns::retired_name as retired_column_name;
 mod write_set;
 pub mod rebuild;
+pub mod upgrade;
 mod sort;
 pub mod verification;
 // The index families and the query engine live in `crate::index` and
@@ -333,18 +337,29 @@ pub(crate) struct Catalog {
     pub(crate) drop: Option<DropState>,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct HeaderInfo {
-    next_collection: u32,
-    next_layout: u32,
-    limits: Option<ResourceLimits>,
-    indexes: Option<IndexHeader>,
+pub(crate) struct HeaderInfo {
+    pub(crate) next_collection: u32,
+    pub(crate) next_layout: u32,
+    pub(crate) limits: Option<ResourceLimits>,
+    pub(crate) indexes: Option<IndexHeader>,
 }
 // E3 db.rs MembershipBatch uses the same fixed one-collection accumulator:
 // switching collections flushes it; memory never grows with collection count.
 struct Sequence {
     collection: CollectionId,
     next: u64,
+    /// On a Register file: the bound written to the table's `NEXT`, so ids
+    /// below it may be handed out without a write (a block of
+    /// [`ROW_ID_BLOCK`]); `dirty` when this transaction raised it.
+    reserved: u64,
+    dirty: bool,
 }
+/// On a Register file the row sequence is reserved in blocks, as a
+/// PostgreSQL sequence caches values: `NEXT` is written once per block rather
+/// than in every commit, so a commit that inserts rows writes no counter
+/// most of the time. An id is still never handed out twice; a crash or a
+/// rollback can only leave a gap.
+pub(crate) const ROW_ID_BLOCK: u64 = 1024;
 pub struct Database {
     store: Backend,
     path: PathBuf,
@@ -356,10 +371,30 @@ pub struct Database {
     /// write of a file that declares `EDGE_TABLE_FEATURE` and dropped on a
     /// binding or a rollback (`index/graph/edge_table.rs`).
     pub(crate) bound_edge_types: RefCell<Option<BTreeMap<EdgeTypeId, CollectionId>>>,
+    /// The edge types whose stored property tokens differ from their
+    /// columns' names (a renamed or retired column); see `columns::BagMap`.
+    pub(crate) bag_maps: RefCell<Option<BTreeMap<EdgeTypeId, Option<Arc<columns::BagMap>>>>>,
+    /// Where the running drop of a bound edge table stopped walking edges
+    /// (`drop_collection.rs`); forgotten on rollback, which only costs a
+    /// walk from the start.
+    pub(crate) edge_drop_cursor: Option<Vec<u8>>,
+    /// On a Register file: per table, the next row id and the reserved
+    /// bound as of the last COMMIT (`ROW_ID_BLOCK`), so the ids a rolled-back
+    /// transaction handed out are handed out again, as they always were.
+    row_id_blocks: BTreeMap<CollectionId, (u64, u64)>,
+    /// The same for tables this transaction left mid-way (a flush on
+    /// switching tables): merged into `row_id_blocks` by `commit`, dropped
+    /// by `rollback`, so no bound the file does not hold is ever trusted.
+    row_id_pending: BTreeMap<CollectionId, (u64, u64)>,
+    /// The same for the edge-id allocator.
+    pub(crate) edge_id_block: Option<(u64, u64)>,
     layout_cache: RefCell<Option<Arc<Layout>>>,
     clock: Arc<dyn Clock>,
     pub(crate) limits: Option<ResourceLimits>,
     pub(crate) index_header: Option<IndexHeader>,
+    /// The Register and Anchor when this is a Register file
+    /// (`docs/core/SUPPORTIVE.md`); `None` for a 0.18-format file.
+    pub(crate) supportive: Option<crate::supportive::header::Supportive>,
     /// The graph dictionary header, cached. It is three replica reads, it is
     /// read once per relationship written, and this handle is the only thing
     /// that can change it, so re-reading it per edge is three descents bought
@@ -1237,14 +1272,63 @@ pub(crate) fn replicas<T: PartialEq>(
     good.ok_or_else(|| corrupt("all metadata copies missing or damaged"))
 }
 fn read_header(s: &PageWalStore) -> Result<HeaderInfo> {
+    read_header_any(s).map(|(h, _)| h)
+}
+/// The header of either format: a 0.18 header, or the header facts of a
+/// Register file together with its Register.
+fn read_header_any(
+    s: &PageWalStore,
+) -> Result<(HeaderInfo, Option<crate::supportive::header::Supportive>)> {
+    if crate::supportive::header::anchored(s)? {
+        let sup = crate::supportive::header::Supportive::read(s)?;
+        let h = header_of(&sup, catalog::registry_count(s, Some(&sup))?)?;
+        return Ok((h, Some(sup)));
+    }
+    let h = read_header_legacy(s)?;
+    if !crate::supportive::header::legacy_mode() {
+        return Err(Error::Unsupported(
+            "this database is in the 0.18 format; 0.19 opens it after `sekejap-upgrade --apply <path>`, which keeps the original directory as the backup".into(),
+        ));
+    }
+    Ok((h, None))
+}
+/// A Register file's header facts in the 0.18 shape the engine reads, with
+/// the index count the caller derived from the registry.
+pub(crate) fn header_of(
+    sup: &crate::supportive::header::Supportive,
+    count: u32,
+) -> Result<HeaderInfo> {
+    let f = &sup.fields;
+    let indexes = match f.index {
+        Some((features, next)) => {
+            admit_features(features, SUPPORTED_LOGICAL_FEATURES)?;
+            if u64::from(count) >= next {
+                return Err(corrupt("index allocator/count"));
+            }
+            Some(IndexHeader { features, next, count })
+        }
+        None => None,
+    };
+    Ok(HeaderInfo {
+        next_collection: f.next_collection,
+        next_layout: f.next_layout,
+        limits: f.limits.as_deref().map(decode_limits).transpose()?,
+        indexes,
+    })
+}
+fn read_header_legacy(s: &PageWalStore) -> Result<HeaderInfo> {
     replicas(
         |k| s.get(k).map_err(Error::from),
         |i| vec![0, 0, i],
         parse_header,
     )
 }
-fn validate_features(s: &PageWalStore, header: Option<IndexHeader>) -> Result<()> {
-    catalog::validate_catalog(s, header)?;
+fn validate_features(
+    s: &PageWalStore,
+    header: Option<IndexHeader>,
+    sup: Option<&crate::supportive::header::Supportive>,
+) -> Result<()> {
+    catalog::validate_catalog(s, header, sup)?;
     crate::index::graph::validate_graph(
         s,
         header.is_some_and(|h| h.features & crate::index::graph::GRAPH_FEATURE != 0),
@@ -1252,13 +1336,14 @@ fn validate_features(s: &PageWalStore, header: Option<IndexHeader>) -> Result<()
             h.features & crate::index::graph::endpoints::ENDPOINT_FEATURE != 0
         }),
         header.is_some_and(|h| h.features & crate::index::graph::EDGE_ID_FEATURE != 0),
+        sup,
     )
 }
 /// The typed refusal the page-WAL runs before it normalizes or creates
 /// anything. The precise collection error is kept in `detail`; the kernel
 /// sees an opaque refusal.
 fn typed_check(s: &PageWalStore, detail: &RefCell<Option<Error>>) -> kernel::Result<()> {
-    match read_header(s).and_then(|h| validate_features(s, h.indexes)) {
+    match read_header_any(s).and_then(|(h, sup)| validate_features(s, h.indexes, sup.as_ref())) {
         Ok(()) => Ok(()),
         Err(e) => {
             *detail.borrow_mut() = Some(e);
@@ -1289,7 +1374,15 @@ impl Database {
         let limits = limits.map(check_limits).transpose()?;
         let store = Backend::create(path, cache, sync, limits)?;
         let mut db = Self::wrap(store, false, limits, None);
-        db.write_header(1, 1)?;
+        if crate::supportive::header::create_switch() {
+            let policy = limits.map(|l| l.encode());
+            db.supportive = Some(crate::supportive::header::Supportive::create(
+                db.writer()?,
+                policy,
+            )?);
+        } else {
+            db.write_header(1, 1)?;
+        }
         db.commit()?;
         Ok(db)
     }
@@ -1311,9 +1404,10 @@ impl Database {
             Ok(s) => s,
             Err(k) => return Err(detail.into_inner().unwrap_or_else(|| Error::from(k))),
         };
-        let h = read_header(store.store())?;
+        let (h, supportive) = read_header_any(store.store())?;
         let mut db = Self::wrap(store, false, h.limits, h.indexes);
-        db.dropping = drop_collection::scan_dropping(db.store.store(), h.indexes)?;
+        db.supportive = supportive;
+        db.dropping = drop_collection::scan_dropping(db.store.store(), h.indexes, db.supportive.as_ref())?;
         if let Some(l) = h.limits {
             db.store.install_limits(l)?;
         }
@@ -1333,11 +1427,13 @@ impl Database {
         let detail = RefCell::new(None);
         let limits = std::cell::Cell::new(None);
         let index_header = std::cell::Cell::new(None);
+        let supportive = RefCell::new(None);
         // The typed check also hands the persisted reader bound to the
         // page-WAL, which enforces it on the slot this handle holds.
         let store = Backend::open_snapshot(path.as_ref(), cache, |s| {
-            match read_header(s).and_then(|h| {
-                validate_features(s, h.indexes)?;
+            match read_header_any(s).and_then(|(h, sup)| {
+                validate_features(s, h.indexes, sup.as_ref())?;
+                *supportive.borrow_mut() = sup;
                 Ok(h)
             }) {
                 Ok(h) => {
@@ -1359,7 +1455,8 @@ impl Database {
             Err(k) => return Err(detail.into_inner().unwrap_or_else(|| Error::from(k))),
         };
         let mut db = Self::wrap(store, true, limits.get(), index_header.get());
-        db.dropping = drop_collection::scan_dropping(db.store.store(), db.index_header)?;
+        db.supportive = supportive.into_inner();
+        db.dropping = drop_collection::scan_dropping(db.store.store(), db.index_header, db.supportive.as_ref())?;
         Ok(db)
     }
     fn wrap(
@@ -1376,10 +1473,16 @@ impl Database {
             sequence: None,
             catalog_cache: RefCell::new(None),
             bound_edge_types: RefCell::new(None),
+            bag_maps: RefCell::new(None),
+            edge_drop_cursor: None,
+            row_id_blocks: BTreeMap::new(),
+            row_id_pending: BTreeMap::new(),
+            edge_id_block: None,
             layout_cache: RefCell::new(None),
             clock: Arc::new(SystemClock),
             limits,
             index_header,
+            supportive: None,
             graph_header_cache: Cell::new(None),
             index_cache: RefCell::new(Vec::new()),
             index_list_cache: RefCell::new(None),
@@ -1706,10 +1809,22 @@ impl Database {
         replicas(|k| store.get(k).map_err(Error::from), keys, parse)
     }
     pub(crate) fn header(&self) -> Result<(u32, u32)> {
+        if let Some(s) = &self.supportive {
+            self.store()?;
+            return Ok((s.fields.next_collection, s.fields.next_layout));
+        }
         let h = self.replicas(|i| vec![0, 0, i], parse_header)?;
         Ok((h.next_collection, h.next_layout))
     }
     pub(crate) fn write_header(&mut self, collection: u32, layout: u32) -> Result<()> {
+        if let Some(mut s) = self.supportive.take() {
+            let index = self.index_header.map(|h| (h.features, h.next));
+            let written = self
+                .writer()
+                .and_then(|w| s.write(w, collection, layout, index));
+            self.supportive = Some(s);
+            return written;
+        }
         let b = header_bytes(HeaderInfo {
             next_collection: collection,
             next_layout: layout,
@@ -1748,16 +1863,20 @@ impl Database {
         if let Some(c) = self.catalog_cache.borrow().as_ref().filter(|c| c.id == id) {
             return Ok(c.clone());
         }
-        let c = self.replicas(
-            |i| replica_key(1, id.0, i),
-            |b| {
-                let c = parse_catalog(b)?;
-                if c.id != id {
-                    return Err(corrupt("catalog identity"));
-                }
-                Ok(c)
-            },
-        )?;
+        let c = match &self.supportive {
+            Some(sup) => register_catalog::read_catalog(self.store()?, sup, id)?
+                .ok_or_else(|| corrupt(format!("table {} has no TABL entry", id.0)))?,
+            None => self.replicas(
+                |i| replica_key(1, id.0, i),
+                |b| {
+                    let c = parse_catalog(b)?;
+                    if c.id != id {
+                        return Err(corrupt("catalog identity"));
+                    }
+                    Ok(c)
+                },
+            )?,
+        };
         // The DROPPING tail and `DROP_FEATURE` are written in one commit and
         // the packet CRC covers the tail, so the two can disagree only through
         // damage. Checking it on a record already in hand costs nothing and
@@ -1790,18 +1909,28 @@ impl Database {
         {
             return Ok(l.clone());
         }
-        let l = self.replicas(
-            |i| layout_key(id, i),
-            |b| {
-                let l = Layout::from_descriptor(b).map_err(corrupt)?;
-                if l.id != u64::from(id)
-                    || l.fields.first() != Some(&(KEY_FIELD.to_owned(), Kind::Text))
-                {
+        let l = match &self.supportive {
+            Some(sup) => {
+                let (_, l) = register_catalog::read_layout(self.store()?, sup, id, None)?
+                    .ok_or_else(|| corrupt(format!("layout {id} has no LAYT entry")))?;
+                if l.fields.first() != Some(&(KEY_FIELD.to_owned(), Kind::Text)) {
                     return Err(corrupt("layout identity/key slot"));
                 }
-                Ok(l)
-            },
-        )?;
+                l
+            }
+            None => self.replicas(
+                |i| layout_key(id, i),
+                |b| {
+                    let l = Layout::from_descriptor(b).map_err(corrupt)?;
+                    if l.id != u64::from(id)
+                        || l.fields.first() != Some(&(KEY_FIELD.to_owned(), Kind::Text))
+                    {
+                        return Err(corrupt("layout identity/key slot"));
+                    }
+                    Ok(l)
+                },
+            )?,
+        };
         let l = Arc::new(l);
         *self.layout_cache.borrow_mut() = Some(l.clone());
         Ok(l)
@@ -1812,6 +1941,18 @@ impl Database {
         self.persist_catalog(c)
     }
     fn persist_catalog(&mut self, c: &Catalog) -> Result<()> {
+        *self.bag_maps.borrow_mut() = None;
+        if let Some(mut sup) = self.supportive.take() {
+            let written = (|| {
+                let w = self.writer()?;
+                let old = register_catalog::read_catalog(w, &sup, c.id)?;
+                register_catalog::write_catalog(w, &mut sup, old.as_ref(), c)
+            })();
+            self.supportive = Some(sup);
+            written?;
+            *self.catalog_cache.borrow_mut() = Some(c.clone());
+            return Ok(());
+        }
         let b = catalog_bytes(c)?;
         for i in 0..3 {
             self.writer()?.put(&replica_key(1, c.id.0, i), &b)?;
@@ -1819,7 +1960,18 @@ impl Database {
         *self.catalog_cache.borrow_mut() = Some(c.clone());
         Ok(())
     }
-    fn persist_layout(&mut self, l: &Layout) -> Result<()> {
+    fn persist_layout(&mut self, l: &Layout, table: CollectionId) -> Result<()> {
+        *self.bag_maps.borrow_mut() = None;
+        if let Some(mut sup) = self.supportive.take() {
+            let written = (|| {
+                l.validate().map_err(invalid)?;
+                register_catalog::write_layout(self.writer()?, &mut sup, table, l)
+            })();
+            self.supportive = Some(sup);
+            written?;
+            *self.layout_cache.borrow_mut() = Some(Arc::new(l.clone()));
+            return Ok(());
+        }
         let b = l.descriptor().map_err(invalid)?;
         for i in 0..3 {
             self.writer()?.put(&layout_key(l.id as u32, i), &b)?;
@@ -1841,9 +1993,11 @@ impl Database {
         }
         let layout = Layout {
             id: u64::from(id),
-            fields: out,
+            fields: out, absent: Default::default(),
         };
-        layout.descriptor().map_err(invalid)?;
+        // The 0.18 descriptor's own 256-column limit is checked where a 0.18
+        // file writes one (`persist_layout`).
+        layout.validate().map_err(invalid)?;
         Ok(layout)
     }
     pub fn create_collection(
@@ -1955,11 +2109,10 @@ impl Database {
             if column_rules::has_constant(&c.rules) {
                 self.enable_logical_feature(column_rules::CONSTANT_DEFAULT_FEATURE)?;
             }
-            self.persist_layout(&layout)?;
+            self.persist_layout(&layout, c.id)?;
             self.persist_catalog(&c)?;
             self.write_sequence(c.id, 1)?;
-            self.writer()?
-                .put(&name_key_in(c.schema.as_deref(), name), &cid.to_be_bytes())?;
+            self.put_table_name(c.schema.as_deref(), name, c.id)?;
             // A collection that has just been created holds no rows, so its
             // live count is 0 and needs no walk to establish. The record and
             // `ROW_COUNT_FEATURE` ride this same transaction, which is what
@@ -1997,12 +2150,109 @@ impl Database {
         let old = std::mem::replace(&mut c.name, name.to_owned());
         let result = (|| {
             self.persist_catalog(&c)?;
-            self.writer()?
-                .put(&name_key_in(schema.as_deref(), name), &id.0.to_be_bytes())?;
-            self.writer()?.delete(&name_key_in(schema.as_deref(), &old))?;
+            self.put_table_name(schema.as_deref(), name, id)?;
+            self.delete_table_name(schema.as_deref(), &old)?;
             Ok(())
         })();
         self.finish(result)
+    }
+    /// A supportive value: on a Register file the entry `key` (version 1),
+    /// on a 0.18 file the primary-tree key `legacy`.
+    pub(crate) fn entry_get(
+        &self,
+        key: &crate::supportive::carrier::Key,
+        legacy: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let store = self.store()?;
+        match &self.supportive {
+            Some(sup) => match sup.register.get(store, key)? {
+                Some((1, p)) => Ok(Some(p)),
+                Some(_) => Err(corrupt("Register entry version")),
+                None => Ok(None),
+            },
+            None => Ok(store.get(legacy)?),
+        }
+    }
+    pub(crate) fn entry_put(
+        &mut self,
+        key: &crate::supportive::carrier::Key,
+        line: crate::supportive::carrier::CensusLine,
+        legacy: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        if let Some(mut sup) = self.supportive.take() {
+            let r = self.writer().and_then(|w| sup.put(w, key, line, value));
+            self.supportive = Some(sup);
+            return r;
+        }
+        self.writer()?.put(legacy, value)?;
+        Ok(())
+    }
+    pub(crate) fn entry_delete(
+        &mut self,
+        key: &crate::supportive::carrier::Key,
+        legacy: &[u8],
+    ) -> Result<()> {
+        if let Some(mut sup) = self.supportive.take() {
+            let r = self.writer().and_then(|w| sup.delete(w, key).map(|_| ()));
+            self.supportive = Some(sup);
+            return r;
+        }
+        self.writer()?.delete(legacy)?;
+        Ok(())
+    }
+    /// A table's row sequence, from either format.
+    fn read_sequence(&self, c: CollectionId) -> Result<u64> {
+        if self.supportive.is_some() {
+            let key = crate::supportive::schema::sequence_key(u64::from(c.0));
+            return match self.entry_get(&key, &[])? {
+                Some(p) if p.len() == 8 && p != [0; 8] => Ok(u64::from_be_bytes(p.try_into().unwrap())),
+                _ => Err(corrupt("row sequence NEXT")),
+            };
+        }
+        self.replicas(
+            |i| replica_key(2, c.0, i),
+            |b| {
+                let b = unpack(b, COUNTER_MAGIC)?;
+                if b.len() != 8 {
+                    return Err(corrupt("sequence length"));
+                }
+                let n = u64::from_be_bytes(b.try_into().unwrap());
+                if n == 0 {
+                    return Err(corrupt("zero sequence"));
+                }
+                Ok(n)
+            },
+        )
+    }
+    /// The name -> id entry of a table, in either format.
+    pub(crate) fn put_table_name(&mut self, schema: Option<&str>, name: &str, id: CollectionId) -> Result<()> {
+        if let Some(mut sup) = self.supportive.take() {
+            let r = (|| {
+                let w = self.writer()?;
+                let sid = register_catalog::schema_id(w, &sup, schema)?
+                    .ok_or_else(|| invalid("schema does not exist"))?;
+                register_catalog::put_table_name(w, &mut sup, sid, name, id)
+            })();
+            self.supportive = Some(sup);
+            return r;
+        }
+        self.writer()?.put(&name_key_in(schema, name), &id.0.to_be_bytes())?;
+        Ok(())
+    }
+    pub(crate) fn delete_table_name(&mut self, schema: Option<&str>, name: &str) -> Result<()> {
+        if let Some(mut sup) = self.supportive.take() {
+            let r = (|| {
+                let w = self.writer()?;
+                let sid = register_catalog::schema_id(w, &sup, schema)?
+                    .ok_or_else(|| corrupt("schema nIDX"))?;
+                register_catalog::delete_table_name(w, &mut sup, sid, name)
+            })();
+            self.supportive = Some(sup);
+            return r;
+        }
+        self.writer()?.delete(&name_key_in(schema, name))?;
+        Ok(())
     }
     /// The collection called `name` in `public`.
     pub fn collection(&self, name: &str) -> Result<Option<CollectionId>> {
@@ -2016,13 +2266,24 @@ impl Database {
         {
             return Ok(None);
         }
-        let Some(b) = self.store()?.get(&name_key_in(named, name))? else {
-            return Ok(None);
+        let id = if let Some(sup) = &self.supportive {
+            let store = self.store()?;
+            let Some(schema) = register_catalog::schema_id(store, sup, named)? else {
+                return Ok(None);
+            };
+            match register_catalog::table_id(store, sup, schema, name)? {
+                Some(id) => CollectionId(id),
+                None => return Ok(None),
+            }
+        } else {
+            let Some(b) = self.store()?.get(&name_key_in(named, name))? else {
+                return Ok(None);
+            };
+            if b.len() != 4 {
+                return Err(corrupt("collection-name mapping"));
+            }
+            CollectionId(u32::from_be_bytes(b.try_into().unwrap()))
         };
-        if b.len() != 4 {
-            return Err(corrupt("collection-name mapping"));
-        }
-        let id = CollectionId(u32::from_be_bytes(b.try_into().unwrap()));
         let c = self.catalog(id)?;
         if c.name != name || c.schema.as_deref() != named {
             return Err(corrupt("collection-name identity"));
@@ -2036,6 +2297,9 @@ impl Database {
         }
         if schema.is_empty() || schema.as_bytes().contains(&SCHEMA_MARK) {
             return Ok(false);
+        }
+        if let Some(sup) = &self.supportive {
+            return Ok(register_catalog::schema_id(self.store()?, sup, Some(schema))?.is_some());
         }
         Ok(self.store()?.get(&schema_key(schema))?.is_some())
     }
@@ -2055,6 +2319,13 @@ impl Database {
         self.user_write()?;
         let result = (|| {
             self.enable_logical_feature(SCHEMA_FEATURE)?;
+            if let Some(mut sup) = self.supportive.take() {
+                let r = self
+                    .writer()
+                    .and_then(|w| register_catalog::create_schema(w, &mut sup, schema));
+                self.supportive = Some(sup);
+                return r;
+            }
             self.writer()?.put(&schema_key(schema), &[])?;
             Ok(())
         })();
@@ -2071,6 +2342,23 @@ impl Database {
         }
         if !self.schema_exists(schema)? {
             return Err(invalid(format!("schema `{schema}` does not exist")));
+        }
+        if let Some(sup) = &self.supportive {
+            let store = self.store()?;
+            let id = register_catalog::schema_id(store, sup, Some(schema))?
+                .ok_or_else(|| corrupt("schema nIDX"))?;
+            if let Some((held, _)) = register_catalog::names(store, sup, crate::supportive::schema::NAME_TABLE, id)?.first() {
+                return Err(invalid(format!(
+                    "schema `{schema}` still holds `{held}`: drop its collections first (DROP SCHEMA ... CASCADE is not built)"
+                )));
+            }
+            self.user_write()?;
+            let mut sup = self.supportive.take().unwrap();
+            let r = self
+                .writer()
+                .and_then(|w| register_catalog::drop_schema(w, &mut sup, schema, id));
+            self.supportive = Some(sup);
+            return self.finish(r);
         }
         let mut prefix = schema_key(schema);
         prefix.push(SCHEMA_MARK);
@@ -2094,6 +2382,13 @@ impl Database {
     /// the number of schemas and collections, which the catalog bounds.
     pub fn list_schemas(&self) -> Result<Vec<String>> {
         let mut out = vec![PUBLIC_SCHEMA.to_owned()];
+        if let Some(sup) = &self.supportive {
+            for (name, _) in register_catalog::names(self.store()?, sup, crate::supportive::schema::NAME_SCHEMA, 0)? {
+                out.push(name);
+            }
+            out.sort();
+            return Ok(out);
+        }
         let prefix = [0x10u8, SCHEMA_MARK];
         for row in self.store()?.range(&prefix)? {
             let (k, _) = row?;
@@ -2111,6 +2406,20 @@ impl Database {
     pub fn list_qualified_collections(&self) -> Result<Vec<(String, String)>> {
         let prefix = [0x10u8];
         let mut out = Vec::new();
+        if let Some(sup) = &self.supportive {
+            let store = self.store()?;
+            for (name, _) in register_catalog::names(store, sup, crate::supportive::schema::NAME_TABLE, 0)? {
+                out.push((PUBLIC_SCHEMA.to_owned(), name));
+            }
+            let mut schemas = register_catalog::names(store, sup, crate::supportive::schema::NAME_SCHEMA, 0)?;
+            schemas.sort();
+            for (schema, id) in schemas {
+                for (name, _) in register_catalog::names(store, sup, crate::supportive::schema::NAME_TABLE, id)? {
+                    out.push((schema.clone(), name));
+                }
+            }
+            return Ok(out);
+        }
         for row in self.store()?.range(&prefix)? {
             let (k, _) = row?;
             if !k.starts_with(&prefix) {
@@ -2133,6 +2442,10 @@ impl Database {
         // opens the named schemas; the walk stops there.
         let prefix = [0x10u8];
         let mut out = Vec::new();
+        if let Some(sup) = &self.supportive {
+            let names = register_catalog::names(self.store()?, sup, crate::supportive::schema::NAME_TABLE, 0)?;
+            return Ok(names.into_iter().map(|(n, _)| n).collect());
+        }
         for row in self.store()?.range(&prefix)? {
             let (k, _) = row?;
             if !k.starts_with(&prefix) || k.get(1) == Some(&SCHEMA_MARK) {
@@ -2266,7 +2579,7 @@ impl Database {
             if column_rules::has_constant(&c.rules) {
                 self.enable_logical_feature(column_rules::CONSTANT_DEFAULT_FEATURE)?;
             }
-            self.persist_layout(&layout)?;
+            self.persist_layout(&layout, id)?;
             self.persist_catalog(&c)?;
             self.write_header(next_c, after)?;
             Ok(u64::from(next_l))
@@ -2293,6 +2606,11 @@ impl Database {
         self.alter_collection_rules(id, fields, declared, rules)
     }
     fn write_sequence(&mut self, c: CollectionId, next: u64) -> Result<()> {
+        if self.supportive.is_some() {
+            let key = crate::supportive::schema::sequence_key(u64::from(c.0));
+            let line = crate::supportive::schema::line(b"NEXT", 1, crate::supportive::schema::NEXT_ROW as u32);
+            return self.entry_put(&key, line, &[], &next.to_be_bytes());
+        }
         let b = packet(COUNTER_MAGIC, &next.to_be_bytes())?;
         for i in 0..3 {
             self.writer()?.put(&replica_key(2, c.0, i), &b)?;
@@ -2301,33 +2619,43 @@ impl Database {
     }
     fn flush_sequence(&mut self) -> Result<()> {
         if let Some(s) = self.sequence.take() {
-            self.write_sequence(s.collection, s.next)?;
+            if self.supportive.is_none() {
+                self.write_sequence(s.collection, s.next)?;
+            } else {
+                if s.dirty {
+                    self.write_sequence(s.collection, s.reserved)?;
+                }
+                self.row_id_pending.insert(s.collection, (s.next, s.reserved));
+            }
         }
         Ok(())
     }
     fn allocate(&mut self, c: CollectionId) -> Result<EntityId> {
         if !self.sequence.as_ref().is_some_and(|s| s.collection == c) {
             self.flush_sequence()?;
-            let next = self.replicas(
-                |i| replica_key(2, c.0, i),
-                |b| {
-                    let b = unpack(b, COUNTER_MAGIC)?;
-                    if b.len() != 8 {
-                        return Err(corrupt("sequence length"));
-                    }
-                    let n = u64::from_be_bytes(b.try_into().unwrap());
-                    if n == 0 {
-                        return Err(corrupt("zero sequence"));
-                    }
-                    Ok(n)
-                },
-            )?;
+            let (next, reserved) = match self.row_id_pending.get(&c).or_else(|| self.row_id_blocks.get(&c)) {
+                Some(block) => *block,
+                None => {
+                    let next = self.read_sequence(c)?;
+                    (next, next)
+                }
+            };
             self.sequence = Some(Sequence {
                 collection: c,
                 next,
+                reserved,
+                dirty: false,
             });
         }
+        let register = self.supportive.is_some();
         let s = self.sequence.as_mut().unwrap();
+        if register && s.next >= s.reserved {
+            s.reserved = s
+                .next
+                .checked_add(ROW_ID_BLOCK)
+                .ok_or_else(|| invalid("entity sequence exhausted"))?;
+            s.dirty = true;
+        }
         let sequence = s.next;
         s.next = sequence
             .checked_add(1)
@@ -2354,20 +2682,10 @@ impl Database {
         if let Some(s) = self.sequence.as_ref().filter(|s| s.collection == c) {
             return Ok(s.next);
         }
-        self.replicas(
-            |i| replica_key(2, c.0, i),
-            |b| {
-                let b = unpack(b, COUNTER_MAGIC)?;
-                if b.len() != 8 {
-                    return Err(corrupt("sequence length"));
-                }
-                let n = u64::from_be_bytes(b.try_into().unwrap());
-                if n == 0 {
-                    return Err(corrupt("zero sequence"));
-                }
-                Ok(n)
-            },
-        )
+        if let Some((next, _)) = self.row_id_pending.get(&c).or_else(|| self.row_id_blocks.get(&c)) {
+            return Ok(*next);
+        }
+        self.read_sequence(c)
     }
     /// Extend this collection's allocated range to cover a just-handed-out
     /// identity. `allocate` is the only place sequences are handed out and it
@@ -2647,6 +2965,11 @@ impl Database {
             Ok(value)
         })
         .map_err(corrupt)?;
+        if self.supportive.is_some() && l.fields.iter().any(|(n, _)| columns::is_retired(n)) {
+            if let Some(object) = doc.as_object_mut() {
+                object.retain(|name, _| !columns::is_retired(name));
+            }
+        }
         let key = doc
             .as_object_mut()
             .ok_or_else(|| corrupt("entity object"))?
@@ -2712,6 +3035,10 @@ impl Database {
             // The edge-id allocator, once, beside the ids it handed out.
             self.flush_edge_id_allocator()?;
             self.writer()?.commit()?;
+            // Published: what this transaction reserved and handed out is the
+            // file's now.
+            let pending = std::mem::take(&mut self.row_id_pending);
+            self.row_id_blocks.extend(pending);
             Ok(())
         })();
         self.finish(r)
@@ -2736,8 +3063,12 @@ impl Database {
             return Err(Error::ReadOnly);
         }
         self.sequence = None;
+        self.row_id_pending.clear();
+        self.edge_id_block = None;
         *self.catalog_cache.borrow_mut() = None;
         *self.bound_edge_types.borrow_mut() = None;
+        *self.bag_maps.borrow_mut() = None;
+        self.edge_drop_cursor = None;
         *self.layout_cache.borrow_mut() = None;
         self.graph_header_cache.set(None);
         self.index_cache.borrow_mut().clear();
@@ -2771,10 +3102,11 @@ impl Database {
             self.store.install_limits(l)?;
         }
         self.failed = false;
-        let validation = read_header(self.store.store()).and_then(|h| {
-            validate_features(self.store.store(), h.indexes)?;
+        let validation = read_header_any(self.store.store()).and_then(|(h, sup)| {
+            validate_features(self.store.store(), h.indexes, sup.as_ref())?;
             self.index_header = h.indexes;
-            self.dropping = drop_collection::scan_dropping(self.store.store(), h.indexes)?;
+            self.supportive = sup;
+            self.dropping = drop_collection::scan_dropping(self.store.store(), h.indexes, self.supportive.as_ref())?;
             Ok(())
         });
         self.finish(validation)
@@ -3038,6 +3370,12 @@ mod tests {
             };
             for fail_at in 0..steps {
                 let (t, mut db, c, id) = setup();
+                if operation == "sequence-commit" && db.has_column_ids() {
+                    // A Register file reserves row ids in blocks: a commit
+                    // inside the block writes no counter, so there is no
+                    // write here for a fault to hit (`ROW_ID_BLOCK`).
+                    continue;
+                }
                 if operation == "sequence-commit" {
                     db.put(c, "new", &json!({"v":[3.0,4.0]})).unwrap();
                 }
@@ -3078,6 +3416,8 @@ mod tests {
     }
     #[test]
     fn metadata_replica_loss_and_conflict_fail_safely() {
+        // A 0.18-format property: pinned to that format.
+        crate::supportive::header::FORCE.with(|f| f.set(Some(false)));
         for family in 0..4 {
             for losses in 1..=3 {
                 let (t, db, c, _) = setup();
@@ -3161,6 +3501,8 @@ mod tests {
     }
     #[test]
     fn plain_header_payload_is_the_eight_byte_form_and_future_versions_refuse() {
+        // A 0.18-format property: pinned to that format.
+        crate::supportive::header::FORCE.with(|f| f.set(Some(false)));
         // The PLAIN form is what a database with no logical feature in it
         // carries: a fresh file before its first collection, and every
         // preserved compatibility fixture. A database this build creates a
@@ -3197,6 +3539,8 @@ mod tests {
     }
     #[test]
     fn rootless_collection_recovery_preserves_source_and_reports_vector_limit() {
+        // A 0.18-format property: pinned to that format.
+        crate::supportive::header::FORCE.with(|f| f.set(Some(false)));
         let (t, mut db, c, _) = setup();
         db.put(c, "scalar", &json!({"n":2})).unwrap();
         db.commit().unwrap();

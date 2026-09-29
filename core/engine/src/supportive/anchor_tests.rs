@@ -33,27 +33,27 @@ fn anchor() -> Anchor {
 #[test]
 fn the_anchor_survives_one_damaged_copy() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Database::create(dir.path().join("db"), cfg()).unwrap();
+    let mut db = legacy_create(dir.path().join("db"), cfg()).unwrap();
     let store = db.writer().unwrap();
     write_anchor(store, &anchor()).unwrap();
-    assert_eq!(read_anchor(store).unwrap(), anchor());
+    assert_eq!(read_anchor(store.store()).unwrap(), anchor());
     store.put(&[0, 0, 1], b"damaged").unwrap();
-    assert_eq!(read_anchor(store).unwrap(), anchor(), "copies 0 and 2 win");
+    assert_eq!(read_anchor(store.store()).unwrap(), anchor(), "copies 0 and 2 win");
     store.put(&[0, 0, 0], b"damaged").unwrap();
     store.put(&[0, 0, 2], b"damaged").unwrap();
-    assert!(matches!(read_anchor(store), Err(Error::Corrupt(_))));
+    assert!(matches!(read_anchor(store.store()), Err(Error::Corrupt(_))));
 }
 
 #[test]
 fn a_newer_register_format_is_refused_by_name() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Database::create(dir.path().join("db"), cfg()).unwrap();
+    let mut db = legacy_create(dir.path().join("db"), cfg()).unwrap();
     let store = db.writer().unwrap();
     write_anchor(store, &anchor()).unwrap();
     let mut payload = anchor().encode().unwrap();
     payload[..2].copy_from_slice(&2u16.to_be_bytes());
     store.put(&[0, 0, 0], &packet(ANCHOR_MAGIC, &payload).unwrap()).unwrap();
-    match read_anchor(store) {
+    match read_anchor(store.store()) {
         Err(Error::Unsupported(m)) => assert!(m.contains("Register format 2"), "{m}"),
         other => panic!("{other:?}"),
     }
@@ -69,7 +69,7 @@ fn the_released_0185_binary_refuses_an_anchored_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     {
-        let mut db = Database::create(&path, cfg()).unwrap();
+        let mut db = legacy_create(&path, cfg()).unwrap();
         let store = db.writer().unwrap();
         write_anchor(store, &anchor()).unwrap();
         db.commit().unwrap();
@@ -95,4 +95,11 @@ mod files {
         out.sort();
         out
     }
+}
+
+/// These tests build the carrier by hand on a 0.18-format file, whose
+/// header keys and tree ids are free.
+fn legacy_create(path: impl AsRef<std::path::Path>, config: Config) -> crate::collections::Result<Database> {
+    super::header::FORCE.with(|f| f.set(Some(false)));
+    Database::create(path, config)
 }

@@ -147,6 +147,16 @@ impl Key {
         Ok(k)
     }
 
+    /// The key bytes every entry of one kind under one owner starts with.
+    pub(crate) fn prefix(node: Node, owner_class: OwnerClass, owner_id: u64, kind: Kind) -> Vec<u8> {
+        let mut k = Vec::with_capacity(16);
+        k.push(node.byte());
+        k.push(owner_class as u8);
+        ordered_into(&mut k, owner_id);
+        k.extend_from_slice(&kind.0);
+        k
+    }
+
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         let node = bytes.first().copied().and_then(Node::from_byte).ok_or_else(|| corrupt("Register key node"))?;
         let owner_class =

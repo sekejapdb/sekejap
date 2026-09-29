@@ -373,8 +373,13 @@ fn an_ascending_edge_run_reaches_its_leaves_without_descending() {
         "the per-keyspace hint served only {served} of the {} puts an edge makes",
         EDGES * 4
     );
+    // 6.0 until 0.19. NAMED COST (2026-09-29): a 0.19-format file keeps no
+    // metadata record in the primary tree, so its leaf boundaries fall
+    // elsewhere and the per-keyspace hint misses a little more often (331
+    // misses in 8,000 puts against 274): 6.18 page accesses against 5.93.
+    // An edge write does no Register read or write (counted: none per edge).
     assert!(
-        pages <= 6.0,
+        pages <= 6.25,
         "an edge over four ascending runs took {pages:.2} page accesses; four hinted \
          appends are four, and before the hint two descents alone were about 8.7"
     );

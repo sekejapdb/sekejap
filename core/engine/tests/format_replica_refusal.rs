@@ -69,6 +69,9 @@ fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
 
 #[test]
 fn one_future_typed_replica_refuses_before_any_open_mutation() {
+    // It writes and reads 0.18-format header or descriptor bytes: pinned
+    // to that format (a Register file's are `supportive::*_tests`).
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let tmp = tempfile::tempdir().unwrap();
     for copy in 0..3 {
         let path = tmp.path().join(format!("typed-{copy}"));

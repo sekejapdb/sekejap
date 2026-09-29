@@ -133,7 +133,7 @@ pub fn recover_typed_candidates(
             if codec.classify(r.key) == RecordClass::Layout {
                 match reader.read_value(r, 2081) {
                     Ok(bytes) => match Layout::from_descriptor(&bytes) {
-                        Ok(layout) => catalog.insert(&layout, &bytes, r, &mut report)?,
+                        Ok(layout) => catalog.insert(&layout, &bytes, (r.page_no, r.slot), &mut report)?,
                         Err(error) => {
                             report.invalid_descriptors += 1;
                             line(&mut issues, &json!({"kind":"invalid_descriptor","page":r.page_no,"key_hex":hex(r.key),"reason":error.to_string()}))?;
@@ -149,6 +149,7 @@ pub fn recover_typed_candidates(
         }
         Ok(())
     })?;
+    register_layouts(&reader, &catalog, &mut report, &mut issues)?;
     let mut raw = output(&destination.join("records.raw"))?;
     let mut unresolved = output(&destination.join("unresolved.raw"))?;
     raw.write_all(b"E4ROWS01")?;
@@ -309,7 +310,7 @@ impl Catalog {
         &self,
         layout: &Layout,
         bytes: &[u8],
-        r: LeafCandidate<'_>,
+        (page_no, slot): (u32, usize),
         report: &mut SchemaRecoveryReport,
     ) -> Result<()> {
         let primary = self.path(layout.id, "layout");
@@ -326,7 +327,7 @@ impl Catalog {
                 }
                 let path = self.path(
                     layout.id,
-                    &format!("page{}-slot{}.candidate", r.page_no, r.slot),
+                    &format!("page{page_no}-slot{slot}.candidate"),
                 );
                 let mut f = output(&path)?;
                 f.write_all(bytes)?;
@@ -441,4 +442,96 @@ pub fn visit_raw_records(
         count += 1;
     }
     Ok(count)
+}
+
+/// A Register file keeps its layouts as `LAYT` entries naming column ids,
+/// and the columns' names in `COLM` (`docs/core/SUPPORTIVE.md` 2.c), in the
+/// Register's copy-0 tree. Salvage scans that tree's leaves as it scans the
+/// primary tree's, keeps the newest generation of each entry, and turns each
+/// complete layout into the descriptor the rest of the salvage reads.
+fn register_layouts(
+    reader: &kernel::recover::CandidateReader,
+    catalog: &Catalog,
+    report: &mut SchemaRecoveryReport,
+    issues: &mut BufWriter<File>,
+) -> Result<()> {
+    use crate::supportive::carrier::{decode_value, Item, Key, MAX_VALUE, REGISTER_TREES};
+    use crate::supportive::schema::{kind, kind_from, Column, LayoutPart};
+    use std::collections::BTreeMap;
+    let mut columns: BTreeMap<(u64, u64), (u64, Column)> = BTreeMap::new();
+    let mut parts: BTreeMap<(u64, u8), (u64, LayoutPart, (u32, usize))> = BTreeMap::new();
+    let (colm, layt) = (kind(b"COLM"), kind(b"LAYT"));
+    reader.scan::<Box<dyn std::error::Error>>(REGISTER_TREES[0], |event| {
+        let LeafEvent::Record(r) = event else { return Ok(()) };
+        let Ok(key) = Key::decode(r.key) else { return Ok(()) };
+        if key.kind != colm && key.kind != layt {
+            return Ok(());
+        }
+        let value = match reader.read_value(r, MAX_VALUE) {
+            Ok(v) => v,
+            Err(kernel::Error::Io(e)) => return Err(e.into()),
+            Err(_) => return Ok(()),
+        };
+        let Ok((1, payload)) = decode_value(r.key, &value) else {
+            report.invalid_descriptors += 1;
+            line(issues, &json!({"kind":"invalid_register_entry","page":r.page_no,"key_hex":hex(r.key)}))?;
+            return Ok(());
+        };
+        match (key.item, key.kind == colm) {
+            (Item::Id(id), true) => {
+                if let Ok(c) = Column::decode(payload) {
+                    let slot = columns.entry((key.owner_id, id)).or_insert((0, c.clone()));
+                    if r.generation >= slot.0 {
+                        *slot = (r.generation, c);
+                    }
+                }
+            }
+            (Item::Part { id, part }, false) => {
+                if let Ok(p) = LayoutPart::decode(payload) {
+                    let at = (r.page_no, r.slot);
+                    let slot = parts.entry((id, part)).or_insert((0, p.clone(), at));
+                    if r.generation >= slot.0 {
+                        *slot = (r.generation, p, at);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    let mut layout_ids: Vec<u64> = parts.keys().map(|(id, _)| *id).collect();
+    layout_ids.dedup();
+    for id in layout_ids {
+        let mut fields = Vec::new();
+        let mut first = None;
+        let mut complete = true;
+        for part in 0..=u8::MAX {
+            let Some((_, p, at)) = parts.get(&(id, part)) else { break };
+            first.get_or_insert((p.table, *at));
+            for (col, code, dim) in &p.slots {
+                let name = match columns.get(&(u64::from(p.table), *col)) {
+                    Some((_, c)) if c.live => c.name.clone(),
+                    Some(_) => crate::collections::retired_column_name(*col),
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                };
+                match kind_from(*code, *dim) {
+                    Ok(k) => fields.push((name, k)),
+                    Err(_) => complete = false,
+                }
+            }
+        }
+        let Some((_, at)) = first else { continue };
+        let layout = Layout { id, fields, absent: Default::default() };
+        match (complete, layout.descriptor()) {
+            (true, Ok(bytes)) => catalog.insert(&layout, &bytes, at, report)?,
+            _ => {
+                report.invalid_descriptors += 1;
+                line(issues, &json!({"kind":"incomplete_register_layout","layout_id":id}))?;
+            }
+        }
+    }
+    Ok(())
 }

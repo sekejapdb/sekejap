@@ -105,6 +105,9 @@ fn assert_refused_unchanged(path: &Path, unsupported: bool) {
 
 #[test]
 fn one_intact_future_index_encoding_replica_refuses_before_mutation() {
+    // It writes and reads 0.18-format header or descriptor bytes: pinned
+    // to that format (a Register file's are `supportive::*_tests`).
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     for copy in 0..3u8 {
         let path = temp.path().join(format!("future-index-{copy}"));
@@ -147,6 +150,9 @@ fn one_intact_future_index_encoding_replica_refuses_before_mutation() {
 /// source byte moves, live and snapshot alike (Law 8, then Law 5).
 #[test]
 fn a_version_three_descriptor_without_its_feature_bit_is_refused_before_mutation() {
+    // It writes and reads 0.18-format header or descriptor bytes: pinned
+    // to that format (a Register file's are `supportive::*_tests`).
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     for copy in 0..3u8 {
         let path = temp.path().join(format!("expression-unadmitted-{copy}"));
@@ -213,6 +219,9 @@ fn a_version_three_descriptor_without_its_feature_bit_is_refused_before_mutation
 
 #[test]
 fn one_intact_unknown_logical_feature_replica_refuses_before_mutation() {
+    // It writes and reads 0.18-format header or descriptor bytes: pinned
+    // to that format (a Register file's are `supportive::*_tests`).
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     for copy in 0..3u8 {
         let path = temp.path().join(format!("future-feature-{copy}"));
@@ -233,6 +242,9 @@ fn one_intact_unknown_logical_feature_replica_refuses_before_mutation() {
 
 #[test]
 fn missing_registry_or_intact_orphan_descriptor_is_not_silently_ignored() {
+    // It writes and reads 0.18-format header or descriptor bytes: pinned
+    // to that format (a Register file's are `supportive::*_tests`).
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     for missing_registry in [false, true] {
         let path = temp.path().join(format!("orphan-{missing_registry}"));
@@ -256,6 +268,9 @@ fn missing_registry_or_intact_orphan_descriptor_is_not_silently_ignored() {
 
 #[test]
 fn damaged_future_descriptor_replica_falls_back_to_intact_siblings() {
+    // It writes and reads 0.18-format header or descriptor bytes: pinned
+    // to that format (a Register file's are `supportive::*_tests`).
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     for copy in 0..3u8 {
         let path = temp.path().join(format!("damaged-{copy}"));

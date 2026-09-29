@@ -110,6 +110,10 @@ fn assert_unsupported_unchanged(path: &Path) {
 
 #[test]
 fn a_fresh_database_never_carries_the_geometry_bit_until_a_geometry_index_is_created() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("no-geometry-yet");
     let mut db = Database::create(&path, cfg()).unwrap();
@@ -153,6 +157,10 @@ fn a_fresh_database_never_carries_the_geometry_bit_until_a_geometry_index_is_cre
 
 #[test]
 fn clearing_the_geometry_feature_cannot_hide_descriptor_or_postings() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("hidden-geometry-family");
     let mut db = Database::create(&path, cfg()).unwrap();

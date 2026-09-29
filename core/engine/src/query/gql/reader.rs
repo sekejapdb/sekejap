@@ -26,9 +26,9 @@ use super::super::{
 };
 use super::budget::GqlMeter;
 use super::value::{BindingValue, EdgeRef, NodeRef};
-use crate::collections::{row_key, Database, Error, IndexId, ProjectedValue, KEY_FIELD};
+use crate::collections::{row_key, Database, IndexId, ProjectedValue, KEY_FIELD};
 use crate::index::graph::adjacency::primary_posting;
-use crate::index::graph::{decode_properties, read_name};
+use crate::index::graph::decode_properties;
 use crate::index::text::TextMatch;
 use crate::{dense_v3, Kind};
 use serde_json::Value;
@@ -116,12 +116,20 @@ impl<'db> ElementReader<'db> {
         edge: &EdgeRef,
         meter: &mut GqlMeter<'_, C>,
     ) -> QueryResult<Arc<Value>> {
+        let map = self.db.bag_map(edge.key.edge_type)?;
         if let Some(bag) = &edge.bag {
-            return Ok(Arc::clone(bag));
+            return Ok(match map {
+                Some(m) => Arc::new(m.names(bag)),
+                None => Arc::clone(bag),
+            });
         }
         meter.charge(WorkResource::GraphEdges, 1)?;
         let bytes = primary_posting(self.db, edge.key, edge.id)?;
-        Ok(Arc::new(decode_properties(&bytes)?))
+        let bag = decode_properties(&bytes)?;
+        Ok(Arc::new(match map {
+            Some(m) => m.names(&bag),
+            None => bag,
+        }))
     }
 
     /// Property `name` of `edge`, by its JSON kind: `Null` when the bag does
@@ -159,13 +167,7 @@ impl<'db> ElementReader<'db> {
 
     /// An edge's label: the name of its type.
     pub fn edge_label(&self, edge: &EdgeRef) -> QueryResult<String> {
-        let store = self.db.store()?;
-        let name = read_name(
-            |key| store.get(key).map_err(Error::from),
-            0,
-            edge.key.edge_type.0,
-        )?;
-        Ok(name.name)
+        Ok(self.db.graph_name_of(0, edge.key.edge_type.0)?)
     }
 
     /// Does `node`'s text, as text index `index` holds it, match `query`

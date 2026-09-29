@@ -337,7 +337,6 @@ fn what_is_not_mapped_is_refused_by_name() {
         "references",
     );
     refused(db.sql("CREATE INDEX ON performed (venue)", &[]), "edge table");
-    refused(db.sql("DROP TABLE performed", &[]), "edge table");
     refused(db.sql("DROP TABLE song", &[]), "references it");
     refused(
         db.sql("CREATE PROPERTY GRAPH g2 EDGE TABLES (covered SOURCE KEY (artist_id) REFERENCES artist (_key) DESTINATION KEY (song_id) REFERENCES song (_key) PROPERTIES (x))", &[]),
@@ -407,7 +406,7 @@ fn an_end_that_names_no_row_matches_no_edge() {
 }
 
 #[test]
-fn alter_table_leaves_an_edge_tables_columns_alone() {
+fn alter_table_changes_an_edge_tables_properties_and_keeps_its_ends() {
     let dir = TempDir::new().unwrap();
     let mut db = db(&dir);
     for sql in [
@@ -420,17 +419,18 @@ fn alter_table_leaves_an_edge_tables_columns_alone() {
     ] {
         run(&mut db, sql);
     }
-    for sql in [
-        "ALTER TABLE link RENAME COLUMN src TO origin",
-        "ALTER TABLE link RENAME COLUMN w TO weight",
-        "ALTER TABLE link DROP COLUMN w",
-        "ALTER TABLE link DROP COLUMN dst",
-        "ALTER TABLE link ADD COLUMN note TEXT NOT NULL",
-        "ALTER TABLE link ALTER COLUMN w TYPE BIGINT",
-    ] {
+    // The ends and the key are each edge's identity (0.19, column ids).
+    for sql in ["ALTER TABLE link RENAME COLUMN src TO origin", "ALTER TABLE link DROP COLUMN dst"] {
         refused(db.sql(sql, &[]), "edge table");
         let _ = db.sql("ROLLBACK", &[]);
     }
+    // A NOT NULL column with no DEFAULT would be false on every edge there.
+    assert!(db.sql("ALTER TABLE link ADD COLUMN note TEXT NOT NULL", &[]).is_err());
+    let _ = db.sql("ROLLBACK", &[]);
+    // A property column changes like any table's column.
+    run(&mut db, "ALTER TABLE link RENAME COLUMN w TO weight");
+    run(&mut db, "ALTER TABLE link ALTER COLUMN weight TYPE BIGINT");
+    run(&mut db, "ALTER TABLE link RENAME COLUMN weight TO w");
     let want = sorted_texts(vec![
         vec![SqlValue::Text("a".into()), SqlValue::Text("b".into()), SqlValue::Int(1)],
         vec![SqlValue::Text("a".into()), SqlValue::Text("c".into()), SqlValue::Int(2)],

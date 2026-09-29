@@ -540,6 +540,10 @@ fn late_build_tracks_historical_vector_ordinals_across_layout_reorder() {
 
 #[test]
 fn unknown_quantizer_options_family_or_version_refuses_before_source_mutation() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     for damage in 0..4u8 {
         let path = temp.path().join(format!("unknown-quantized-{damage}"));

@@ -100,9 +100,12 @@ fn a_constant_that_cannot_hold_is_refused_by_name() {
     run(&mut db, "CREATE TABLE e (_key TEXT PRIMARY KEY, name TEXT)");
     run(&mut db, "INSERT INTO e (_key, name) VALUES ('e1', 'x')");
     run(&mut db, "COMMIT");
-    match db.sql("ALTER TABLE e ADD COLUMN role TEXT DEFAULT 'member'", &[]) {
-        Err(e) => assert!(e.to_string().contains("DEFAULT"), "{e}"),
-        Ok(r) => panic!("refused by name, not {r:?}"),
+    // 0.19 (F2): the row already there reads the DEFAULT, as PostgreSQL
+    // shows it; no row is rewritten.
+    run(&mut db, "ALTER TABLE e ADD COLUMN role TEXT DEFAULT 'member'");
+    match db.sql("SELECT role FROM e WHERE _key = 'e1'", &[]).unwrap() {
+        SqlResult::Rows { rows, .. } => assert_eq!(rows[0].values[0], SqlValue::Text("member".into())),
+        other => panic!("{other:?}"),
     }
     // On an empty table there is no old row to disagree.
     run(&mut db, "CREATE TABLE f (_key TEXT PRIMARY KEY)");

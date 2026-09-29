@@ -144,6 +144,10 @@ fn walk(db: &Database, c: CollectionId) -> u64 {
 /// record on disk must equal the map's length, and so must the walk.
 #[test]
 fn the_record_equals_a_btree_map_of_live_keys_through_every_write_shape() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, c, ix_n, ix_tag) = open_indexed(&path);
@@ -254,6 +258,10 @@ fn the_record_equals_a_btree_map_of_live_keys_through_every_write_shape() {
 /// record with it and touches no other.
 #[test]
 fn each_collection_owns_one_record_and_a_drop_removes_exactly_that_one() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, first) = open(&path);
@@ -293,6 +301,10 @@ fn each_collection_owns_one_record_and_a_drop_removes_exactly_that_one() {
 /// discards it with the rows it was counting.
 #[test]
 fn a_rollback_discards_the_delta_with_the_rows_it_was_counting() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, c) = open(&path);
@@ -324,6 +336,10 @@ fn a_rollback_discards_the_delta_with_the_rows_it_was_counting() {
 /// COMMITTED pair and never a count that is off by one.
 #[test]
 fn a_handle_dropped_without_a_commit_leaves_the_count_the_last_commit_left() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, c) = open(&path);
@@ -408,6 +424,10 @@ fn strip_row_counts(path: &Path) {
 /// feature word does not move.
 #[test]
 fn a_database_whose_bit_is_clear_gains_no_key_and_no_feature_from_a_write() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, c) = open(&path);
@@ -461,6 +481,10 @@ fn a_database_whose_bit_is_clear_gains_no_key_and_no_feature_from_a_write() {
 /// its records. The oracle is this file's own walk.
 #[test]
 fn a_backfill_on_a_bit_clear_database_equals_the_walk() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, c) = open(&path);
@@ -537,6 +561,10 @@ fn a_backfill_on_a_bit_clear_database_equals_the_walk() {
 /// and a delete behind the cursor is taken off the running total.
 #[test]
 fn a_write_during_a_half_finished_backfill_still_lands_on_the_walk() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, c) = open(&path);
@@ -591,6 +619,10 @@ fn a_write_during_a_half_finished_backfill_still_lands_on_the_walk() {
 /// the same rule with `0x2000` itself taken out of the mask.
 #[test]
 fn a_file_declaring_a_bit_this_binary_does_not_implement_is_unsupported() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, c) = open(&path);
@@ -626,6 +658,10 @@ fn a_file_declaring_a_bit_this_binary_does_not_implement_is_unsupported() {
 /// a record someone edited is a named finding rather than a silent answer.
 #[test]
 fn verification_names_a_tampered_record_against_its_own_walk() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, c) = open(&path);
@@ -692,6 +728,10 @@ fn bytes_key(id: u64) -> Vec<u8> {
 /// does, so it is counted by the same arithmetic.
 #[test]
 fn a_cascade_write_pass_moves_the_count_like_every_other_delete() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, c) = open(&path);
@@ -795,6 +835,10 @@ fn a_count_star_reads_the_live_record_and_charges_no_walk() {
 /// posting per row plus the peek that runs off its end.
 #[test]
 fn a_count_star_on_a_bit_clear_database_still_walks_the_mapping_keyspace() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, c) = open(&path);

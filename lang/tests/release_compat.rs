@@ -210,6 +210,8 @@ fn every_preserved_file_is_the_one_the_release_wrote() {
 
 #[test]
 fn every_release_answer_is_this_builds_answer() {
+    // The 0.18 engine path, which 0.19 keeps for 0.18 compatibility only.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     for fx in fixtures() {
         verify(&fx);
         let copy = copy(&fx);
@@ -230,6 +232,8 @@ fn every_release_answer_is_this_builds_answer() {
 
 #[test]
 fn a_release_file_takes_writes_and_reopens() {
+    // The 0.18 engine path, which 0.19 keeps for 0.18 compatibility only.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     for fx in fixtures() {
         let copy = copy(&fx);
         let (recorded, _) = {
@@ -282,6 +286,8 @@ fn a_release_file_takes_writes_and_reopens() {
 
 #[test]
 fn a_release_file_reindexes_to_the_same_answers() {
+    // The 0.18 engine path, which 0.19 keeps for 0.18 compatibility only.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     for fx in fixtures() {
         let copy = copy(&fx);
         let mut db = Database::open(copy.path(), cfg()).unwrap();
@@ -296,6 +302,50 @@ fn a_release_file_reindexes_to_the_same_answers() {
             let (columns, rows) = answer(&mut db, sql);
             assert_eq!(columns, query["columns"], "{}: `{sql}` columns", label(&fx));
             assert_eq!(rows, query["rows"].as_array().unwrap().clone(), "{}: after REINDEX: `{sql}`", label(&fx));
+        }
+        verify(&fx);
+    }
+}
+
+/// `sekejap-upgrade` (`docs/core/SUPPORTIVE.md` section 3): a file a released
+/// 0.18 binary wrote becomes a Register file that answers every recorded
+/// query as the release did, takes the column changes only column ids make
+/// possible, and the source is left byte for byte as it was.
+#[test]
+fn a_release_file_upgrades_to_a_register_file_with_the_same_answers() {
+    use sekejap_core::collections::rebuild::{upgrade_to_register, RebuildLimits};
+    for fx in fixtures() {
+        let copy = copy(&fx);
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("upgraded");
+        upgrade_to_register(copy.path(), &dest, RebuildLimits::default())
+            .unwrap_or_else(|e| panic!("{}: upgrade: {e}", label(&fx)));
+        let mut db = Database::open(&dest, cfg()).unwrap_or_else(|e| panic!("{}: open: {e}", label(&fx)));
+        assert!(db.has_column_ids(), "{}: the upgraded file has no column ids", label(&fx));
+        for query in expected(&fx) {
+            let sql = query["sql"].as_str().unwrap();
+            let (columns, rows) = answer(&mut db, sql);
+            assert_eq!(columns, query["columns"], "{}: upgraded: `{sql}` columns", label(&fx));
+            assert_eq!(rows, query["rows"].as_array().unwrap().clone(), "{}: upgraded: `{sql}`", label(&fx));
+        }
+        db.sql("ALTER TABLE place RENAME COLUMN visits TO visitors", &[])
+            .unwrap_or_else(|e| panic!("{}: RENAME COLUMN: {e}", label(&fx)));
+        let (_, rows) = answer(&mut db, "SELECT _key FROM place WHERE visitors >= 0 ORDER BY _key LIMIT 1");
+        assert_eq!(rows.len(), 1, "{}: the renamed column answers", label(&fx));
+        drop(db);
+        verify(&fx);
+    }
+}
+
+/// 0.19 opens no 0.18-format file until it is moved (`sekejap-upgrade`), and
+/// says so by name before it touches a byte.
+#[test]
+fn a_release_file_is_refused_by_name_until_upgraded() {
+    for fx in fixtures() {
+        let copy = copy(&fx);
+        match Database::open(copy.path(), cfg()) {
+            Err(e) => assert!(e.to_string().contains("sekejap-upgrade"), "{}: {e}", label(&fx)),
+            Ok(_) => panic!("{}: a 0.18-format file opened without an upgrade", label(&fx)),
         }
         verify(&fx);
     }

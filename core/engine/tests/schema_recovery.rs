@@ -36,7 +36,7 @@ fn layout(id: u64) -> Layout {
     if id == 2 {
         fields.push(("created".into(), Kind::Int));
     }
-    Layout { id, fields }
+    Layout { id, fields, absent: Default::default() }
 }
 fn document(id: u16) -> Value {
     let mut d = json!({"name":format!("Person 東京 {id}"),"age":i64::from(id % 100)-10,

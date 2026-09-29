@@ -48,6 +48,27 @@ pub mod internal {
         admit_logical_features, logical_features, next_layout_id, parse_uuid, random_bytes, sha1,
     };
     pub use crate::query::EDGE_FIELD_PREFIX;
+
+    /// For a test that reads or edits 0.18-format bytes: while the guard
+    /// lives, databases this process creates are 0.18-format files; the
+    /// setting before it is restored when it drops, so no later test is
+    /// changed by it.
+    pub struct LegacyFormat(Option<std::ffi::OsString>);
+    impl LegacyFormat {
+        pub fn pin() -> Self {
+            let before = std::env::var_os("SEKEJAP_CREATE_REGISTER");
+            std::env::set_var("SEKEJAP_CREATE_REGISTER", "0");
+            Self(before)
+        }
+    }
+    impl Drop for LegacyFormat {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("SEKEJAP_CREATE_REGISTER", v),
+                None => std::env::remove_var("SEKEJAP_CREATE_REGISTER"),
+            }
+        }
+    }
 }
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -62,10 +83,32 @@ pub enum Kind {
     Point,
     Vector(usize),
 }
-#[derive(Clone, Debug, PartialEq)]
+/// The most columns one table may have (`docs/core/SUPPORTIVE.md` 2.c).
+pub const MAX_COLUMNS: usize = 1600;
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Layout {
     pub id: u64,
     pub fields: Vec<(String, Kind)>,
+    /// F2: what a row of this layout reads for a column added AFTER it with
+    /// a DEFAULT (`docs/core/SUPPORTIVE.md` 2.c). Filled only when the engine
+    /// loads a historical layout of a Register file; never stored, never part
+    /// of the layout's identity.
+    pub absent: Absent,
+}
+/// See [`Layout::absent`].
+#[derive(Clone, Debug, Default)]
+pub struct Absent(pub Option<std::sync::Arc<Vec<(String, serde_json::Value)>>>);
+impl PartialEq for Absent {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Layout {
+    /// The default a row of this layout reads for `field`, when the field is
+    /// a later column added with one.
+    pub(crate) fn absent_default(&self, field: &str) -> Option<&serde_json::Value> {
+        self.absent.0.as_ref()?.iter().find(|(n, _)| n == field).map(|(_, v)| v)
+    }
 }
 pub struct Encoded {
     pub row: Vec<u8>,
@@ -687,9 +730,12 @@ impl Layout {
     /// pairwise instead: no allocation, and fewer comparisons than the set
     /// costs. The set is kept for a wide layout, where the quadratic scan
     /// would be the worse of the two.
+    /// A layout this build can hold: at most 1,600 columns (the owner's
+    /// limit, `docs/core/SUPPORTIVE.md` 2.c). A 0.18 descriptor holds at most
+    /// 256; [`Layout::descriptor`] keeps that limit for the files it writes.
     pub fn validate(&self) -> Result<()> {
-        if self.fields.len() > 256 {
-            return Err("P0 max 256 columns".into());
+        if self.fields.len() > MAX_COLUMNS {
+            return Err(format!("at most {MAX_COLUMNS} columns").into());
         }
         for (i, (name, kind)) in self.fields.iter().enumerate() {
             if matches!(kind,Kind::Vector(n) if *n==0 || *n>16384) {
@@ -711,6 +757,9 @@ impl Layout {
     }
     pub fn descriptor(&self) -> Result<Vec<u8>> {
         self.validate()?;
+        if self.fields.len() > 256 {
+            return Err("P0 max 256 columns".into());
+        }
         let mut b = b"E4P0LAY\0".to_vec();
         uv(self.id, &mut b);
         uv(self.fields.len() as u64, &mut b);
@@ -772,7 +821,7 @@ impl Layout {
         if r.b[r.p..].iter().any(|b| *b != 0) {
             return Err("descriptor padding".into());
         }
-        let l = Self { id, fields };
+        let l = Self { id, fields, absent: Default::default() };
         l.validate()?;
         Ok(l)
     }

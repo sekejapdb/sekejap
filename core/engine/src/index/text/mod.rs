@@ -653,10 +653,19 @@ fn encode_corpus(corpus: Corpus) -> [u8; 16] {
     bytes
 }
 
+/// Write a text index's corpus totals: `tCRP` on a Register file.
+pub(crate) fn put_corpus(db: &mut Database, id: IndexId, corpus: Corpus) -> Result<()> {
+    db.entry_put(
+        &crate::supportive::schema::corpus_key(id.0),
+        crate::supportive::schema::line(b"tCRP", 1, 0),
+        &corpus_key(id),
+        &encode_corpus(corpus),
+    )
+}
+
 pub(crate) fn read_corpus(db: &Database, id: IndexId) -> Result<Corpus> {
     let bytes = db
-        .store()?
-        .get(&corpus_key(id))?
+        .entry_get(&crate::supportive::schema::corpus_key(id.0), &corpus_key(id))?
         .ok_or_else(|| corrupt("missing text corpus statistics"))?;
     decode_corpus(&bytes)
 }
@@ -1166,8 +1175,7 @@ fn apply_transition(
         None => {}
     }
     if old_documents != new_documents || indexed_old.length != indexed_new.length {
-        db.writer()?
-            .put(&corpus_key(index.id), &encode_corpus(corpus))?;
+        put_corpus(db, index.id, corpus)?;
     }
     Ok(())
 }
@@ -1319,8 +1327,7 @@ pub(crate) fn build_documents(
         db.writer()?
             .put(&term_stats_key(index.id, term), &df.to_be_bytes())?;
     }
-    db.writer()?
-        .put(&corpus_key(index.id), &encode_corpus(corpus))?;
+    put_corpus(db, index.id, corpus)?;
     Ok(())
 }
 
@@ -1394,12 +1401,13 @@ fn clear_unpublished(db: &mut Database, i: &IndexInfo) -> Result<()> {
     }
     let corpus = read_corpus(db, i.id)?;
     if corpus.documents != 0 || corpus.tokens != 0 {
-        db.writer()?.put(
-            &corpus_key(i.id),
-            &encode_corpus(Corpus {
+        put_corpus(
+            db,
+            i.id,
+            Corpus {
                 documents: 0,
                 tokens: 0,
-            }),
+            },
         )?;
         db.commit()?;
     }
@@ -1744,7 +1752,7 @@ pub(crate) fn build_sorted(
             }
         }
     }
-    db.writer()?.put(&corpus_key(i.id), &encode_corpus(corpus))?;
+    put_corpus(db, i.id, corpus)?;
     i.state = IndexState::Ready;
     db.save_index(i)?;
     db.commit()?;
@@ -1996,12 +2004,13 @@ impl Database {
             IndexFamily::Text,
             TEXT_FEATURE,
         )?;
-        let result = self.writer()?.put(
-            &corpus_key(id),
-            &encode_corpus(Corpus {
+        let result = put_corpus(
+            self,
+            id,
+            Corpus {
                 documents: 0,
                 tokens: 0,
-            }),
+            },
         );
         self.finish(result.map_err(Error::from))?;
         Ok(id)

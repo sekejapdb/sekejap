@@ -46,7 +46,7 @@ fn layout(stamps: bool) -> Layout {
             ("_updated_unix".into(), Kind::Int),
         ]);
     }
-    Layout { id: 1, fields }
+    Layout { id: 1, fields, absent: Default::default() }
 }
 fn person(id: u64) -> Value {
     const FIRST: &[&str] = &[

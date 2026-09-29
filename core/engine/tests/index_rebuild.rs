@@ -178,6 +178,10 @@ fn rebuilds_all_derived_families_and_catalog_references_without_touching_source(
 
 #[test]
 fn authoritative_row_vector_graph_or_declaration_loss_refuses_publication() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     for tag in [0x40, 0x60, 0x71, 3, 6] {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");

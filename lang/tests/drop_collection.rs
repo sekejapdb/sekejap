@@ -731,6 +731,9 @@ fn sql_drop_table_if_exists_and_cascade_end_to_end() {
 
 #[test]
 fn the_drop_removes_exactly_the_collections_records_and_nothing_else() {
+    // The classifier names the 0.18 metadata keyspaces by tag: pinned to
+    // that format.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("db");
     let mut db = Database::create(&path, config()).unwrap();

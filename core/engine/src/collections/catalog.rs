@@ -391,6 +391,11 @@ fn encode_tree(b: &mut Vec<u8>, i: &IndexInfo) -> Result<()> {
     }
 }
 pub(super) fn encode(i: &IndexInfo) -> Result<Vec<u8>> {
+    packet(MAGIC, &encode_body(i)?)
+}
+/// The descriptor without its 0.18 envelope: the body a Register file's
+/// `INDX` entry carries.
+pub(super) fn encode_body(i: &IndexInfo) -> Result<Vec<u8>> {
     if i.tree.is_some() && !matches!(i.family, IndexFamily::Scalar | IndexFamily::SpatialPoint) {
         return Err(invalid("only scalar and spatial indexes own a tree"));
     }
@@ -553,14 +558,16 @@ pub(super) fn encode(i: &IndexInfo) -> Result<Vec<u8>> {
             b.extend(member.as_bytes());
         }
     }
-    packet(MAGIC, &b)
+    Ok(b)
 }
 pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
     if b.len() == PAD && b.starts_with(b"E4IDX") && &b[..8] != MAGIC {
         unpack(b, b[..8].try_into().unwrap())?;
         return Err(Error::Unsupported("index descriptor envelope".into()));
     }
-    let b = unpack(b, MAGIC)?;
+    decode_body(unpack(b, MAGIC)?)
+}
+pub(super) fn decode_body(b: &[u8]) -> Result<IndexInfo> {
     if b.len() < 15 {
         return Err(corrupt("short index descriptor"));
     }
@@ -821,20 +828,64 @@ pub(super) fn read_index(
 }
 /// Called inside writer/snapshot admission, before any WAL normalization.
 /// Streams bounded descriptors, never indexes or entities, with no resident registry.
-pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Result<()> {
+/// The number of indexes in the registry: the index count a Register file
+/// derives rather than stores.
+pub(super) fn registry_count(
+    s: &PageWalStore,
+    sup: Option<&crate::supportive::header::Supportive>,
+) -> Result<u32> {
+    if let Some(sup) = sup {
+        return u32::try_from(super::register_catalog::index_ids(s, sup)?.len()).map_err(corrupt);
+    }
     let mut count = 0u32;
     for row in s.range(&[REGISTRY])? {
-        let (k, v) = row?;
+        let (k, _) = row?;
         if k.first() != Some(&REGISTRY) {
             break;
         }
+        count = count.checked_add(1).ok_or_else(|| corrupt("index count overflow"))?;
+    }
+    Ok(count)
+}
+pub(super) fn validate_catalog(
+    s: &PageWalStore,
+    h: Option<IndexHeader>,
+    sup: Option<&crate::supportive::header::Supportive>,
+) -> Result<()> {
+    let mut count = 0u32;
+    // The registry: every index id, with the table the 0.18 registry names.
+    let mut registry = Vec::new();
+    match sup {
+        Some(sup) => {
+            for id in super::register_catalog::index_ids(s, sup)? {
+                registry.push((id, None));
+            }
+        }
+        None => {
+            for row in s.range(&[REGISTRY])? {
+                let (k, v) = row?;
+                if k.first() != Some(&REGISTRY) {
+                    break;
+                }
+                let mut at = 1;
+                let id = IndexId(read_ordered(&k, &mut at)?);
+                if at != k.len() || v.len() != 4 {
+                    return Err(corrupt("index registry entry"));
+                }
+                registry.push((id, Some(v)));
+            }
+        }
+    }
+    for (id, v) in registry {
         let h = h.ok_or_else(|| corrupt("index registry without feature envelope"))?;
-        let mut at = 1;
-        let id = IndexId(read_ordered(&k, &mut at)?);
-        if at != k.len() || id.0 == 0 || id.0 >= h.next || v.len() != 4 {
+        if id.0 == 0 || id.0 >= h.next {
             return Err(corrupt("index registry entry"));
         }
-        let i = read_index(|k| s.get(k).map_err(Error::from), id)?;
+        let i = match sup {
+            Some(sup) => super::register_catalog::read_index(s, sup, id)?
+                .ok_or_else(|| corrupt("index INDX missing"))?,
+            None => read_index(|k| s.get(k).map_err(Error::from), id)?,
+        };
         if i.family == IndexFamily::ExactVector
             && h.features & crate::index::vector::exact::VECTOR_FEATURE == 0
         {
@@ -891,27 +942,45 @@ pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Resu
                 "per-index tree descriptor without feature admission",
             ));
         }
-        if v != i.collection.0.to_be_bytes() {
-            return Err(corrupt("index registry collection"));
+        match (sup, v) {
+            (Some(sup), _) => {
+                if super::register_catalog::index_id(s, sup, i.collection, &i.name)? != Some(id) {
+                    return Err(corrupt("index catalog mapping"));
+                }
+            }
+            (None, v) => {
+                if v.as_deref() != Some(&i.collection.0.to_be_bytes()[..]) {
+                    return Err(corrupt("index registry collection"));
+                }
+                if s.get(&ckey(i.collection, id))? != Some(vec![])
+                    || s.get(&nkey(i.collection, &i.name))? != Some(ordered(id.0))
+                {
+                    return Err(corrupt("index catalog mapping"));
+                }
+            }
         }
-        if s.get(&ckey(i.collection, id))? != Some(vec![])
-            || s.get(&nkey(i.collection, &i.name))? != Some(ordered(id.0))
-        {
-            return Err(corrupt("index catalog mapping"));
-        }
-        let c = replicas(
-            |k| s.get(k).map_err(Error::from),
-            |copy| replica_key(1, i.collection.0, copy),
-            parse_catalog,
-        )?;
+        let c = match sup {
+            Some(sup) => super::register_catalog::read_catalog(s, sup, i.collection)?
+                .ok_or_else(|| corrupt("indexed collection has no TABL"))?,
+            None => replicas(
+                |k| s.get(k).map_err(Error::from),
+                |copy| replica_key(1, i.collection.0, copy),
+                parse_catalog,
+            )?,
+        };
         if c.id != i.collection {
             return Err(corrupt("indexed collection identity"));
         }
-        let l = replicas(
-            |k| s.get(k).map_err(Error::from),
-            |copy| layout_key(c.layout, copy),
-            |b| Layout::from_descriptor(b).map_err(corrupt),
-        )?;
+        let l = match sup {
+            Some(sup) => super::register_catalog::read_layout(s, sup, c.layout, None)?
+                .ok_or_else(|| corrupt("indexed collection's layout has no LAYT"))?
+                .1,
+            None => replicas(
+                |k| s.get(k).map_err(Error::from),
+                |copy| layout_key(c.layout, copy),
+                |b| Layout::from_descriptor(b).map_err(corrupt),
+            )?,
+        };
         // The layout has to offer the index's SOURCE field. For an
         // expression index that is not `i.kind`: `col->>'m'` reads a `Json`
         // column and stores `Text`.
@@ -954,6 +1023,9 @@ pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Resu
     let mut mapping_count = 0u32;
     let mut last_collection = None;
     let mut collection_count = 0usize;
+    // A Register file keeps no 0.18 index keyspaces: its names are `nIDX`
+    // entries, checked from each index above.
+    let legacy_count = if sup.is_some() { 0 } else { count };
     for row in s.range(&[COLLECTION_INDEX])? {
         let (k, v) = row?;
         if k.first() != Some(&COLLECTION_INDEX) {
@@ -980,7 +1052,7 @@ pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Resu
             .checked_add(1)
             .ok_or_else(|| corrupt("index mapping count overflow"))?;
     }
-    if mapping_count != count {
+    if mapping_count != legacy_count {
         return Err(corrupt("collection index mapping count"));
     }
     let mut name_count = 0u32;
@@ -1005,7 +1077,7 @@ pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Resu
             .checked_add(1)
             .ok_or_else(|| corrupt("index name count overflow"))?;
     }
-    if name_count != count {
+    if name_count != legacy_count {
         return Err(corrupt("index name count"));
     }
     if !h.is_some_and(|header| header.features & crate::index::vector::exact::VECTOR_FEATURE != 0) {
@@ -1155,8 +1227,51 @@ impl Database {
         }
         Ok(found)
     }
+    /// Whether a table already has an index of this name.
+    pub(super) fn index_name_taken(&self, c: CollectionId, name: &str) -> Result<bool> {
+        let s = self.store()?;
+        match &self.supportive {
+            Some(sup) => Ok(super::register_catalog::index_id(s, sup, c, name)?.is_some()),
+            None => Ok(s.get(&nkey(c, name))?.is_some()),
+        }
+    }
+    /// Point an index name at `id`, or remove it (`None`). `created` also
+    /// registers a new index in the 0.18 registry keyspaces, which a Register
+    /// file does not have.
+    pub(super) fn register_index_name(
+        &mut self,
+        c: CollectionId,
+        name: &str,
+        id: Option<IndexId>,
+        created: bool,
+    ) -> Result<()> {
+        if let Some(mut sup) = self.supportive.take() {
+            let r = self.writer().and_then(|w| match id {
+                Some(id) => super::register_catalog::put_index_name(w, &mut sup, c, name, id),
+                None => super::register_catalog::delete_index_name(w, &mut sup, c, name),
+            });
+            self.supportive = Some(sup);
+            return r;
+        }
+        match id {
+            Some(id) => {
+                if created {
+                    self.writer()?.put(&ikey(REGISTRY, id), &c.0.to_be_bytes())?;
+                    self.writer()?.put(&ckey(c, id), &[])?;
+                }
+                self.writer()?.put(&nkey(c, name), &ordered(id.0))?;
+            }
+            None => {
+                self.writer()?.delete(&nkey(c, name))?;
+            }
+        }
+        Ok(())
+    }
     pub fn index_info(&self, id: IndexId) -> Result<IndexInfo> {
         let s = self.store()?;
+        if let Some(sup) = &self.supportive {
+            return super::register_catalog::read_index(s, sup, id)?.ok_or(Error::NotFound("index"));
+        }
         if s.get(&ikey(REGISTRY, id))?.is_none() {
             return Err(Error::NotFound("index"));
         }
@@ -1172,6 +1287,25 @@ impl Database {
     pub(super) fn list_indexes_any(&self, c: CollectionId) -> Result<Vec<IndexInfo>> {
         if self.index_header.is_none() {
             return Ok(vec![]);
+        }
+        if let Some(sup) = &self.supportive {
+            let mut ids: Vec<IndexId> = super::register_catalog::index_names(self.store()?, sup, c)?
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect();
+            ids.sort();
+            if ids.len() > MAX_INDEXES {
+                return Err(corrupt("collection index registry"));
+            }
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                let i = self.index_info(id)?;
+                if i.collection != c {
+                    return Err(corrupt("index collection mismatch"));
+                }
+                out.push(i);
+            }
+            return Ok(out);
         }
         let p = prefix(COLLECTION_INDEX, c);
         let mut out = Vec::new();
@@ -1194,10 +1328,19 @@ impl Database {
         Ok(out)
     }
     pub(crate) fn save_index(&mut self, i: &IndexInfo) -> Result<()> {
-        let b = encode(i)?;
         // Every descriptor write in a live handle passes here, so this is
         // where the write-path descriptor list stops being believable.
         self.index_descriptors_changed();
+        if let Some(mut sup) = self.supportive.take() {
+            let r = (|| {
+                let w = self.writer()?;
+                let old = super::register_catalog::read_index(w, &sup, i.id)?;
+                super::register_catalog::write_index(w, &mut sup, old.as_ref(), i)
+            })();
+            self.supportive = Some(sup);
+            return r;
+        }
+        let b = encode(i)?;
         for copy in 0..3 {
             self.writer()?.put(&dkey(i.id, copy), &b)?;
         }
@@ -1346,7 +1489,7 @@ impl Database {
         if name.is_empty() || name.len() > 128 || field.is_empty() || field.len() > 128 {
             return Err(invalid("index name and field require 1..128 UTF-8 bytes"));
         }
-        if self.store()?.get(&nkey(c, name))?.is_some() {
+        if self.index_name_taken(c, name)? {
             return Err(Error::AlreadyExists);
         }
         if self.list_indexes(c)?.len() >= MAX_INDEXES {
@@ -1361,7 +1504,9 @@ impl Database {
         let id = IndexId(header.next);
         let tree = if with_tree {
             let tree_id = u16::try_from(id.0 + 1)
-                .map_err(|_| invalid("per-index tree identities exhausted"))?;
+                .ok()
+                .filter(|t| self.supportive.is_none() || *t < crate::supportive::carrier::REGISTER_TREES[0])
+                .ok_or_else(|| invalid("per-index tree identities exhausted"))?;
             header.features |= INDEX_TREE_FEATURE;
             Some(IndexTree { id: tree_id, root: 0 })
         } else {
@@ -1409,10 +1554,7 @@ impl Database {
             self.index_header = Some(header);
             self.write_header(nc, nl)?;
             self.save_index(&i)?;
-            self.writer()?
-                .put(&ikey(REGISTRY, id), &c.0.to_be_bytes())?;
-            self.writer()?.put(&ckey(c, id), &[])?;
-            self.writer()?.put(&nkey(c, name), &ordered(id.0))?;
+            self.register_index_name(c, name, Some(id), true)?;
             Ok(id)
         })();
         self.finish(result)
@@ -2457,7 +2599,7 @@ impl Database {
         let name = o.name.clone();
         let temporary = n.name.clone();
         let retired = format!("__reindex_retired_{}", o.id.0);
-        if self.store()?.get(&nkey(c, &retired))?.is_some() {
+        if self.index_name_taken(c, &retired)? {
             return Err(Error::AlreadyExists);
         }
         let result = (|| {
@@ -2466,9 +2608,9 @@ impl Database {
             n.name = name.clone();
             self.save_index(&o)?;
             self.save_index(&n)?;
-            self.writer()?.delete(&nkey(c, &temporary))?;
-            self.writer()?.put(&nkey(c, &name), &ordered(n.id.0))?;
-            self.writer()?.put(&nkey(c, &retired), &ordered(o.id.0))?;
+            self.register_index_name(c, &temporary, None, false)?;
+            self.register_index_name(c, &name, Some(n.id), false)?;
+            self.register_index_name(c, &retired, Some(o.id), false)?;
             self.index_descriptors_changed();
             Ok(())
         })();
@@ -2550,12 +2692,21 @@ impl Database {
                     self.writer()?.tree_free_root(t.id, t.root)?;
                 }
                 self.index_descriptors_changed();
-                for copy in 0..3 {
-                    self.writer()?.delete(&dkey(id, copy))?;
+                if let Some(mut sup) = self.supportive.take() {
+                    let r = self
+                        .writer()
+                        .and_then(|w| super::register_catalog::delete_index(w, &mut sup, &i));
+                    self.supportive = Some(sup);
+                    r?;
+                    self.register_index_name(i.collection, &i.name, None, false)?;
+                } else {
+                    for copy in 0..3 {
+                        self.writer()?.delete(&dkey(id, copy))?;
+                    }
+                    self.writer()?.delete(&ikey(REGISTRY, id))?;
+                    self.writer()?.delete(&ckey(i.collection, id))?;
+                    self.writer()?.delete(&nkey(i.collection, &i.name))?;
                 }
-                self.writer()?.delete(&ikey(REGISTRY, id))?;
-                self.writer()?.delete(&ckey(i.collection, id))?;
-                self.writer()?.delete(&nkey(i.collection, &i.name))?;
                 let mut h = self
                     .index_header
                     .ok_or_else(|| corrupt("missing index header"))?;

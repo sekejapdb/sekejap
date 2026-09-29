@@ -329,17 +329,12 @@ fn select_after_rename_column_shows_the_new_name_and_the_rule_follows_it() {
         got[0][0]
     );
 
-    // And now that the collection holds a row, a second rename is refused by
-    // name, with the codec reason.
-    let error = refuse(&mut db, "ALTER TABLE evt RENAME COLUMN created TO made");
-    assert!(
-        matches!(error, SqlError::Refused { tier: Tier::Three, ref reason, .. }
-            if reason.contains("MISSING") && reason.contains("immutable")
-                || reason.contains("IMMUTABLE")),
-        "{error:?}"
-    );
-    // The refused rename changed nothing.
-    assert_eq!(rows(&mut db, "SELECT * FROM evt").0, ["id", "n", "created"]);
+    // With column ids (0.19) a rename of a column that holds rows is one
+    // column record: the row written above reads under the newest name.
+    run(&mut db, "ALTER TABLE evt RENAME COLUMN created TO made");
+    assert_eq!(rows(&mut db, "SELECT * FROM evt").0, ["id", "n", "made"]);
+    let (_, got) = rows(&mut db, "SELECT made FROM evt WHERE _key = 'b'");
+    assert!(matches!(got[0][0], SqlValue::Text(ref t) if t.starts_with("20")), "{:?}", got[0][0]);
 }
 
 /// `RENAME TO new_name`: one name record. The collection id does not change,
@@ -530,11 +525,9 @@ fn an_alter_form_with_no_atomic_is_refused_and_names_what_there_is() {
     let (_dir, mut db) = open();
     run(&mut db, "CREATE TABLE person (id TEXT PRIMARY KEY, n INT)");
     for (statement, wanted) in [
-        ("ALTER TABLE person ALTER COLUMN n SET NOT NULL", "SET"),
         ("ALTER TABLE person ADD CONSTRAINT c CHECK (n > 0)", "ADD COLUMN"),
         ("ALTER TABLE person OWNER TO bob", "ADD COLUMN"),
         ("ALTER TABLE IF EXISTS person RENAME TO p", "IF EXISTS"),
-        ("ALTER INDEX i RENAME TO j", "ALTER TABLE"),
         (
             "ALTER TABLE person ALTER COLUMN n TYPE TEXT USING n::text",
             "USING",

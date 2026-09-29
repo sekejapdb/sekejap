@@ -126,6 +126,10 @@ fn assert_unsupported_unchanged(path: &Path) {
 
 #[test]
 fn one_intact_unknown_vector_family_or_version_refuses_before_mutation() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     for (future_family, copy) in (0..3u8).flat_map(|copy| [(false, copy), (true, copy)]) {
         let path = temp
@@ -153,6 +157,10 @@ fn one_intact_unknown_vector_family_or_version_refuses_before_mutation() {
 
 #[test]
 fn clearing_vector_feature_cannot_hide_vector_descriptor_or_locators() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("hidden-vector-family");
     fixture(&path);

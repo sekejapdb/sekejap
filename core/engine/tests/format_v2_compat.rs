@@ -451,6 +451,9 @@ fn every_fixture_file_matches_its_manifest_sha256() {
 /// copy of the preserved fixture, never from the original files.
 #[test]
 fn a_snapshot_of_a_copied_fixture_serves_every_expected_entity_and_count() {
+    // A preserved 0.18 corpus, opened as it is: 0.18 compatibility, which
+    // 0.19 keeps for these tests and for `sekejap-upgrade` only.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let root = fixtures_root();
     for fx in load_fixtures(&root) {
         verify_manifest_hashes(&fx);
@@ -468,6 +471,9 @@ fn a_snapshot_of_a_copied_fixture_serves_every_expected_entity_and_count() {
 /// the database's declared required-feature bits.
 #[test]
 fn a_writer_update_insert_delete_commit_checkpoint_reopen_preserves_declared_feature_bits() {
+    // A preserved 0.18 corpus, opened as it is: 0.18 compatibility, which
+    // 0.19 keeps for these tests and for `sekejap-upgrade` only.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let root = fixtures_root();
     for fx in load_fixtures(&root) {
         verify_manifest_hashes(&fx);

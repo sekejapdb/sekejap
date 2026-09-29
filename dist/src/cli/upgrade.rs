@@ -16,6 +16,12 @@
 //! index, its family, its format (`current` or `older`), the file's logical
 //! feature word, and whether each known release can still open the file.
 //!
+//! A database in the 0.18 FORMAT (written by a 0.18 release) is moved to the
+//! 0.19 format first (`docs/core/SUPPORTIVE.md` section 3): `--check` says
+//! so, and `--apply` builds the 0.19 file beside it, verifies it, and swaps
+//! it in, keeping the original directory untouched as
+//! `<db-path>.v018-backup`. 0.19 opens no 0.18-format file until then.
+//!
 //! `--apply` does nothing when nothing is older. Otherwise it takes the
 //! database's writer, copies every file to the backup directory (default
 //! `<db-path>.before-upgrade-<unix seconds>`, refused if it exists), then
@@ -135,6 +141,24 @@ fn run(args: &[String]) -> Result<(), String> {
         _ => return Err(usage.into()),
     };
     let shown = path.display().to_string();
+    let legacy = sekejap_core::collections::upgrade::is_legacy_format(&path)
+        .map_err(|e| format!("read `{shown}`: {e}"))?;
+    if legacy && mode == "--check" {
+        let value = json!({
+            "database": shown,
+            "format": "0.18",
+            "advice": "this file is in the 0.18 format; `sekejap-upgrade --apply` moves it to the 0.19 format, keeping the original directory as the backup",
+        });
+        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        return Ok(());
+    }
+    if legacy {
+        let moved = sekejap_core::collections::upgrade::upgrade_format(&path, Default::default())
+            .map_err(|e| format!("upgrade `{shown}`: {e}"))?;
+        if let Some(moved) = moved {
+            eprintln!("0.19 format: {shown}; the 0.18 original is kept at {}", moved.backup.display());
+        }
+    }
     if mode == "--check" {
         let db = Database::open_snapshot(&path, cfg()).map_err(|e| format!("open `{shown}`: {e}"))?;
         let (value, _) = report(&db, &shown)?;

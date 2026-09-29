@@ -489,6 +489,19 @@ impl Parser {
         match self.word().as_deref() {
             Some("TABLE") => {}
             Some("PROPERTY") => return self.property_graph(GraphMode::Alter),
+            Some(what @ ("INDEX" | "SCHEMA")) => {
+                let index = what == "INDEX";
+                self.bump();
+                let name = self.name()?;
+                self.expect_word("RENAME")?;
+                self.expect_word("TO")?;
+                let to = self.name()?;
+                return Ok(if index {
+                    Stmt::AlterIndex { name, to }
+                } else {
+                    Stmt::AlterSchema { name, to }
+                });
+            }
             Some(other) => {
                 return Err(SqlError::unsupported(format!(
                     "ALTER {other}: ALTER TABLE is the catalog's own; there is no other alterable object"
@@ -585,6 +598,11 @@ impl Parser {
                 let _ = self.eat_word("RESTRICT");
                 Ok(AlterAction::DropColumn { column, if_exists })
             }
+            Some("SET") if self.word_at(1).as_deref() == Some("SCHEMA") => {
+                self.bump();
+                self.bump();
+                Ok(AlterAction::SetSchema { schema: self.name()? })
+            }
             Some("RENAME") => {
                 self.bump();
                 if self.eat_word("TO") {
@@ -602,7 +620,23 @@ impl Parser {
                 self.bump();
                 let _ = self.eat_word("COLUMN");
                 let column = self.name()?;
+                if self.eat_word("DROP") {
+                    if self.eat_word("DEFAULT") {
+                        return Ok(AlterAction::SetDefault { column, default: None });
+                    }
+                    self.expect_word("NOT")?;
+                    self.expect_word("NULL")?;
+                    return Ok(AlterAction::SetNotNull { column, on: false });
+                }
                 if self.eat_word("SET") {
+                    if self.eat_word("DEFAULT") {
+                        let default = self.default_generator()?;
+                        return Ok(AlterAction::SetDefault { column, default });
+                    }
+                    if self.eat_word("NOT") {
+                        self.expect_word("NULL")?;
+                        return Ok(AlterAction::SetNotNull { column, on: true });
+                    }
                     if self.eat_word("DATA") {
                         self.expect_word("TYPE")?;
                     } else {

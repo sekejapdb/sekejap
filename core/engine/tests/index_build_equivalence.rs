@@ -306,6 +306,9 @@ const SPATIAL_HOME: &str = "195919c4b0c7dfdbbcad2c117a6a3d861135d374b45445f72210
 
 #[test]
 fn a_late_build_persists_the_same_bytes_however_it_is_scheduled() {
+    // The pinned digests cover a 0.18 file's index keyspaces, the corpus
+    // record included, which a Register file keeps in its Register.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, s) = seed(&path);
@@ -630,6 +633,9 @@ fn a_text_late_build_pays_the_corpus_row_once_per_chunk() {
 /// oracle constants above were pinned against the unchanged builder.
 #[test]
 fn a_sorted_late_build_keeps_the_pinned_digests() {
+    // The pinned digests cover a 0.18 file's index keyspaces, the corpus
+    // record included, which a Register file keeps in its Register.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut db, s) = seed(&path);
@@ -762,6 +768,9 @@ fn leaf_shape(store: &sekejap_core::pagewal::PageWalStore, tree: u16, no: u32, d
 /// refused on a real database (the frame watermark).
 #[test]
 fn a_bounded_run_build_finishes_under_a_small_allowance_and_keeps_the_pinned_digests() {
+    // The pinned digests cover a 0.18 file's index keyspaces, the corpus
+    // record included, which a Register file keeps in its Register.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     use sekejap_core::collections::verification::{verify_indexed_source, VerificationLimits};
     use sekejap_core::pagewal::PageWalStore;
     use kernel::limits::ResourceLimits;

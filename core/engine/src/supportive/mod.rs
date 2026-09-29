@@ -15,7 +15,9 @@
 
 pub(crate) mod anchor;
 pub(crate) mod carrier;
+pub(crate) mod header;
 pub(crate) mod register;
+pub(crate) mod schema;
 pub(crate) mod verify;
 
 #[cfg(test)]
@@ -25,8 +27,14 @@ mod anchor_tests;
 #[path = "carrier_tests.rs"]
 mod carrier_tests;
 #[cfg(test)]
+#[path = "header_tests.rs"]
+mod header_tests;
+#[cfg(test)]
 #[path = "register_tests.rs"]
 mod register_tests;
+#[cfg(test)]
+#[path = "schema_tests.rs"]
+mod schema_tests;
 #[cfg(test)]
 #[path = "verify_tests.rs"]
 mod verify_tests;

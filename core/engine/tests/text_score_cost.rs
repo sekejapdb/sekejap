@@ -347,6 +347,10 @@ fn scoring_cost(
 
 #[test]
 fn scoring_a_term_that_matches_most_of_the_corpus_costs_one_pass_not_one_per_document() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("bm25_cost");
     let fixture = build(&path);
@@ -460,6 +464,10 @@ fn scoring_a_term_that_matches_most_of_the_corpus_costs_one_pass_not_one_per_doc
 /// against ascending order; correctness must not.
 #[test]
 fn a_driver_that_hands_out_documents_out_of_order_still_scores_them_correctly() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("bm25_unordered");
     let fixture = build(&path);
@@ -499,6 +507,10 @@ fn a_driver_that_hands_out_documents_out_of_order_still_scores_them_correctly() 
 /// removal is worth -- one per returned row, which is `MATCHING`.
 #[test]
 fn a_bm25_page_proves_its_winners_without_one_primary_probe_each() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("bm25_winners");
     let fixture = build(&path);

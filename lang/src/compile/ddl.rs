@@ -502,6 +502,30 @@ impl Compiler<'_> {
     /// `DROP INDEX <name>` resolves a bare name over the whole catalog
     /// (`lang/src/compile/mod.rs::index_named`): a generated name that
     /// duplicates one held elsewhere would make that statement ambiguous.
+    /// `ALTER INDEX name RENAME TO to`: the index is found by name across
+    /// every table; a name two tables share is refused naming them.
+    pub(super) fn rename_index(&self, name: &str, to: &str) -> SqlResult2<WritePlan> {
+        let mut found = Vec::new();
+        for (schema, table) in self.db.list_qualified_collections().map_err(SqlError::from)? {
+            let Some(id) = self.db.collection_in(&schema, &table).map_err(SqlError::from)? else {
+                continue;
+            };
+            for index in self.db.list_indexes(id).map_err(SqlError::from)? {
+                if index.name == name {
+                    found.push((index.id, format!("{schema}.{table}")));
+                }
+            }
+        }
+        match found.as_slice() {
+            [(index, _)] => Ok(WritePlan::RenameIndex { index: *index, to: to.to_owned() }),
+            [] => Err(SqlError::engine(format!("no index named `{name}`"))),
+            many => Err(SqlError::engine(format!(
+                "ALTER INDEX {name}: the name is used on {}; rename it from one table with DROP INDEX and CREATE INDEX",
+                many.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join(", ")
+            ))),
+        }
+    }
+
     fn every_index_name(&self) -> SqlResult2<Vec<String>> {
         let mut out = Vec::new();
         for (schema, name) in self.db.list_qualified_collections().map_err(SqlError::from)? {
@@ -590,9 +614,27 @@ impl Compiler<'_> {
         // edges, not entity rows: a column change would leave the binding on
         // the old layout and see a populated table as empty. Renaming the
         // table itself is safe.
-        if !matches!(action, AlterAction::RenameTable { .. })
-            && self.db.edge_table(collection).map_err(SqlError::from)?.is_some()
-        {
+        let edge_table = self.db.edge_table(collection).map_err(SqlError::from)?;
+        if let (true, Some(edge)) = (self.db.has_column_ids(), &edge_table) {
+            // With column ids an edge table's property columns change like
+            // any table's: a bag keeps each property under its stored token.
+            // The ends and the key are the edge's identity and stay put.
+            let identity = |c: &str| {
+                edge.references.iter().any(|(n, _)| n == c) || edge.key.iter().any(|k| k == c)
+            };
+            let touched = match action {
+                AlterAction::DropColumn { column, .. } => Some(column.as_str()),
+                AlterAction::RenameColumn { from, .. } => Some(from.as_str()),
+                AlterAction::ColumnType { column, .. } => Some(column.as_str()),
+                _ => None,
+            };
+            if let Some(column) = touched.filter(|c| identity(c)) {
+                return Err(SqlError::unsupported(format!(
+                    "ALTER TABLE {table} {}: `{column}` is an end or a key column of edge table `{table}`, part of each edge's identity",
+                    action.written()
+                )));
+            }
+        } else if !matches!(action, AlterAction::RenameTable { .. }) && edge_table.is_some() {
             return Err(SqlError::unsupported(format!(
                 "ALTER TABLE {table} {}: `{table}` is an edge table, whose columns its property graph binding names; recreate it to change them (docs/core/EDGE_TABLES.md)",
                 action.written()
@@ -620,6 +662,7 @@ impl Compiler<'_> {
         let mut rules = info.rules.clone();
         let mut drop_indexes = Vec::new();
         let mut create_indexes: Vec<(String, CompiledIndex)> = Vec::new();
+        let mut missing: Vec<(String, serde_json::Value)> = Vec::new();
         match action {
             AlterAction::RenameTable { to } => {
                 let (schema, _) = crate::split_table(table);
@@ -663,7 +706,27 @@ impl Compiler<'_> {
                     // PostgreSQL shows a constant default on the rows already
                     // there; here they would read MISSING, which is not the
                     // same answer, so it is refused while rows exist.
-                    if matches!(rule.default, Some(DefaultValue::Constant(_)))
+                    if self.db.has_column_ids() && self.any_row(collection)? {
+                        // F2: the rows already there read the DEFAULT, as
+                        // PostgreSQL shows it, with no row rewritten.
+                        let value = match &rule.default {
+                            Some(DefaultValue::Constant(v)) => Some(v.clone()),
+                            // `now()` is one instant for every row already there, as in
+                            // PostgreSQL, where the ALTER evaluates it once.
+                            Some(DefaultValue::Now) => std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .ok()
+                                .map(|d| serde_json::Value::from(d.as_micros() as i64)),
+                            _ => None,
+                        };
+                        if let Some(value) = value {
+                            self.notices.push(format!(
+                                "ADD COLUMN {}: the rows already there read the DEFAULT; none is rewritten",
+                                column.name
+                            ));
+                            missing.push((column.name.clone(), value));
+                        }
+                    } else if matches!(rule.default, Some(DefaultValue::Constant(_)))
                         && self.any_row(collection)?
                     {
                         return Err(SqlError::unsupported(format!(
@@ -713,6 +776,19 @@ impl Compiler<'_> {
                     named(column)?;
                 }
                 drop_indexes = over(column);
+                if self.db.has_column_ids() {
+                    self.notices.push(format!(
+                        "DROP COLUMN {column}: the column is retired; no row is rewritten, and its values stay hidden even if a column of that name is added later"
+                    ));
+                    return Ok(WritePlan::AlterTable {
+                        collection,
+                        table: table.to_owned(),
+                        action: CompiledAlter::DropColumn {
+                            column: column.clone(),
+                            drop_indexes,
+                        },
+                    });
+                }
                 if !drop_indexes.is_empty() {
                     self.notices.push(format!(
                         "DROP COLUMN {column}: its index(es) {} are dropped with it, each by the ordinary bounded drop, committed before the layout is repointed",
@@ -736,6 +812,19 @@ impl Compiler<'_> {
                     return Err(SqlError::engine(format!(
                         "RENAME COLUMN {from} TO {to}: `{table}` already has a column `{to}`"
                     )));
+                }
+                if self.db.has_column_ids() {
+                    self.notices.push(format!(
+                        "RENAME COLUMN {from} TO {to}: one column record; every row, layout and index over it keeps its bytes and reads under the new name"
+                    ));
+                    return Ok(WritePlan::AlterTable {
+                        collection,
+                        table: table.to_owned(),
+                        action: CompiledAlter::RenameColumn {
+                            from: from.clone(),
+                            to: to.clone(),
+                        },
+                    });
                 }
                 if self.any_row(collection)? {
                     return Err(SqlError::Refused {
@@ -796,6 +885,75 @@ impl Compiler<'_> {
                     "RENAME COLUMN {from} TO {to}: the DECLARED type and the COLUMN RULE follow the column; rows written before this commit still carry the OLD name in their own layout and read back under the new one"
                 ));
             }
+            AlterAction::SetSchema { schema } => {
+                return Ok(WritePlan::AlterTable {
+                    collection,
+                    table: table.to_owned(),
+                    action: CompiledAlter::SetSchema { schema: schema.clone() },
+                });
+            }
+            AlterAction::SetDefault { column, default } => {
+                named(column)?;
+                let slot = rules.iter().position(|(n, _)| n == column);
+                let mut rule = slot.map(|i| rules[i].1.clone()).unwrap_or_default();
+                rule.default = default.clone();
+                if rule.default.is_some() {
+                    let (kind, spelling) = fields
+                        .iter()
+                        .find(|(n, _)| n == column)
+                        .map(|(_, k)| {
+                            let spelling = declared
+                                .iter()
+                                .find(|(n, _)| n == column)
+                                .map(|(_, d)| d.clone())
+                                .unwrap_or_else(|| format!("{k:?}"));
+                            (k.clone(), spelling)
+                        })
+                        .expect("named() proved the column is there");
+                    let def = ColumnDef {
+                        name: column.clone(),
+                        kind,
+                        declared: spelling,
+                        primary_key: false,
+                        references: None,
+                        unique: false,
+                        rule: None,
+                    };
+                    rule = self.typed_rule(&def, &rule)?;
+                }
+                match (slot, rule == ColumnRule::default()) {
+                    (Some(i), true) => {
+                        rules.remove(i);
+                    }
+                    (Some(i), false) => rules[i].1 = rule,
+                    (None, true) => {}
+                    (None, false) => rules.push((column.clone(), rule)),
+                }
+                return Ok(WritePlan::AlterTable {
+                    collection,
+                    table: table.to_owned(),
+                    action: CompiledAlter::Rules { rules },
+                });
+            }
+            AlterAction::SetNotNull { column, on } => {
+                named(column)?;
+                let slot = rules.iter().position(|(n, _)| n == column);
+                let mut rule = slot.map(|i| rules[i].1.clone()).unwrap_or_default();
+                rule.not_null = *on;
+                match (slot, rule == ColumnRule::default()) {
+                    (Some(i), true) => {
+                        rules.remove(i);
+                    }
+                    (Some(i), false) => rules[i].1 = rule,
+                    (None, true) => {}
+                    (None, false) => rules.push((column.clone(), rule)),
+                }
+                return Ok(WritePlan::AlterTable {
+                    collection,
+                    table: table.to_owned(),
+                    action: CompiledAlter::Rules { rules },
+                });
+            }
             AlterAction::ColumnType {
                 column,
                 kind,
@@ -832,6 +990,7 @@ impl Compiler<'_> {
                 rules,
                 drop_indexes,
                 create_indexes,
+                missing,
             },
         })
     }
@@ -839,6 +998,10 @@ impl Compiler<'_> {
     /// Whether the collection holds at least one row. One bounded probe --
     /// the first key of the row keyspace -- not a count.
     fn any_row(&self, collection: CollectionId) -> SqlResult2<bool> {
+        // An edge table's rows are its edges.
+        if self.db.edge_table(collection).map_err(SqlError::from)?.is_some() {
+            return self.db.edge_table_has_edges(collection).map_err(SqlError::from);
+        }
         Ok(self
             .db
             .scan(collection, None)
@@ -900,9 +1063,16 @@ impl Compiler<'_> {
                         rules,
                         drop_indexes,
                         create_indexes,
+                        missing,
                     },
                 ..
             } => {
+                for (column, value) in &missing {
+                    out.push_str(&format!(
+                        "missing: the rows already there read `{column}` = {value}; none is rewritten
+"
+                    ));
+                }
                 let next = sekejap_core::internal::next_layout_id(self.db)
                     .map_err(SqlError::from)?;
                 out.push_str(&format!(
@@ -967,6 +1137,53 @@ impl Compiler<'_> {
                                 .join(", ")
                         )
                     }
+                ));
+            }
+            WritePlan::AlterTable {
+                action: CompiledAlter::RenameColumn { from, to },
+                ..
+            } => {
+                out.push_str(&format!(
+                    "rewrite: rename_column -- the column record of `{from}` now says `{to}`; its id is unchanged
+"
+                ));
+                out.push_str("layout: unchanged -- every layout names the column by id, so no row or index key moves
+");
+            }
+            WritePlan::AlterTable {
+                action: CompiledAlter::DropColumn { column, drop_indexes },
+                ..
+            } => {
+                let next = sekejap_core::internal::next_layout_id(self.db).map_err(SqlError::from)?;
+                out.push_str(&format!(
+                    "rewrite: drop_column -- `{column}` is retired and new layout id {next} without it is published; no row is rewritten
+"
+                ));
+                if !drop_indexes.is_empty() {
+                    out.push_str(&format!(
+                        "indexes: dropped first -- {}
+",
+                        drop_indexes.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+            }
+            WritePlan::AlterTable {
+                action: CompiledAlter::Rules { rules },
+                ..
+            } => {
+                out.push_str(&format!(
+                    "rewrite: set_column_rules -- the catalog's column rules, {} of them; a new NOT NULL is checked on every row first
+",
+                    rules.len()
+                ));
+            }
+            WritePlan::AlterTable {
+                action: CompiledAlter::SetSchema { schema },
+                ..
+            } => {
+                out.push_str(&format!(
+                    "rewrite: move_collection -- the name moves to schema `{schema}`; the id, rows, indexes and edges stay
+"
                 ));
             }
             _ => unreachable!("alter_table builds an AlterTable plan or a Notice"),

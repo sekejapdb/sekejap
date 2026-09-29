@@ -305,15 +305,15 @@ fn a_bound_edge_type_takes_no_untyped_write_and_the_table_no_row() {
     assert!(m.db.create_edge(GraphContextId::BASE, dewa, t, kirana, &json!({})).is_err());
     assert!(m.db.put(wrote, "r", &json!({"a": "dewa", "s": "kirana"})).is_err());
     assert_eq!(m.db.edge_table_of_type(t).unwrap(), Some(wrote));
-    // Neither end's table, nor the edge table itself, can be dropped out
-    // from under the edges.
+    // An end's table cannot be dropped out from under the edges. The edge
+    // table itself can (0.19, N6): its drop removes its edges with it.
     m.db.rollback().unwrap();
     let refused = |r: Result<(), sekejap_core::collections::Error>| match r {
         Err(sekejap_core::collections::Error::InvalidInput(m)) => m,
         other => panic!("refused by name, not {other:?}"),
     };
     assert!(refused(m.db.begin_drop_collection(m.song)).contains("edge table `wrote` references it"));
-    assert!(refused(m.db.begin_drop_collection(wrote)).contains("is an edge table"));
+    m.db.begin_drop_collection(wrote).unwrap();
 }
 
 #[test]

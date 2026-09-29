@@ -871,6 +871,16 @@ pub(super) enum AlterAction {
     RenameTable {
         to: String,
     },
+    /// `ALTER COLUMN c SET DEFAULT <generator>` (`Some`) or `DROP DEFAULT`
+    /// (`None`): the column rule's DEFAULT, for rows written from now on.
+    SetDefault {
+        column: String,
+        default: Option<sekejap_core::collections::DefaultValue>,
+    },
+    /// `ALTER COLUMN c SET NOT NULL` (`true`) or `DROP NOT NULL`.
+    SetNotNull { column: String, on: bool },
+    /// `SET SCHEMA s`: the table's name moves to another schema.
+    SetSchema { schema: String },
     /// `ALTER COLUMN c TYPE new_type`: Tier 2 within one `Kind`, Tier 3
     /// across `Kind`s. The declared spelling is rewritten and no row byte
     /// changes.
@@ -897,6 +907,11 @@ impl AlterAction {
             Self::ColumnType {
                 column, declared, ..
             } => format!("ALTER COLUMN {column} TYPE {declared}"),
+            Self::SetDefault { column, default: Some(_) } => format!("ALTER COLUMN {column} SET DEFAULT"),
+            Self::SetDefault { column, default: None } => format!("ALTER COLUMN {column} DROP DEFAULT"),
+            Self::SetNotNull { column, on: true } => format!("ALTER COLUMN {column} SET NOT NULL"),
+            Self::SetNotNull { column, on: false } => format!("ALTER COLUMN {column} DROP NOT NULL"),
+            Self::SetSchema { schema } => format!("SET SCHEMA {schema}"),
         }
     }
 }
@@ -1095,6 +1110,10 @@ pub(super) enum Stmt {
         table: String,
         action: AlterAction,
     },
+    /// `ALTER INDEX name RENAME TO to`.
+    AlterIndex { name: String, to: String },
+    /// `ALTER SCHEMA name RENAME TO to`.
+    AlterSchema { name: String, to: String },
     /// `EXPLAIN ALTER TABLE ...`. Like `EXPLAIN DROP TABLE`, it does not run
     /// its statement: printing the plan of a catalog rewrite by performing
     /// the rewrite is not an explanation.

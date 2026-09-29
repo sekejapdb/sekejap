@@ -358,6 +358,10 @@ fn reseal(bytes: &mut [u8]) {
 /// bit and stays fully writable.
 #[test]
 fn the_per_index_tree_bit_is_declared_only_when_a_tree_was_created() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     const INDEX_TREES: u64 = 0x80;
     /// Everything the release before this one implemented.
     const OLD_MASK: u64 = 0x7f;
@@ -521,6 +525,10 @@ fn a_build_that_never_commits_leaves_the_last_committed_root() {
 /// refused rather than read as an empty index.
 #[test]
 fn the_verifier_catches_a_damaged_index_tree_and_a_wrong_root() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
 
     let damaged = temp.path().join("damaged");
@@ -780,6 +788,10 @@ fn prepared_query_drivers_read_the_index_tree() {
 /// own tree with none left behind in the primary one.
 #[test]
 fn an_unconfigured_handle_creates_the_layout_the_compat_corpus_declares() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     /// The mask a scalar-only collection must require of a reader: the base
     /// logical bit plus the per-index-tree bit.
     // `0x2000` is the live row-count record `create_collection` writes.

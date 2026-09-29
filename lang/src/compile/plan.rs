@@ -788,9 +788,26 @@ pub(crate) enum CompiledAlter {
         /// `RENAME COLUMN` re-earns under the new name. Empty for every
         /// other action, and for a column no family covers.
         create_indexes: Vec<(String, CompiledIndex)>,
+        /// F2, on a file with column ids: what the rows already there read
+        /// for a column this statement adds with a DEFAULT.
+        missing: Vec<(String, serde_json::Value)>,
     },
     /// `RENAME TO`: one name record, and the `CollectionId` does not change.
     Rename { to: String },
+    /// `ALTER COLUMN ... SET/DROP DEFAULT`, `SET/DROP NOT NULL`: the table's
+    /// column rules, replaced whole; a new NOT NULL is checked on every row.
+    Rules { rules: Vec<(String, ColumnRule)> },
+    /// `SET SCHEMA`: the table's name moves.
+    SetSchema { schema: String },
+    /// `RENAME COLUMN` on a file with column ids: one column record; every
+    /// row, layout and index keeps its bytes.
+    RenameColumn { from: String, to: String },
+    /// `DROP COLUMN` on a file with column ids: the column's indexes are
+    /// dropped, then its id is retired and a layout without it published.
+    DropColumn {
+        column: String,
+        drop_indexes: Vec<(IndexId, String)>,
+    },
 }
 
 /// An INSERT's `RETURNING` columns. `time[i]` is `Some(date_only)` for a
@@ -935,6 +952,10 @@ pub(crate) enum WritePlan {
     /// `DROP SCHEMA`: `Database::drop_schema`, which refuses a schema that
     /// still holds a table.
     DropSchema { name: String },
+    /// `ALTER INDEX ... RENAME TO`.
+    RenameIndex { index: IndexId, to: String },
+    /// `ALTER SCHEMA ... RENAME TO`.
+    RenameSchema { from: String, to: String },
     /// `DROP TABLE [IF EXISTS] name [CASCADE|RESTRICT]`: the DROPPING mark,
     /// then bounded steps to the end. Nothing here is a second removal path --
     /// it is `begin_drop_collection` and `drop_collection_step`, the same
@@ -1441,12 +1462,24 @@ impl WritePlan {
                 db.commit()?;
                 match action {
                     CompiledAlter::Rename { to } => db.rename_collection(collection, &to)?,
+                    CompiledAlter::RenameColumn { from, to } => db.rename_column(collection, &from, &to)?,
+                    CompiledAlter::Rules { rules } => db.set_column_rules(collection, rules)?,
+                    CompiledAlter::SetSchema { schema } => db.move_collection(collection, &schema)?,
+                    CompiledAlter::DropColumn { column, drop_indexes } => {
+                        for (index, _) in drop_indexes {
+                            db.begin_drop_index(index)?;
+                            while !db.drop_index_step(index, 256)? {}
+                            db.commit()?;
+                        }
+                        db.drop_column(collection, &column)?;
+                    }
                     CompiledAlter::Layout {
                         fields,
                         declared,
                         rules,
                         drop_indexes,
                         create_indexes,
+                        missing,
                     } => {
                         // The contract's DROP COLUMN drops the column's index
                         // with it. It is the ordinary bounded drop, committed
@@ -1460,6 +1493,9 @@ impl WritePlan {
                             db.commit()?;
                         }
                         db.alter_collection_rules(collection, fields, declared, rules)?;
+                        for (column, value) in missing {
+                            db.set_missing_default(collection, &column, value)?;
+                        }
                         db.commit()?;
                         // And the mirror of that: a column the layout now HAS
                         // gets the index `docs/lang/INDEX_CONTRACT.md` gives
@@ -1488,6 +1524,18 @@ impl WritePlan {
             Self::CreateSchema { name } => {
                 db.commit()?;
                 db.create_schema(&name)?;
+                db.commit()?;
+                SqlResult::Affected(0)
+            }
+            Self::RenameIndex { index, to } => {
+                db.commit()?;
+                db.rename_index(index, &to)?;
+                db.commit()?;
+                SqlResult::Affected(0)
+            }
+            Self::RenameSchema { from, to } => {
+                db.commit()?;
+                db.rename_schema(&from, &to)?;
                 db.commit()?;
                 SqlResult::Affected(0)
             }

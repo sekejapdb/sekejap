@@ -492,6 +492,8 @@ impl Compiler<'_> {
             Stmt::AlterTable { table, action } => {
                 Plan::Write(self.alter_table(&table, &action)?)
             }
+            Stmt::AlterIndex { name, to } => Plan::Write(self.rename_index(&name, &to)?),
+            Stmt::AlterSchema { name, to } => Plan::Write(WritePlan::RenameSchema { from: name, to }),
             Stmt::ExplainAlterTable { table, action } => {
                 Plan::ExplainText(self.explain_alter_table(&table, &action)?)
             }

@@ -260,6 +260,85 @@ most 256 per commit), resumes after a crash, and verifies before removing
 | 0x100000 | key specs | `KEYS` |
 | 0x400000 | property graphs | `GRPH`, `MEMB` |
 
+### 2.i Entry payloads and codes, version 1
+
+Integers are big-endian. Codes below are census variants and field values;
+each is frozen once written by a released binary.
+
+**`NEXT` id classes** (the item and the census variant): 1 table, 2 layout,
+3 index, 4 row sequence, 5 edge id, 6 edge type, 7 context, 8 graph,
+9 schema, 10 job, 11 column. Payload: next id, u64. The database counters
+(classes 1-3) are owned by the database (owner class 0, id 0), node `b`.
+
+**`LIMT`**: node `a`, owner the database, item 0. Payload: the kernel's
+56-byte policy record, unchanged.
+
+**`INDX` variants** (the index family): 0 scalar, 1 text (words), 2 text in
+packed segments, 3 trigram, 4 exact vector, 5 quantized vector, 6 Vamana
+graph, 7 spatial point, 8 geometry, 9 endpoint set. `INDX` versions: 1 plain
+columns, 2 with a `lower` expression, 3 with a JSON member expression.
+
+**`JOBS` types** (the variant): 1 index build, 2 index drop, 3 table drop,
+4 swap, 5 conversion, 6 validation, 7 backfill, 8 reshape, 9 tree free,
+10 upgrade cleanup.
+
+**`NAME` classes** (the variant, and the class byte of an `nIDX` item):
+1 schema, 2 table, 3 column, 4 index, 5 edge type, 6 context, 7 graph.
+
+**`COLM` variants**: 0 a column; 1 declared spellings in use; 2 column rules
+in use; 3 constant defaults in use; 8 reserved for BYTES. Every entry is
+written as 1/0; lines 1/1-1/3 are the file's feature lines.
+
+**Payloads, version 1** (strings are a u8 length and UTF-8 bytes):
+
+| Kind | Key (node, owner, item) | Payload |
+|---|---|---|
+| `NAME` | `b`, the object (schema or table), 0 | parent id u64 (a table's schema, 0 for `public`), state u8 (0 live), name |
+| `nIDX` | `b`, the parent (database for a schema, schema for a table), (class, name) | id u64 |
+| `TABL` | `c`, the table, 0 | flags u8 (bit 0 timestamps), current layout u32, schema id u64 |
+| `COLM` | `c`, the table, column id | state u8 (0 live, 1 retired), name, stored token, declared spelling (empty: none), rule length u16 + the 0.18 column-rule encoding |
+| `LAYT` | `c`, the database, (layout id, part) | table u32, slot count u16 (at most 512), per slot: column id u64, type u8, vector dimension u32 |
+| `KEYS` | `c`, the table, 0 | the 0.18 key-declaration encoding |
+| `BIND` | `e`, the table, 0 | the 0.18 edge-table record encoding |
+| `MEMB` | `e`, the table, 0 | the 0.18 membership encoding |
+| `JOBS` | `f`, the table, job type (3: table drop) | phase u8, mode u8, removed u64 |
+| `NEXT` | `b`, the owner, id class | next id u64 (columns: per table, from 16) |
+
+**Row ids and edge ids are reserved in blocks of 1,024.** A table's row
+`NEXT` (class 4) and the edge-id `NEXT` (class 5) hold a bound: every id
+below it may have been handed out. A writer raises the bound one block at a
+time, so a commit inside a block writes no counter. An id is never handed out
+twice; a crash or a rollback can leave a gap, as a PostgreSQL sequence with a
+cache does. NAMED COST: the commit that opens a block writes the entry's
+three copies in three trees, two pages more than the 0.18 counter.
+
+Column ids 1, 2 and 3 are the managed columns `__e4_key`, `_created_unix`
+and `_updated_unix`; user columns start at 16. A layout slot names a column
+id, and reading resolves it to the column's current name, so a rename is one
+`COLM` write whatever the number of rows or layouts. The column's type lives
+in the slots: a historical layout keeps the type its rows were written with.
+
+**The legacy feature word.** Each bit of 2.h is exactly one census line:
+
+| Bit | Line | Bit | Line |
+|---|---|---|---|
+| 0x2 | `GRPH` 1/0 | 0x2000 | `rCNT` 1/0 |
+| 0x4 | `INDX` 1/4 | 0x4000 | `INDX` 1/9 |
+| 0x8 | `INDX` 1/7 | 0x8000 | `INDX` 1/6 |
+| 0x10 | `INDX` 1/1 | 0x10000 | `INDX` 3/0 |
+| 0x20 | `INDX` 1/5 | 0x20000 | `NAME` 1/1 |
+| 0x40 | `INDX` 1/2 | 0x40000 | `NEXT` 1/5 |
+| 0x80 | `TREE` 1/0 | 0x80000 | `BIND` 1/0 |
+| 0x100 | `INDX` 1/8 | 0x100000 | `KEYS` 1/0 |
+| 0x200 | `JOBS` 1/3 | 0x200000 | `COLM` 1/3 |
+| 0x400 | `INDX` 2/0 | 0x400000 | `MEMB` 1/0 |
+| 0x800 | `COLM` 1/1 | 0x800000 | `INDX` 1/3 |
+| 0x1000 | `COLM` 1/2 | | |
+
+Bit 0x1 is the `NEXT` index-class line. The engine's feature word is derived
+from the census, so a bit is never cleared once its line is written (the
+census only grows); the index count is derived from the registry.
+
 ---
 
 ## 3. The move -- `sekejap-upgrade`, 0.18 to 0.19
@@ -270,45 +349,37 @@ before touching a byte (Law 8 baseline). The upgrader carries the 0.18 code
 isolated inside it, to read the old catalog and to finish work already in
 progress; nothing else in 0.19 uses it.
 
-**3.a The marker.** One fixed key in the primary tree, `[0,0,0xFE]`, framed
-like the header and rewritten in every commit of the build. It holds the
-database identity, the source's committed transaction number at start, the
-phase, the cursor, the three Register roots, and the backup's path, size and
-completion flag.
+**3.a Build beside, then publish by rename** (implemented 2026-09-29; it
+replaces the in-place marker first written here). The move is
+`collections::upgrade::upgrade_format`, a rebuild into a Register file
+(`collections::rebuild::upgrade_to_register`):
 
-**3.b Steps**
+1. `<db>.v019-upgrading` is built from `<db>`, which is read and never
+   written: rows, vector sidecars and edges copied byte for byte, every
+   supportive fact translated into Register entries (each 0.18 layout gets
+   its table from the table's current layout or from its rows; a layout no
+   table and no row uses is not carried), every index rebuilt from the rows.
+2. The build is compared with the source (rows, sidecars and edges equal,
+   key for key) and verified independently, then marked complete.
+3. Publication is two renames: `<db>` to `<db>.v018-backup`, then
+   `<db>.v019-upgrading` to `<db>`. The original directory is the backup;
+   it costs no copy.
 
-1. Check, read-only: inventory every metadata family, layout, counter and
-   unfinished job; unknown source semantics stop here. The index counter must
-   not exceed 0xFFFC (the fixed Register tree ids).
-2. Take the writer, and hold it through publication. Checkpoint. Revalidate
-   the source against step 1.
-3. Back up. A resume never takes a second backup (the marker records the
-   first); a backup path that exists and is not this upgrade's is refused.
-4. Finish legacy work with the isolated 0.18 code: tables dropping, indexes
-   building or dropping, REINDEX leftovers. This work does what it always did
-   (drops delete rows, builds write postings); the translation then sees only
-   ready objects.
-5. Build beside: the Register trees, in bounded commits, each also writing
-   the marker. The legacy header is untouched.
-6. Verify (3.d), before publishing.
-7. Publish in one commit: the Anchor replaces `[0,0,copy]`, the marker is
-   removed, an upgrade-cleanup `JOBS` entry appears.
-8. Clean up in steps of at most 256 deletes: legacy metadata records, name
-   keyspaces, per-index corpus and vector-graph header records.
+The source must have every index READY and no drop in flight, as a rebuild
+requires; a 0.18 release finishes that work first.
 
-The metadata translation rewrites no row, edge or posting.
+**3.b Cost.** One full read of the source, one write of the new file (rows,
+edges and sidecars; indexes rebuilt), disk for both until the backup is
+removed. The translation of the metadata itself is small.
 
 **3.c Crash states**
 
 | State | Recognised by | Finished by |
 |---|---|---|
-| Legacy | `E4COLL1`/`2`, no marker | 0.19 refuses it until upgraded |
-| Backing up | marker in phase backup, backup incomplete | discard the partial backup, take it again |
-| Finishing legacy work | marker in phase legacy-work | resume that work with the isolated 0.18 code |
-| Building | marker in phase build | source transaction unchanged: resume at the cursor; changed: free the Register trees in bounded steps (recorded in the marker), then restart from step 1 |
-| Published | `E4COLL3` plus the cleanup job | resume the deletes at the cursor |
-| Clean | `E4COLL3`, no marker, no cleanup job | done |
+| Legacy | `<db>` is 0.18, no build beside it | 0.19 refuses it until upgraded |
+| Building | `<db>` is 0.18, `<db>.v019-upgrading` holds the rebuild's incomplete marker | the next call deletes the partial build and starts again |
+| Between the renames | no `<db>`, `<db>.v018-backup`, a complete `<db>.v019-upgrading` | the next call finishes the second rename |
+| Done | `<db>` is a Register file | nothing |
 
 **3.d Verified before publishing**
 

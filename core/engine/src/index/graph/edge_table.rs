@@ -185,9 +185,23 @@ struct Bound {
     source_collection: CollectionId,
     destination_collection: CollectionId,
     fields: Vec<(String, Kind)>,
+    /// Stored tokens that are not the columns' names (F1 on edges).
+    bag: Option<Arc<crate::collections::columns::BagMap>>,
 }
 
 impl Bound {
+    fn names(&self, bag: Value) -> Value {
+        match &self.bag {
+            Some(m) => m.names(&bag),
+            None => bag,
+        }
+    }
+    fn tokens(&self, bag: &Value) -> Value {
+        match &self.bag {
+            Some(m) => m.tokens(bag),
+            None => bag.clone(),
+        }
+    }
     fn is_end(&self, column: &str) -> bool {
         column == self.binding.source || column == self.binding.destination
     }
@@ -348,6 +362,7 @@ impl Database {
             Ok(edge_type)
         })();
         *self.bound_edge_types.borrow_mut() = None;
+        *self.bag_maps.borrow_mut() = None;
         self.finish(result)
     }
 
@@ -416,8 +431,9 @@ impl Database {
                 }
                 self.refuse_null_properties(&bound, &merged)?;
                 self.check_properties(&bound, &merged)?;
+                let stored = bound.tokens(&merged);
                 let result = (|| {
-                    self.write_edge_bag(taken.edge, &merged)?;
+                    self.write_edge_bag(taken.edge, &stored)?;
                     Ok(Some(taken.edge))
                 })();
                 self.finish(result)
@@ -457,7 +473,7 @@ impl Database {
             }
             self.refuse_null_properties(&bound, &bag)?;
             self.check_properties(&bound, &bag)?;
-            rewritten.push((f.edge, bag));
+            rewritten.push((f.edge, bound.tokens(&bag)));
         }
         let result = (|| {
             for (edge, bag) in &rewritten {
@@ -554,6 +570,35 @@ impl Database {
         Ok(None)
     }
 
+    /// Whether an edge table holds at least one edge: its "rows", for a
+    /// statement that has to know (`ADD COLUMN ... NOT NULL`). One walk of
+    /// its source table's outgoing edges until the first of its type.
+    pub fn edge_table_has_edges(&self, c: CollectionId) -> Result<bool> {
+        let catalog = self.catalog(c)?;
+        let Some(table) = catalog.edge else { return Ok(false) };
+        let Some(binding) = table.binding else { return Ok(false) };
+        let Some(source) = table.references.iter().find(|(n, _)| *n == binding.source).map(|(_, s)| *s) else {
+            return Err(corrupt("edge table binding names a column it does not reference"));
+        };
+        let scope = crate::collections::prefix(PRIMARY_EDGE, source);
+        for row in self.store()?.range(&scope)? {
+            let (k, _) = row?;
+            if !k.starts_with(&scope) {
+                break;
+            }
+            let (key, _) = parse_edge(&k, PRIMARY_EDGE)?;
+            if key.edge_type == binding.edge_type && key.context == GraphContextId::BASE {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Every edge type an edge table owns, and that table.
+    pub(crate) fn edge_table_types(&self) -> Result<BTreeMap<EdgeTypeId, CollectionId>> {
+        self.bound_types()
+    }
+
     fn bound_types(&self) -> Result<BTreeMap<EdgeTypeId, CollectionId>> {
         if let Some(map) = self.bound_edge_types.borrow().as_ref() {
             return Ok(map.clone());
@@ -598,7 +643,9 @@ impl Database {
         let source_collection = find(&binding.source)?;
         let destination_collection = find(&binding.destination)?;
         let fields = self.layout(catalog.layout)?.fields.clone();
+        let bag = self.bag_map_of(binding.edge_type, Some(c))?;
         Ok(Bound {
+            bag,
             collection: c,
             name: catalog.name,
             table,
@@ -716,7 +763,7 @@ impl Database {
         object.insert(KEY_FIELD.to_owned(), Value::from("k"));
         let layout = crate::Layout {
             id: 1,
-            fields: bound.fields.clone(),
+            fields: bound.fields.clone(), absent: Default::default(),
         };
         encode_dense_v3(&layout, &doc).map_err(|e| {
             invalid(format!("an edge of `{}` does not fit its columns: {e}", bound.name))
@@ -739,7 +786,7 @@ impl Database {
             return match primary_posting_if_any(self, key, 0)? {
                 Some(posting) => Ok(Some(Found {
                     edge: EdgeId { key, id: 0 },
-                    bag: decode_properties(&posting)?,
+                    bag: bound.names(decode_properties(&posting)?),
                 })),
                 None => Ok(None),
             };
@@ -795,7 +842,7 @@ impl Database {
             };
             out.push(Found {
                 edge: EdgeId { key, id },
-                bag,
+                bag: bound.names(bag),
             });
         }
         Ok(out)
@@ -860,6 +907,8 @@ impl Database {
     }
 
     fn write_new_edge(&mut self, bound: &Bound, key: EdgeKey, bag: &Value) -> Result<EdgeId> {
+        let stored = bound.tokens(bag);
+        let bag = &stored;
         let pair_key = bound.table.key.len() == 2
             && bound.table.key.contains(&bound.binding.source)
             && bound.table.key.contains(&bound.binding.destination);

@@ -342,6 +342,10 @@ fn mutating_a_folded_document_keeps_both_tiers_agreeing() {
 /// refuses. The bit is only ever set by a build that actually packs something.
 #[test]
 fn the_packed_tier_is_admitted_only_behind_its_own_feature_bit() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let dir = tempfile::tempdir().unwrap();
 
     // Ordinary use never raises the file's minimum reader.

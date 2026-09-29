@@ -2298,6 +2298,10 @@ const PACKED_ROWS: u64 = 700;
 
 #[test]
 fn a_packed_norm_tier_still_scores_text_in_the_query_executor() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("packed_norms");
 

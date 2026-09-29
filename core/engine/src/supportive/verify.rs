@@ -4,7 +4,7 @@
 use super::carrier::{decode_value, Anchor, Key, REGISTER_TREES};
 use super::register::Register;
 use crate::collections::{corrupt, Error};
-use crate::store::Backend;
+use crate::pagewal::PageWalStore;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -18,7 +18,7 @@ pub(crate) struct Verified {
 /// Every entry: each copy's checksum; critical copies all present and equal;
 /// ignorable entries in copy 0 only; every (kind, version) in the census.
 /// The first problem found is returned as corruption, naming it.
-pub(crate) fn verify(store: &Backend, register: &Register, anchor: &Anchor) -> Result<Verified> {
+pub(crate) fn verify(store: &PageWalStore, register: &Register, anchor: &Anchor) -> Result<Verified> {
     let roots = register.roots();
     let mut seen = Verified::default();
     // Copy 0 holds every entry: walk it in order, and check each critical

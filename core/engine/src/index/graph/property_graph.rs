@@ -393,6 +393,7 @@ impl Database {
             self.save_catalog(&catalog)
         })();
         *self.bound_edge_types.borrow_mut() = None;
+        *self.bag_maps.borrow_mut() = None;
         self.finish(result)
     }
 }

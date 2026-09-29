@@ -249,6 +249,10 @@ fn layout_holds(path: &Path, index: IndexId, dim: usize, nodes: usize) {
 /// verified, and both answer the brute-force top-k this process computed.
 #[test]
 fn a_node_record_is_one_head_and_its_edges_live_in_a_record_of_their_own() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     for (dim, rows) in [(NARROW, 800usize), (WIDE, 400usize)] {
         assert_eq!(dim > PAGE - 14, dim == WIDE, "the two cases must straddle a page");
         let temp = tempfile::tempdir().unwrap();
@@ -294,6 +298,10 @@ fn a_node_record_is_one_head_and_its_edges_live_in_a_record_of_their_own() {
 /// build transaction was refused by the 16 MiB allowance.
 #[test]
 fn one_insert_dirties_the_edges_and_not_the_codes_however_wide_the_vector_is() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let mut measured = Vec::new();
     for (dim, rows) in [(NARROW, 800usize), (WIDE, 400usize)] {
         let temp = tempfile::tempdir().unwrap();
@@ -343,6 +351,10 @@ fn one_insert_dirties_the_edges_and_not_the_codes_however_wide_the_vector_is() {
 /// at `ef = 10` was 0.940 when it did.
 #[test]
 fn recall_is_unchanged_by_moving_the_adjacency_into_its_own_record() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     let rows = 2_000;
@@ -398,6 +410,10 @@ fn recall_is_unchanged_by_moving_the_adjacency_into_its_own_record() {
 /// no descriptor names, which is what this catches.
 #[test]
 fn dropping_the_index_reclaims_the_adjacency_keyspace_as_well_as_the_heads() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     let vectors = corpus(400, NARROW, 0x55e6_f708_192a_3b4c);

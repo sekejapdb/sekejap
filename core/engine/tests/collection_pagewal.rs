@@ -552,6 +552,9 @@ fn resource_policy_is_persisted_as_e4limit1_enforced_per_field_and_refused_when_
 /// holds it is reported, not assumed.
 #[test]
 fn metadata_transaction_cost_is_measured_and_a_policy_below_it_refuses_explicitly() {
+    // It writes and reads 0.18-format header or descriptor bytes: pinned
+    // to that format (a Register file's are `supportive::*_tests`).
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let d = tempfile::tempdir().unwrap();
     let mut db = Database::create(d.path().join("measure"), cfg()).unwrap();
     let (_, before) = db.storage_bytes().unwrap();

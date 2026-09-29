@@ -84,6 +84,13 @@ pub(crate) fn row_count_key(c: CollectionId) -> Vec<u8> {
     prefix(ROW_COUNT, c)
 }
 
+fn rc_key(c: CollectionId) -> crate::supportive::carrier::Key {
+    crate::supportive::schema::row_count_key(u64::from(c.0))
+}
+fn rc_line() -> crate::supportive::carrier::CensusLine {
+    crate::supportive::schema::line(b"rCNT", 1, 0)
+}
+
 pub(crate) fn encode(record: RowCountRecord) -> [u8; RECORD_BYTES] {
     let mut b = [0u8; RECORD_BYTES];
     b[..8].copy_from_slice(&record.rows.to_be_bytes());
@@ -165,7 +172,7 @@ impl Database {
         if !self.row_counts_declared() {
             return Ok(None);
         }
-        match self.store()?.get(&row_count_key(c))? {
+        match self.entry_get(&rc_key(c), &row_count_key(c))? {
             Some(b) => Ok(Some(decode(&b)?.rows)),
             None => Ok(None),
         }
@@ -176,8 +183,7 @@ impl Database {
         if !self.row_counts_declared() {
             return Ok(None);
         }
-        self.store()?
-            .get(&row_count_key(c))?
+        self.entry_get(&rc_key(c), &row_count_key(c))?
             .as_deref()
             .map(decode)
             .transpose()
@@ -197,7 +203,7 @@ impl Database {
         if !self.row_counts_declared() || self.dropping == Some(c) {
             return Ok(false);
         }
-        let Some(b) = self.store()?.get(&row_count_key(c))? else {
+        let Some(b) = self.entry_get(&rc_key(c), &row_count_key(c))? else {
             return Ok(false);
         };
         let record = decode(&b)?;
@@ -275,7 +281,7 @@ impl Database {
                 rows: entry.applied()?,
                 generation: entry.generation.saturating_add(1),
             };
-            self.writer()?.put(&row_count_key(c), &encode(record))?;
+            self.entry_put(&rc_key(c), rc_line(), &row_count_key(c), &encode(record))?;
         }
         Ok(())
     }
@@ -300,7 +306,7 @@ impl Database {
         if !self.row_counts_declared() {
             return Ok(());
         }
-        self.writer()?.delete(&row_count_key(c))?;
+        self.entry_delete(&rc_key(c), &row_count_key(c))?;
         Ok(())
     }
 
@@ -313,7 +319,9 @@ impl Database {
     /// bit and the first record one durable fact.
     pub(crate) fn seed_row_count(&mut self, c: CollectionId, rows: u64) -> Result<()> {
         self.enable_logical_feature(ROW_COUNT_FEATURE)?;
-        self.writer()?.put(
+        self.entry_put(
+            &rc_key(c),
+            rc_line(),
             &row_count_key(c),
             &encode(RowCountRecord {
                 rows,

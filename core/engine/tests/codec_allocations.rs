@@ -58,7 +58,7 @@ fn dense_rows_do_not_rebuild_multiple_intermediate_formats() {
             ("name".into(), Kind::Text),
             ("profile".into(), Kind::Json),
             ("number".into(), Kind::Int),
-        ],
+        ], absent: Default::default(),
     };
     let document = json!({"name":"sensor","number":i64::MIN,"profile":{"text":"x".repeat(100_000)},"extra":{"blob":"y".repeat(100_000)}});
     let (encoded, encode_bytes) = measured(|| encode_dense_v3(&layout, &document).unwrap());

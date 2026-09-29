@@ -2,7 +2,47 @@
 
 ## 0.19.0 (in development)
 
-Search, toward Elasticsearch / Solr / Manticore.
+The versatility foundation: a new supportive format, columns with stable
+ids, and the schema changes they make cheap. Search work (the skip table,
+fusion, analyzers) moves to 0.21.
+
+- **The 0.19 format** (`docs/core/SUPPORTIVE.md`, `CONTRACT.md`). Rows,
+  edges and index postings keep their bytes. Everything else a database
+  holds about itself -- names, tables, columns, layouts, indexes, graph
+  names, counters, statistics -- is now one structure, the Register: three
+  small B-trees, each entry checksummed with its key, critical entries kept
+  in all three copies, and a census that lets a later release refuse a file
+  it cannot read by name. This is the format Law 8 holds from 0.19 on.
+- **0.19 opens no 0.18-format file until it is moved**, and says so by name
+  before touching a byte.
+- **Moving a 0.18 database**: `sekejap-upgrade --apply <path>` (or
+  `collections::upgrade::upgrade_format` from Rust) builds the 0.19 file
+  beside the original, compares and verifies it, and swaps it in; the
+  original directory is kept untouched as `<path>.v018-backup`. It is
+  tested on the database files the released 0.18.3 and 0.18.5 builds wrote.
+- **Columns have ids.** `ALTER TABLE ... RENAME COLUMN` and `DROP COLUMN`
+  now work on tables that hold rows, as one catalog write: no row is
+  rewritten, every index follows a renamed column, and a dropped column's
+  values never come back, even when a column of that name is added later.
+- **Edge tables change like tables.** Their property columns can be added,
+  renamed and dropped; the end and key columns stay. `DROP TABLE` on an
+  edge table a property graph declared removes its edges in bounded steps
+  and frees its label.
+- **`ADD COLUMN ... DEFAULT` on a table with rows**: the rows already there
+  read the default, as PostgreSQL shows it, without being rewritten.
+  `ALTER COLUMN ... SET/DROP DEFAULT` and `SET/DROP NOT NULL` (checked
+  against every row, SQLSTATE 23502) are new.
+- **Names move**: `ALTER TABLE ... SET SCHEMA`, `ALTER INDEX ... RENAME TO`,
+  `ALTER SCHEMA ... RENAME TO`.
+- **Up to 1,600 columns** per table (was 256).
+- **Costs, measured and named**: a Register entry that must survive damage
+  is kept in three trees, so the commit that opens a block of 1,024 row ids
+  writes two pages more than 0.18 did (the commits inside a block write
+  none); an ascending edge load reads 6.18 pages per edge against 5.93,
+  because the primary tree's leaf boundaries moved when the metadata left it.
+- **Fixed**: an offline rebuild of a database with a JSON-member expression
+  index (`(col->>'m')`) refused it; a rebuild of a database with a dropped
+  table refused it.
 
 - **Trigram index for `LIKE` and `ILIKE`**, as PostgreSQL's pg_trgm writes
   it: `CREATE INDEX ON place USING gin (name gin_trgm_ops)`. Any pattern

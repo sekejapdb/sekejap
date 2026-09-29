@@ -44,11 +44,11 @@ fn filled(store: &mut crate::store::Backend) -> Register {
 #[test]
 fn a_clean_register_verifies() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Database::create(dir.path().join("db"), cfg()).unwrap();
+    let mut db = legacy_create(dir.path().join("db"), cfg()).unwrap();
     let store = db.writer().unwrap();
     let reg = filled(store);
     let anchor = Anchor { roots: reg.roots(), census: census() };
-    assert_eq!(verify(store, &reg, &anchor).unwrap(), Verified { critical: 3, ignorable: 1 });
+    assert_eq!(verify(store.store(), &reg, &anchor).unwrap(), Verified { critical: 3, ignorable: 1 });
 }
 
 #[test]
@@ -82,16 +82,23 @@ fn each_kind_of_damage_is_named() {
     ];
     for (what, damage) in cases {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Database::create(dir.path().join("db"), cfg()).unwrap();
+        let mut db = legacy_create(dir.path().join("db"), cfg()).unwrap();
         let store = db.writer().unwrap();
         let reg = filled(store);
         let mut roots = reg.roots();
         damage(store, &mut roots);
         let reg = Register::open(roots);
         let anchor = Anchor { roots, census: census() };
-        match verify(store, &reg, &anchor) {
+        match verify(store.store(), &reg, &anchor) {
             Err(Error::Corrupt(m)) => assert!(!m.is_empty(), "{what}"),
             other => panic!("{what}: {other:?}"),
         }
     }
+}
+
+/// These tests build the carrier by hand on a 0.18-format file, whose
+/// header keys and tree ids are free.
+fn legacy_create(path: impl AsRef<std::path::Path>, config: Config) -> crate::collections::Result<Database> {
+    super::header::FORCE.with(|f| f.set(Some(false)));
+    Database::create(path, config)
 }

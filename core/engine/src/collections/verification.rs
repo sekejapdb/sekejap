@@ -84,8 +84,44 @@ struct Run<F> {
     limits: VerificationLimits,
     report: VerificationReport,
     emit: F,
+    /// The Register of a Register file; `None` for a 0.18-format file.
+    sup: Option<crate::supportive::header::Supportive>,
 }
 impl<F: FnMut(&VerificationIssue)> Run<F> {
+    /// A supportive value: the Register entry on a Register file, the 0.18
+    /// primary-tree key otherwise. One budgeted point read either way.
+    fn entry(&mut self, key: &crate::supportive::carrier::Key, legacy: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self.sup.clone() {
+            Some(sup) => {
+                self.read(&[])?;
+                Ok(sup.register.get(&*self.reader, key)?.map(|(_, p)| p))
+            }
+            None => self.read(legacy),
+        }
+    }
+    /// A layout by id, from either format.
+    fn layout(&mut self, id: u32) -> Result<Layout> {
+        match self.sup.clone() {
+            Some(sup) => {
+                self.read(&[])?;
+                Ok(super::register_catalog::read_layout(&*self.reader, &sup, id, None)?
+                    .ok_or_else(|| corrupt("layout missing"))?
+                    .1)
+            }
+            None => layout(|k| self.read(k), id),
+        }
+    }
+    /// A catalog record by id, from either format.
+    fn catalog(&mut self, id: CollectionId) -> Result<Catalog> {
+        match self.sup.clone() {
+            Some(sup) => {
+                self.read(&[])?;
+                super::register_catalog::read_catalog(&*self.reader, &sup, id)?
+                    .ok_or_else(|| corrupt("collection descriptor missing"))
+            }
+            None => replicas(|k| self.read(k), |copy| replica_key(1, id.0, copy), parse_catalog),
+        }
+    }
     fn issue(&mut self, issue: VerificationIssue) -> Result<()> {
         let total =
             self.report.catalog_issues + self.report.primary_issues + self.report.derived_issues;
@@ -297,6 +333,9 @@ fn verify_collections<F: FnMut(&VerificationIssue)>(
     run: &mut Run<F>,
     header: HeaderInfo,
 ) -> Result<Vec<(Catalog, u64)>> {
+    if run.sup.is_some() {
+        return verify_collections_register(run, header);
+    }
     let mut catalogs: Vec<(Catalog, u64)> = Vec::new();
     let source = run.reader.clone();
     visit(&source, &[1], Some(&[2]), |key, value| {
@@ -515,6 +554,73 @@ fn verify_collections<F: FnMut(&VerificationIssue)>(
     Ok(catalogs)
 }
 
+/// [`verify_collections`] on a Register file: every table the allocator
+/// names is read through the Register's damage rules, its name must resolve
+/// back to it and its layout must be readable. Register damage itself is the
+/// Register verifier's (`crate::supportive::verify`).
+fn verify_collections_register<F: FnMut(&VerificationIssue)>(
+    run: &mut Run<F>,
+    header: HeaderInfo,
+) -> Result<Vec<(Catalog, u64)>> {
+    use crate::supportive::schema::{NAME_SCHEMA, NAME_TABLE};
+    let sup = run.sup.clone().expect("a Register file");
+    let expected = usize::try_from(header.next_collection - 1)
+        .map_err(|_| corrupt("collection allocator domain"))?;
+    if expected > run.limits.max_metadata {
+        return Err(Error::Kernel(kernel::Error::ResourceLimit(
+            "index verifier collection metadata budget exceeded",
+        )));
+    }
+    let mut catalogs = Vec::new();
+    for id in 1..header.next_collection {
+        run.row(true)?;
+        let reader = run.reader.clone();
+        let Some(c) = super::register_catalog::read_catalog(&*reader, &sup, CollectionId(id))? else {
+            continue;
+        };
+        let schema = super::register_catalog::schema_id(&*reader, &sup, c.schema.as_deref())?;
+        let named = match schema {
+            Some(schema) => super::register_catalog::table_id(&*reader, &sup, schema, &c.name)?,
+            None => None,
+        };
+        if named != Some(id) {
+            run.issue(VerificationIssue {
+                class: IssueClass::Catalog,
+                kind: IssueKind::Missing,
+                key: vec![],
+                index: None,
+                entity: None,
+                message: format!("table {id}: its name does not resolve to it"),
+            })?;
+        }
+        if c.layout >= header.next_layout {
+            return Err(corrupt("collection current layout identity"));
+        }
+        run.layout(c.layout)?;
+        let counter = super::register_catalog::sequence(&*reader, &sup, id)?;
+        catalogs.push((c, counter));
+    }
+    let reader = run.reader.clone();
+    let mut owners = vec![0u64];
+    owners.extend(super::register_catalog::names(&*reader, &sup, NAME_SCHEMA, 0)?.into_iter().map(|(_, id)| id));
+    for schema in owners {
+        for (name, id) in super::register_catalog::names(&*reader, &sup, NAME_TABLE, schema)? {
+            run.row(true)?;
+            if !catalogs.iter().any(|(c, _)| u64::from(c.id.0) == id && c.name == name) {
+                run.issue(VerificationIssue {
+                    class: IssueClass::Catalog,
+                    kind: IssueKind::Extra,
+                    key: vec![],
+                    index: None,
+                    entity: None,
+                    message: format!("orphan table name `{name}`"),
+                })?;
+            }
+        }
+    }
+    Ok(catalogs)
+}
+
 fn verify_layouts<F: FnMut(&VerificationIssue)>(
     run: &mut Run<F>,
     header: HeaderInfo,
@@ -652,6 +758,20 @@ fn verify_row_counts<F: FnMut(&VerificationIssue)>(
     let declared = ih.is_some_and(|h| h.features & row_count::ROW_COUNT_FEATURE != 0);
     let source = run.reader.clone();
     let mut found: BTreeMap<CollectionId, u64> = BTreeMap::new();
+    if run.sup.is_some() {
+        for (catalog, _) in catalogs {
+            let key = crate::supportive::schema::row_count_key(u64::from(catalog.id.0));
+            if let Some(bytes) = run.entry(&key, &[])? {
+                match row_count::decode(&bytes) {
+                    Ok(record) => {
+                        found.insert(catalog.id, record.rows);
+                    }
+                    // Ignorable: a damaged record is rebuilt, not a refusal.
+                    Err(_) => {}
+                }
+            }
+        }
+    }
     visit(
         &source,
         &[row_count::ROW_COUNT],
@@ -745,38 +865,71 @@ pub fn verify_indexed_source(
         limits,
         report: VerificationReport::default(),
         emit,
+        sup: None,
     };
-    let header = replicas(|k| run.read(k), |copy| vec![0, 0, copy], parse_header)?;
-    for copy in 0..3u8 {
-        let key = vec![0, 0, copy];
-        match run.read(&key)? {
-            None => run.issue(VerificationIssue {
-                class: IssueClass::Catalog,
-                kind: IssueKind::Missing,
-                key,
-                index: None,
-                entity: None,
-                message: "typed header replica missing".into(),
-            })?,
-            Some(bytes) => match parse_header(&bytes) {
-                Ok(candidate) if candidate == header => {}
-                Ok(_) => return Err(corrupt("conflicting typed header replicas")),
-                Err(Error::Unsupported(message)) => return Err(Error::Unsupported(message)),
-                Err(_) => run.issue(VerificationIssue {
+    let header = if crate::supportive::header::anchored(&*run.reader)? {
+        // A Register file: the header facts are Register entries, read by
+        // the Register's own damage rules.
+        let sup = crate::supportive::header::Supportive::read(&*run.reader)?;
+        let count = super::register_catalog::index_ids(&*run.reader, &sup)?.len();
+        let h = super::header_of(&sup, u32::try_from(count).map_err(corrupt)?)?;
+        run.sup = Some(sup);
+        h
+    } else {
+        let header = replicas(|k| run.read(k), |copy| vec![0, 0, copy], parse_header)?;
+        for copy in 0..3u8 {
+            let key = vec![0, 0, copy];
+            match run.read(&key)? {
+                None => run.issue(VerificationIssue {
                     class: IssueClass::Catalog,
-                    kind: IssueKind::Malformed,
+                    kind: IssueKind::Missing,
                     key,
                     index: None,
                     entity: None,
-                    message: "typed header replica damaged".into(),
+                    message: "typed header replica missing".into(),
                 })?,
-            },
+                Some(bytes) => match parse_header(&bytes) {
+                    Ok(candidate) if candidate == header => {}
+                    Ok(_) => return Err(corrupt("conflicting typed header replicas")),
+                    Err(Error::Unsupported(message)) => return Err(Error::Unsupported(message)),
+                    Err(_) => run.issue(VerificationIssue {
+                        class: IssueClass::Catalog,
+                        kind: IssueKind::Malformed,
+                        key,
+                        index: None,
+                        entity: None,
+                        message: "typed header replica damaged".into(),
+                    })?,
+                },
+            }
         }
-    }
+        header
+    };
     let ih = header.indexes;
     let catalogs = verify_collections(&mut run, header)?;
     let mut indexes = Vec::new();
     let source = run.reader.clone();
+    if let Some(sup) = run.sup.clone() {
+        for id in super::register_catalog::index_ids(&*source, &sup)? {
+            run.row(true)?;
+            if ih.is_some_and(|h| id.0 >= h.next) {
+                return Err(corrupt("verifier index registry"));
+            }
+            let info = super::register_catalog::read_index(&*source, &sup, id)?
+                .ok_or_else(|| corrupt("verifier index registry"))?;
+            if super::register_catalog::index_id(&*source, &sup, info.collection, &info.name)? != Some(id) {
+                run.issue(VerificationIssue {
+                    class: IssueClass::Catalog,
+                    kind: IssueKind::Missing,
+                    key: vec![],
+                    index: Some(id),
+                    entity: None,
+                    message: "index-name mapping".into(),
+                })?;
+            }
+            indexes.push(info);
+        }
+    }
     visit(
         &source,
         &[catalog::REGISTRY],
@@ -895,7 +1048,8 @@ pub fn verify_indexed_source(
             Ok(())
         },
     )?;
-    for info in &indexes {
+    let legacy = run.sup.is_none();
+    for info in indexes.iter().filter(|_| legacy) {
         for copy in 0..3u8 {
             let key = catalog::dkey(info.id, copy);
             match run.read(&key)? {
@@ -943,12 +1097,8 @@ pub fn verify_indexed_source(
             Some(&want),
             "index-name mapping",
         )?;
-        let c = replicas(
-            |k| run.read(k),
-            |copy| replica_key(1, info.collection.0, copy),
-            parse_catalog,
-        )?;
-        let l = layout(|k| run.read(k), c.layout)?;
+        let c = run.catalog(info.collection)?;
+        let l = run.layout(c.layout)?;
         // The SOURCE kind, which is `info.kind` for an ordinary index and the
         // expression's input kind for an expression one: `col->>'m'` reads a
         // `Json` column and stores `Text`.
@@ -961,7 +1111,18 @@ pub fn verify_indexed_source(
             return Err(corrupt("indexed field/layout mismatch"));
         }
     }
-    verify_index_mappings(&mut run, &indexes)?;
+    if run.sup.is_some() {
+        for info in &indexes {
+            let c = run.catalog(info.collection)?;
+            let l = run.layout(c.layout)?;
+            let source = info.source_kind();
+            if !l.fields.iter().any(|(n, k)| n == &info.field && k == &source) {
+                return Err(corrupt("indexed field/layout mismatch"));
+            }
+        }
+    } else {
+        verify_index_mappings(&mut run, &indexes)?;
+    }
     for info in &indexes {
         if info.state != IndexState::Ready {
             run.issue(VerificationIssue {
@@ -1099,7 +1260,7 @@ pub fn verify_indexed_source(
         if id.sequence >= next {
             return Err(corrupt("row identity exceeds sequence allocator"));
         }
-        let l = layout(|k| run.read(k), lid)?;
+        let l = run.layout(lid)?;
         for (ordinal, (name, kind)) in l.fields.iter().enumerate() {
             let decoded = field(&l, row, name)?;
             let Kind::Vector(dimension) = kind else {
@@ -1279,7 +1440,7 @@ fn verify_sidecars_and_mappings<F: FnMut(&VerificationIssue)>(run: &mut Run<F>) 
             })?;
             return Ok(());
         };
-        let l = layout(|k| run.read(k), layout_id(&row)?)?;
+        let l = run.layout(layout_id(&row)?)?;
         let Some((name, Kind::Vector(dimension))) = l.fields.get(ordinal) else {
             run.issue(VerificationIssue {
                 class: IssueClass::Primary,
@@ -1342,7 +1503,7 @@ fn verify_sidecars_and_mappings<F: FnMut(&VerificationIssue)>(run: &mut Run<F>) 
             })?;
             return Ok(());
         };
-        let l = layout(|k| run.read(k), layout_id(&row)?)?;
+        let l = run.layout(layout_id(&row)?)?;
         if !matches!(field(&l,&row,KEY_FIELD)?,crate::dense_v3::FieldValue::Inline(Value::String(found)) if found==external)
         {
             run.issue(VerificationIssue {
@@ -1626,7 +1787,7 @@ fn primary_field<F: FnMut(&VerificationIssue)>(
         })?;
         return Ok(None);
     };
-    let l = layout(|k| run.read(k), layout_id(&row)?)?;
+    let l = run.layout(layout_id(&row)?)?;
     Ok(Some((id, l, row)))
 }
 fn verify_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexInfo) -> Result<()> {
@@ -1861,6 +2022,26 @@ fn verify_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexInfo) 
             let p = crate::index::vector::graph::node_prefix(i.id);
             let end = prefix_end(&p);
             let source = run.reader.clone();
+            // A Register file keeps the graph header as `vENT`, not as the
+            // node keyspace's record 0.
+            if run.sup.is_some() {
+                let key = crate::supportive::schema::vamana_key(i.id.0);
+                if let Some(bytes) = run.entry(&key, &[])? {
+                    if let Ok(header) = crate::index::vector::graph::decode_header(&bytes) {
+                        let entry = crate::index::vector::graph::node_key(i.id, header.entry);
+                        if header.entry != 0 && run.read(&entry)?.is_none() {
+                            run.issue(VerificationIssue {
+                                class: IssueClass::Derived,
+                                kind: IssueKind::Missing,
+                                key: entry,
+                                index: Some(i.id),
+                                entity: None,
+                                message: "vamana graph entry point has no node record".into(),
+                            })?;
+                        }
+                    }
+                }
+            }
             visit(&source, &p, end.as_deref(), |key, value| {
                 run.row(true)?;
                 let mut at = p.len();
@@ -2820,7 +3001,7 @@ fn verify_text_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexI
         .checked_add(block_tokens)
         .ok_or_else(|| corrupt("text corpus tokens"))?;
     let key = crate::index::text::corpus_key(i.id);
-    let actual = run.read(&key)?;
+    let actual = run.entry(&crate::supportive::schema::corpus_key(i.id.0), &key)?;
     let mut expected = [0; 16];
     expected[..8].copy_from_slice(&documents.to_be_bytes());
     expected[8..].copy_from_slice(&tokens.to_be_bytes());
@@ -2876,6 +3057,13 @@ fn verify_edge_id_allocator<F: FnMut(&VerificationIssue)>(
             })?;
         }
         return Ok(None);
+    }
+    if run.sup.is_some() {
+        let bytes = run
+            .entry(&crate::supportive::schema::edge_id_key(), &[])?
+            .ok_or_else(|| corrupt("edge identity declared without its NEXT allocator"))?;
+        let next = u64::from_be_bytes(bytes.try_into().map_err(|_| corrupt("edge-id NEXT"))?);
+        return Ok(Some(next));
     }
     let next = crate::index::graph::read_edge_id_allocator(|k| run.read(k))?;
     for copy in 0..3u8 {
@@ -2999,6 +3187,12 @@ fn verify_graph<F: FnMut(&VerificationIssue)>(
             }
         }
         None
+    } else if let Some(sup) = run.sup.clone() {
+        let source = run.reader.clone();
+        Some(
+            super::register_catalog::read_graph(&*source, &sup)?
+                .ok_or_else(|| corrupt("graph feature without GRPH"))?,
+        )
     } else {
         let header = crate::index::graph::read_graph_header(|k| run.read(k))?;
         for copy in 0..3u8 {

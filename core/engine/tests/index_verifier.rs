@@ -169,6 +169,10 @@ fn clean_all_family_source_is_complete_and_unchanged() {
 
 #[test]
 fn two_way_damage_classifies_derived_and_authoritative_loss_without_writes() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     fixture(&path);
@@ -227,6 +231,10 @@ fn budget_exhaustion_is_an_error_and_preserves_source() {
 
 #[test]
 fn orphan_namespace_and_missing_header_replica_are_not_false_clean() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     fixture(&path);
@@ -271,6 +279,10 @@ fn building_index_is_reported_as_incomplete_lifecycle() {
 
 #[test]
 fn missing_each_derived_family_entry_and_graph_reverse_is_reported() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     fixture(&path);
@@ -297,6 +309,10 @@ fn missing_each_derived_family_entry_and_graph_reverse_is_reported() {
 
 #[test]
 fn ordinary_collection_metadata_and_external_mapping_are_verified() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     let mut db = Database::create(&path, config()).unwrap();
@@ -341,6 +357,10 @@ fn ordinary_collection_metadata_and_external_mapping_are_verified() {
 
 #[test]
 fn duplicate_unique_scalar_value_is_detected_by_ordered_adjacency() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     fixture(&path);
@@ -369,6 +389,10 @@ fn duplicate_unique_scalar_value_is_detected_by_ordered_adjacency() {
 
 #[test]
 fn damaged_replicas_fall_back_and_are_classified() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     fixture(&path);

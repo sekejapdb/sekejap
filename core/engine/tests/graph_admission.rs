@@ -129,6 +129,9 @@ fn assert_refused_unchanged(path: &Path, unsupported: bool) {
 
 #[test]
 fn intact_future_graph_header_or_name_replica_refuses_before_source_mutation() {
+    // It writes and reads 0.18-format header or descriptor bytes: pinned
+    // to that format (a Register file's are `supportive::*_tests`).
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     for (family, copy) in (0..3u8).flat_map(|copy| [(0u8, copy), (1u8, copy)]) {
         let path = temp.path().join(format!("future-{family}-{copy}"));
@@ -157,6 +160,9 @@ fn intact_future_graph_header_or_name_replica_refuses_before_source_mutation() {
 
 #[test]
 fn graph_rows_cannot_be_hidden_by_clearing_feature_and_metadata() {
+    // It writes and reads 0.18-format header or descriptor bytes: pinned
+    // to that format (a Register file's are `supportive::*_tests`).
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("hidden-edges");
     fixture(&path);
@@ -181,6 +187,9 @@ fn graph_rows_cannot_be_hidden_by_clearing_feature_and_metadata() {
 
 #[test]
 fn damaged_graph_metadata_replica_falls_back_without_rewriting_source() {
+    // It writes and reads 0.18-format header or descriptor bytes: pinned
+    // to that format (a Register file's are `supportive::*_tests`).
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     for copy in 0..3u8 {
         let path = temp.path().join(format!("damaged-{copy}"));

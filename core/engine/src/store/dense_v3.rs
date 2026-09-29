@@ -107,7 +107,7 @@ pub(crate) fn encode_direct(layout: &Layout, doc: &Value) -> Result<Encoded> {
     }
     Ok(Encoded { row: out, vectors })
 }
-pub(crate) fn decode_direct(
+fn decode_direct_raw(
     layout: &Layout,
     bytes: &[u8],
     mut get: impl FnMut(usize) -> Result<Vec<u8>>,
@@ -174,7 +174,7 @@ impl FieldPlan {
 ///
 /// `fields` may name undeclared keys; those are answered from the extras
 /// object exactly as the single-field reader answers them.
-pub(crate) fn read_fields(
+fn read_fields_raw(
     layout: &Layout,
     bytes: &[u8],
     fields: &[String],
@@ -341,7 +341,7 @@ pub(crate) enum TextFieldRef<'b> {
 /// line later. The row is still validated end to end: this walks and checks
 /// exactly what `read_field_in` walks and checks, and only the one field it
 /// was asked for comes back, as a borrow into `bytes`.
-pub(crate) fn read_text_field_in<'b>(
+fn read_text_field_in_raw<'b>(
     layout: &Layout,
     bytes: &'b [u8],
     field: &str,
@@ -462,7 +462,7 @@ pub(crate) fn read_field(layout: &Layout, bytes: &[u8], field: &str) -> Result<F
 /// learn what building it had already established: measured at 147 ns against
 /// 87 ns per field read, on a path a non-driving field predicate walks once
 /// per candidate.
-pub(crate) fn read_field_in(layout: &Layout, bytes: &[u8], field: &str) -> Result<FieldValue> {
+fn read_field_in_raw(layout: &Layout, bytes: &[u8], field: &str) -> Result<FieldValue> {
     let declared = layout.fields.iter().position(|(name, _)| name == field);
     let mut selected = FieldValue::Missing;
     let mut r = Read { b: bytes, p: 0 };
@@ -620,7 +620,7 @@ pub(crate) fn read_field_in(layout: &Layout, bytes: &[u8], field: &str) -> Resul
 /// wants. The write path, recovery, index maintenance and the verifier keep
 /// the full reader, so such a row is still refused everywhere a decision is
 /// durable.
-pub(crate) fn read_field_in_trusted(layout: &Layout, bytes: &[u8], field: &str) -> Result<FieldValue> {
+fn read_field_in_trusted_raw(layout: &Layout, bytes: &[u8], field: &str) -> Result<FieldValue> {
     let Some(declared) = layout.fields.iter().position(|(name, _)| name == field) else {
         // Extras carry their own structure; the validated path is the only
         // way to find a key there.
@@ -664,7 +664,7 @@ pub(crate) fn read_field_in_trusted(layout: &Layout, bytes: &[u8], field: &str) 
 /// checked -- exactly as the full reader does, then BORROWED. The per-row
 /// `LIKE` check reads text this way; the sacrifice is the one named on
 /// [`read_field_in_trusted`].
-pub(crate) fn read_text_field_in_trusted<'b>(
+fn read_text_field_in_trusted_raw<'b>(
     layout: &Layout,
     bytes: &'b [u8],
     field: &str,
@@ -880,7 +880,7 @@ pub(crate) fn locate_vector(
 
 // Mutation readers can validate and retain a sidecar without materializing
 // thousands of JSON numbers that replacement/deletion will immediately discard.
-pub(crate) fn decode_with_vector_values(
+fn decode_with_vector_values_raw(
     layout: &Layout,
     bytes: &[u8],
     mut get: impl FnMut(usize, usize) -> Result<Option<Value>>,
@@ -971,6 +971,94 @@ pub(crate) fn decode_with_vector_values(
     Ok(Value::Object(obj))
 }
 
+// ── F2: a later column's DEFAULT, read by a row that predates it ──────────
+//
+// Each public reader is its raw self plus one check: when the raw answer is
+// "missing" and the layout carries a default for that field
+// (`Layout::absent`), the default is the answer. A layout with no defaults --
+// every layout of a table no `ADD COLUMN ... DEFAULT` touched -- pays one
+// `Option` test.
+
+pub(crate) fn read_fields(
+    layout: &Layout,
+    bytes: &[u8],
+    fields: &[String],
+    plan: &FieldPlan,
+    out: &mut Vec<FieldValue>,
+) -> Result<()> {
+    read_fields_raw(layout, bytes, fields, plan, out)?;
+    if layout.absent.0.is_some() {
+        for (slot, field) in fields.iter().enumerate() {
+            if matches!(out[slot], FieldValue::Missing) {
+                if let Some(v) = layout.absent_default(field) {
+                    out[slot] = FieldValue::Inline(v.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+pub(crate) fn read_field_in(layout: &Layout, bytes: &[u8], field: &str) -> Result<FieldValue> {
+    let v = read_field_in_raw(layout, bytes, field)?;
+    Ok(absent_or(layout, field, v))
+}
+pub(crate) fn read_field_in_trusted(layout: &Layout, bytes: &[u8], field: &str) -> Result<FieldValue> {
+    let v = read_field_in_trusted_raw(layout, bytes, field)?;
+    Ok(absent_or(layout, field, v))
+}
+fn absent_or(layout: &Layout, field: &str, v: FieldValue) -> FieldValue {
+    match (&v, layout.absent_default(field)) {
+        (FieldValue::Missing, Some(d)) => FieldValue::Inline(d.clone()),
+        _ => v,
+    }
+}
+/// A text reader borrows from the row, so a default it cannot borrow is
+/// answered `Elsewhere`: the caller then reads the value through
+/// [`read_field_in`], which has it.
+pub(crate) fn read_text_field_in<'b>(layout: &Layout, bytes: &'b [u8], field: &str) -> Result<TextFieldRef<'b>> {
+    let v = read_text_field_in_raw(layout, bytes, field)?;
+    Ok(match v {
+        TextFieldRef::Missing if layout.absent_default(field).is_some() => TextFieldRef::Elsewhere,
+        v => v,
+    })
+}
+pub(crate) fn read_text_field_in_trusted<'b>(
+    layout: &Layout,
+    bytes: &'b [u8],
+    field: &str,
+) -> Result<TextFieldRef<'b>> {
+    let v = read_text_field_in_trusted_raw(layout, bytes, field)?;
+    Ok(match v {
+        TextFieldRef::Missing if layout.absent_default(field).is_some() => TextFieldRef::Elsewhere,
+        v => v,
+    })
+}
+pub(crate) fn decode_with_vector_values(
+    layout: &Layout,
+    bytes: &[u8],
+    get: impl FnMut(usize, usize) -> Result<Option<Value>>,
+) -> Result<Value> {
+    let mut doc = decode_with_vector_values_raw(layout, bytes, get)?;
+    fill_absent(layout, &mut doc);
+    Ok(doc)
+}
+pub(crate) fn decode_direct(
+    layout: &Layout,
+    bytes: &[u8],
+    get: impl FnMut(usize) -> Result<Vec<u8>>,
+) -> Result<Value> {
+    let mut doc = decode_direct_raw(layout, bytes, get)?;
+    fill_absent(layout, &mut doc);
+    Ok(doc)
+}
+fn fill_absent(layout: &Layout, doc: &mut Value) {
+    if let (Some(defaults), Some(object)) = (layout.absent.0.as_ref(), doc.as_object_mut()) {
+        for (name, value) in defaults.iter() {
+            object.entry(name.clone()).or_insert_with(|| value.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1031,7 +1119,7 @@ mod tests {
                 ("left".into(), Kind::Vector(2)),
                 ("target".into(), Kind::Vector(3)),
                 ("tail".into(), Kind::Text),
-            ],
+            ], absent: Default::default(),
         };
         let document = json!({
             "text":"hello λ", "int":i64::MIN, "real":-0.0, "bool":true,
@@ -1065,7 +1153,7 @@ mod tests {
                 ("other".into(), Kind::Vector(2)),
                 ("target".into(), Kind::Vector(3)),
                 ("tail".into(), Kind::Bool),
-            ],
+            ], absent: Default::default(),
         };
         for document in [
             json!({"other":[1,2],"tail":true}),
@@ -1085,7 +1173,7 @@ mod tests {
                 ("prefix".into(), Kind::Text),
                 ("target".into(), Kind::Vector(3)),
                 ("other".into(), Kind::Vector(2)),
-            ],
+            ], absent: Default::default(),
         };
         let new = Layout {
             id: 53,
@@ -1093,7 +1181,7 @@ mod tests {
                 ("other".into(), Kind::Vector(2)),
                 ("flag".into(), Kind::Bool),
                 ("target".into(), Kind::Vector(3)),
-            ],
+            ], absent: Default::default(),
         };
         let old_row = encode_direct(
             &old,
@@ -1113,7 +1201,7 @@ mod tests {
 
         let scalar = Layout {
             id: 54,
-            fields: vec![("target".into(), Kind::Text), ("tail".into(), Kind::Bool)],
+            fields: vec![("target".into(), Kind::Text), ("tail".into(), Kind::Bool)], absent: Default::default(),
         };
         let scalar_row = encode_direct(&scalar, &json!({"target":"old","tail":true})).unwrap();
         assert!(locate_vector(&scalar, &scalar_row.row, "target", 3).is_err());
@@ -1126,14 +1214,14 @@ mod tests {
 
         let wrong_dimension = Layout {
             id: 55,
-            fields: vec![("target".into(), Kind::Vector(2))],
+            fields: vec![("target".into(), Kind::Vector(2))], absent: Default::default(),
         };
         let wrong_row = encode_direct(&wrong_dimension, &json!({"target":[1,2]})).unwrap();
         assert!(locate_vector(&wrong_dimension, &wrong_row.row, "target", 3).is_err());
 
         let absent = Layout {
             id: 56,
-            fields: vec![("other".into(), Kind::Bool)],
+            fields: vec![("other".into(), Kind::Bool)], absent: Default::default(),
         };
         let absent_row = encode_direct(&absent, &json!({"other":true,"target":[1,2,3]})).unwrap();
         assert_eq!(
@@ -1150,7 +1238,7 @@ mod tests {
                 ("target".into(), Kind::Vector(3)),
                 ("tail".into(), Kind::Json),
                 ("text".into(), Kind::Text),
-            ],
+            ], absent: Default::default(),
         };
         let encoded = encode_direct(
             &layout,
@@ -1197,7 +1285,7 @@ mod tests {
         for (case, (kind, value, width)) in cases.into_iter().enumerate() {
             let layout = Layout {
                 id: 70 + case as u64,
-                fields: vec![("target".into(), Kind::Vector(2)), ("value".into(), kind)],
+                fields: vec![("target".into(), Kind::Vector(2)), ("value".into(), kind)], absent: Default::default(),
             };
             let encoded = encode_direct(&layout, &json!({"target":[1,2],"value":value})).unwrap();
             let at = inline_start(&layout, &encoded.row);
@@ -1214,7 +1302,7 @@ mod tests {
 
         let extras_layout = Layout {
             id: 73,
-            fields: vec![("target".into(), Kind::Vector(2))],
+            fields: vec![("target".into(), Kind::Vector(2))], absent: Default::default(),
         };
         let extras = encode_direct(
             &extras_layout,
@@ -1247,7 +1335,7 @@ mod tests {
                 ("vector_null".into(), Kind::Vector(4)),
                 ("missing".into(), Kind::Text),
                 ("null".into(), Kind::Json),
-            ],
+            ], absent: Default::default(),
         };
         let document = json!({
             "text":"hello 雪", "int":-9007199254740993_i64, "real":1.25, "bool":true,
@@ -1320,7 +1408,7 @@ mod tests {
                 ("prefix".into(), Kind::Text),
                 ("embedding".into(), Kind::Vector(3)),
                 ("other".into(), Kind::Vector(2)),
-            ],
+            ], absent: Default::default(),
         };
         let reordered = Layout {
             id: 83,
@@ -1328,11 +1416,11 @@ mod tests {
                 ("other".into(), Kind::Vector(2)),
                 ("active".into(), Kind::Bool),
                 ("embedding".into(), Kind::Vector(3)),
-            ],
+            ], absent: Default::default(),
         };
         let historical = Layout {
             id: 84,
-            fields: vec![("active".into(), Kind::Bool)],
+            fields: vec![("active".into(), Kind::Bool)], absent: Default::default(),
         };
         let old_row = encode_direct(
             &old,
@@ -1389,7 +1477,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, _)| (format!("i{i}"), Kind::Int))
-                .collect(),
+                .collect(), absent: Default::default(),
         };
         let mut document = Map::new();
         for (i, value) in values.iter().enumerate() {
@@ -1414,7 +1502,7 @@ mod tests {
                 ("early".into(), Kind::Text),
                 ("tail".into(), Kind::Json),
                 ("point".into(), Kind::Point),
-            ],
+            ], absent: Default::default(),
         };
         let encoded = encode_direct(
             &layout,
@@ -1518,7 +1606,7 @@ mod tests {
             ]);
             let layout = Layout {
                 id: if round % 2 == 0 { 17 } else { u32::MAX as u64 },
-                fields,
+                fields, absent: Default::default(),
             };
             let mut doc = json!({"text":"hello λ","real":-0.0,"bool":true,"json":{"nested":[null,true,1.5,{"z":u64::MAX}]},"point":{"type":"Point","coordinates":[1.25,-2.5]},"geo":{"type":"LineString","coordinates":[[1.0,2.0],[3.0,4.0]]},"vector":[0.25,-1.0,4.0]});
             for (i, n) in integers.iter().enumerate() {
@@ -1572,7 +1660,7 @@ mod tests {
     fn malformed_inline_bytes_never_fetch_external_vectors() {
         let layout = Layout {
             id: 1,
-            fields: vec![("v".into(), Kind::Vector(1))],
+            fields: vec![("v".into(), Kind::Vector(1))], absent: Default::default(),
         };
         let mut row = encode_direct(&layout, &json!({"v":[1.0]})).unwrap().row;
         row.push(0);
@@ -1599,7 +1687,7 @@ mod tests {
                 ("addr".into(), Kind::Point),
                 ("shape".into(), Kind::Geo),
                 ("ok".into(), Kind::Bool),
-            ],
+            ], absent: Default::default(),
         };
         let encoded = encode_direct(
             &layout,

@@ -151,6 +151,9 @@ fn index_of(db: &Database, manifest: &Value) -> IndexId {
 /// own manifest carries.
 #[test]
 fn the_preserved_vamana_corpus_opens_and_answers_its_own_brute_force_oracle() {
+    // A preserved 0.18 corpus, opened as it is: 0.18 compatibility, which
+    // 0.19 keeps for these tests and for `sekejap-upgrade` only.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     for fx in load() {
         // The shape the fixture was written at is the shape this build
         // implements: a graph whose degree or alpha differed would be a graph
@@ -243,6 +246,9 @@ fn a_build_that_predates_the_vamana_bit_refuses_the_corpus_by_name_and_changes_n
 /// database declares exactly the word the fixture did.
 #[test]
 fn writing_to_a_copy_of_the_corpus_promotes_no_feature_and_keeps_the_graph_whole() {
+    // A preserved 0.18 corpus, opened as it is: 0.18 compatibility, which
+    // 0.19 keeps for these tests and for `sekejap-upgrade` only.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     for fx in load() {
         let before = bytes_of(&fx.dir);
         let temp = copy(&fx, "write");

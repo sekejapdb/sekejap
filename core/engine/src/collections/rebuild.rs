@@ -421,6 +421,21 @@ fn put_replicas(
 
 struct Metadata {
     header: HeaderInfo,
+    /// The source is a Register file: the destination is created as one.
+    anchored: bool,
+    /// The destination is a Register file whatever the source is: the
+    /// upgrade from 0.18 (`upgrade_to_register`).
+    to_register: bool,
+    /// For an upgrade: the table each 0.18 layout belongs to, which a 0.18
+    /// layout does not record. Learned from the table's current layout and
+    /// from the rows; a layout no row and no table uses is not carried.
+    layout_tables: BTreeMap<u64, CollectionId>,
+    /// A Register source's census and every entry of its Register, copied
+    /// into the destination's Register as they are.
+    register: Option<(
+        Vec<crate::supportive::carrier::CensusLine>,
+        Vec<(crate::supportive::carrier::Key, u8, Vec<u8>)>,
+    )>,
     catalogs: Vec<(Catalog, u64)>,
     layouts: Vec<Layout>,
     indexes: Vec<IndexInfo>,
@@ -443,8 +458,17 @@ struct Metadata {
     schemas: Vec<String>,
 }
 
-fn collect_metadata(source: &SourceView) -> Result<Metadata> {
-    let (header, _) = replicated_raw(source, |copy| vec![0, 0, copy], parse_header)?;
+fn collect_metadata(source: &SourceView, to_register: bool) -> Result<Metadata> {
+    let anchored = crate::supportive::header::anchored(&*source.reader)?;
+    let mut sup_read = None;
+    let header = if anchored {
+        let sup = crate::supportive::header::Supportive::read(&*source.reader)?;
+        sup_read = Some(sup.clone());
+        let count = super::register_catalog::index_ids(&*source.reader, &sup)?.len();
+        super::header_of(&sup, u32::try_from(count).map_err(corrupt)?)?
+    } else {
+        replicated_raw(source, |copy| vec![0, 0, copy], parse_header)?.0
+    };
     let collections = usize::try_from(header.next_collection - 1)
         .map_err(|_| corrupt("collection allocator domain"))?;
     let layouts =
@@ -455,7 +479,41 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
         )));
     }
     let mut catalogs = Vec::with_capacity(collections);
-    for id in 1..header.next_collection {
+    let mut decoded_layouts = Vec::with_capacity(layouts);
+    let mut register = None;
+    let mut schemas = Vec::new();
+    if let Some(sup) = &sup_read {
+        let r = &*source.reader;
+        for id in 1..header.next_collection {
+            source.charge_records(1)?;
+            let Some(c) = super::register_catalog::read_catalog(r, sup, CollectionId(id))? else {
+                continue;
+            };
+            let next = super::register_catalog::sequence(r, sup, id)?;
+            catalogs.push((c, next));
+        }
+        for id in 1..header.next_layout {
+            source.charge_records(1)?;
+            if let Some((_, l)) = super::register_catalog::read_layout(r, sup, id, None)? {
+                decoded_layouts.push(l);
+            }
+        }
+        schemas = super::register_catalog::names(r, sup, crate::supportive::schema::NAME_SCHEMA, 0)?
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        register = Some((sup.anchor.census.clone(), sup.register.scan_prefix(r, &[])?));
+    }
+    for id in (1..header.next_collection).filter(|_| sup_read.is_none()) {
+        // A dropped collection leaves its id unused: no copy at all is a gap,
+        // not damage (a damaged copy still fails below).
+        let mut present = false;
+        for copy in 0..3u8 {
+            present |= source.get(&replica_key(1, id, copy))?.is_some();
+        }
+        if !present {
+            continue;
+        }
         let (catalog, _) = replicated_raw(source, |copy| replica_key(1, id, copy), catalog)?;
         if catalog.id.0 != id || catalog.layout == 0 || catalog.layout >= header.next_layout {
             return Err(corrupt("collection descriptor identity/allocator"));
@@ -463,8 +521,15 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
         let (next, _) = replicated_raw(source, |copy| replica_key(2, id, copy), sequence)?;
         catalogs.push((catalog, next));
     }
-    let mut decoded_layouts = Vec::with_capacity(layouts);
-    for id in 1..header.next_layout {
+    for id in (1..header.next_layout).filter(|_| sup_read.is_none()) {
+        // A dropped collection's current layout is deleted with it.
+        let mut present = false;
+        for copy in 0..3u8 {
+            present |= source.get(&layout_key(id, copy))?.is_some();
+        }
+        if !present {
+            continue;
+        }
         let (layout, _) = replicated_raw(source, |copy| layout_key(id, copy), decode_layout)?;
         if layout.id != u64::from(id) {
             return Err(corrupt("layout descriptor identity"));
@@ -480,10 +545,17 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
         }
     }
 
-    let ids = collect_index_ids(source, header.indexes)?;
+    let ids = match &sup_read {
+        Some(sup) => super::register_catalog::index_ids(&*source.reader, sup)?,
+        None => collect_index_ids(source, header.indexes)?,
+    };
     let mut decoded_indexes = Vec::with_capacity(ids.len());
     for id in ids {
-        let (index, _) = replicated_raw(source, |copy| catalog::dkey(id, copy), catalog::decode)?;
+        let index = match &sup_read {
+            Some(sup) => super::register_catalog::read_index(&*source.reader, sup, id)?
+                .ok_or_else(|| corrupt("index INDX missing"))?,
+            None => replicated_raw(source, |copy| catalog::dkey(id, copy), catalog::decode)?.0,
+        };
         if index.id != id || index.state != IndexState::Ready {
             return Err(Error::Unsupported(
                 "index rebuild requires every declared index to be READY".into(),
@@ -502,7 +574,7 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
         if !layout
             .fields
             .iter()
-            .any(|(name, kind)| name == &index.field && kind == &index.kind)
+            .any(|(name, kind)| name == &index.field && *kind == index.source_kind())
         {
             return Err(corrupt("index field does not match the current layout"));
         }
@@ -533,7 +605,11 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
         .is_some_and(|value| value.features & crate::index::graph::GRAPH_FEATURE != 0);
     let mut graph_header = None;
     let mut graph_names = Vec::new();
-    if graph_enabled {
+    if let (true, Some(sup)) = (graph_enabled, &sup_read) {
+        let h = super::register_catalog::read_graph(&*source.reader, sup)?
+            .ok_or_else(|| corrupt("graph feature without GRPH"))?;
+        graph_header = Some((h, Vec::new()));
+    } else if graph_enabled {
         let (decoded, bytes) = replicated_raw(
             source,
             crate::index::graph::graph_header_key,
@@ -565,9 +641,10 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
         }
         graph_header = Some((decoded, bytes));
     }
-    let edge_id_allocator = if header
-        .indexes
-        .is_some_and(|value| value.features & crate::index::graph::EDGE_ID_FEATURE != 0)
+    let edge_id_allocator = if sup_read.is_none()
+        && header
+            .indexes
+            .is_some_and(|value| value.features & crate::index::graph::EDGE_ID_FEATURE != 0)
     {
         if !graph_enabled {
             return Err(corrupt("edge identity feature declared without the graph feature"));
@@ -577,6 +654,19 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
             crate::index::graph::edge_id_allocator_key,
             crate::index::graph::decode_edge_id_allocator,
         )?)
+    } else if let (Some(sup), true) = (
+        &sup_read,
+        header
+            .indexes
+            .is_some_and(|value| value.features & crate::index::graph::EDGE_ID_FEATURE != 0),
+    ) {
+        let bytes = sup
+            .register
+            .get(&*source.reader, &crate::supportive::schema::edge_id_key())?
+            .map(|(_, p)| p)
+            .ok_or_else(|| corrupt("edge identity declared without its NEXT allocator"))?;
+        let next = u64::from_be_bytes(bytes.as_slice().try_into().map_err(|_| corrupt("edge-id NEXT"))?);
+        Some((next, bytes))
     } else {
         None
     };
@@ -589,16 +679,23 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
         .is_some_and(|value| value.features & row_count::ROW_COUNT_FEATURE != 0)
     {
         for (catalog, _) in &catalogs {
-            if let Some(bytes) = source.get(&row_count::row_count_key(catalog.id))? {
+            let bytes = match &sup_read {
+                Some(sup) => sup
+                    .register
+                    .get(&*source.reader, &crate::supportive::schema::row_count_key(u64::from(catalog.id.0)))?
+                    .map(|(_, p)| p),
+                None => source.get(&row_count::row_count_key(catalog.id))?,
+            };
+            if let Some(bytes) = bytes {
                 row_count::decode(&bytes)?;
                 row_counted.push(catalog.id);
             }
         }
     }
-    let mut schemas = Vec::new();
-    if header
-        .indexes
-        .is_some_and(|value| value.features & SCHEMA_FEATURE != 0)
+    if sup_read.is_none()
+        && header
+            .indexes
+            .is_some_and(|value| value.features & SCHEMA_FEATURE != 0)
     {
         source.visit(&[0x10, SCHEMA_MARK], Some(&[0x11]), |key, value| {
             if let NameEntry::Schema(schema) = parse_name_key(key)? {
@@ -622,8 +719,28 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
             }
         }
     }
+    let mut layout_tables = BTreeMap::new();
+    if to_register && sup_read.is_none() {
+        for (catalog, _) in &catalogs {
+            layout_tables.insert(u64::from(catalog.layout), catalog.id);
+        }
+        source.visit(&[0x40], Some(&[0x41]), |key, value| {
+            let id = row_id(key)?;
+            let layout = u64::from(layout_id(value)?);
+            if let Some(owner) = layout_tables.insert(layout, id.collection) {
+                if owner != id.collection {
+                    return Err(corrupt("one layout used by rows of two tables"));
+                }
+            }
+            Ok(())
+        })?;
+    }
     Ok(Metadata {
         header,
+        anchored,
+        to_register,
+        layout_tables,
+        register,
         catalogs,
         layouts: decoded_layouts,
         indexes: decoded_indexes,
@@ -635,13 +752,55 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
     })
 }
 
-fn seed_metadata(destination: &mut Destination, metadata: &Metadata) -> Result<()> {
-    let header = header_bytes(metadata.header)?;
-    put_replicas(destination, |copy| vec![0, 0, copy], &header)?;
-    for schema in &metadata.schemas {
+fn seed_metadata(
+    destination: &mut Destination,
+    metadata: &Metadata,
+) -> Result<Option<crate::supportive::header::Supportive>> {
+    if metadata.to_register && !metadata.anchored {
+        return seed_register_from_legacy(destination, metadata).map(Some);
+    }
+    let mut kept = None;
+    if metadata.anchored {
+        let h = metadata.header;
+        let mut sup = crate::supportive::header::Supportive::create(
+            &mut destination.store,
+            h.limits.map(|l| l.encode()),
+        )?;
+        sup.write(
+            &mut destination.store,
+            h.next_collection,
+            h.next_layout,
+            h.indexes.map(|i| (i.features, i.next)),
+        )?;
+        // Every other supportive fact is copied entry for entry; the header
+        // entries were just written with the same values.
+        let (census, entries) = metadata.register.as_ref().expect("a Register source");
+        for (key, version, payload) in entries {
+            sup.register.put(&mut destination.store, key, *version, payload)?;
+        }
+        sup.sync(&mut destination.store, census.clone())?;
+        // The copied indexes restart as BUILDING over an empty tree: a root
+        // is a page number of the source.
+        for index in &metadata.indexes {
+            let mut building = index.clone();
+            building.state = IndexState::Building { after: 0 };
+            if let Some(t) = building.tree {
+                building.tree = Some(catalog::IndexTree { id: t.id, root: 0 });
+            }
+            super::register_catalog::write_index(&mut destination.store, &mut sup, Some(index), &building)?;
+            if index.family == IndexFamily::Text {
+                put_empty_corpus(destination, &mut sup, index.id)?;
+            }
+        }
+        kept = Some(sup);
+    } else {
+        let header = header_bytes(metadata.header)?;
+        put_replicas(destination, |copy| vec![0, 0, copy], &header)?;
+    }
+    for schema in metadata.schemas.iter().filter(|_| !metadata.anchored) {
         destination.put(&schema_key(schema), &[])?;
     }
-    for (catalog, next) in &metadata.catalogs {
+    for (catalog, next) in metadata.catalogs.iter().filter(|_| !metadata.anchored) {
         let bytes = catalog_bytes(catalog)?;
         put_replicas(
             destination,
@@ -662,7 +821,7 @@ fn seed_metadata(destination: &mut Destination, metadata: &Metadata) -> Result<(
         }
         destination.put(&name, &catalog.id.0.to_be_bytes())?;
     }
-    for layout in &metadata.layouts {
+    for layout in metadata.layouts.iter().filter(|_| !metadata.anchored) {
         let id = u32::try_from(layout.id).map_err(corrupt)?;
         let bytes = layout.descriptor().map_err(corrupt)?;
         put_replicas(destination, |copy| layout_key(id, copy), &bytes)?;
@@ -681,23 +840,25 @@ fn seed_metadata(destination: &mut Destination, metadata: &Metadata) -> Result<(
         if let Some(t) = building.tree {
             building.tree = Some(catalog::IndexTree { id: t.id, root: 0 });
         }
-        let bytes = catalog::encode(&building)?;
-        put_replicas(destination, |copy| catalog::dkey(index.id, copy), &bytes)?;
-        destination.put(
-            &catalog::ikey(catalog::REGISTRY, index.id),
-            &index.collection.0.to_be_bytes(),
-        )?;
-        destination.put(&catalog::ckey(index.collection, index.id), &[])?;
-        let name = catalog::nkey(index.collection, &index.name);
-        if destination.store.get(&name)?.is_some() {
-            return Err(corrupt("duplicate index name in authoritative catalog"));
+        if !metadata.anchored {
+            let bytes = catalog::encode(&building)?;
+            put_replicas(destination, |copy| catalog::dkey(index.id, copy), &bytes)?;
+            destination.put(
+                &catalog::ikey(catalog::REGISTRY, index.id),
+                &index.collection.0.to_be_bytes(),
+            )?;
+            destination.put(&catalog::ckey(index.collection, index.id), &[])?;
+            let name = catalog::nkey(index.collection, &index.name);
+            if destination.store.get(&name)?.is_some() {
+                return Err(corrupt("duplicate index name in authoritative catalog"));
+            }
+            destination.put(&name, &ordered(index.id.0))?;
         }
-        destination.put(&name, &ordered(index.id.0))?;
-        if index.family == IndexFamily::Text {
+        if index.family == IndexFamily::Text && !metadata.anchored {
             destination.put(&crate::index::text::corpus_key(index.id), &[0; 16])?;
         }
     }
-    if let Some((_, bytes)) = &metadata.graph_header {
+    if let Some((_, bytes)) = metadata.graph_header.as_ref().filter(|_| !metadata.anchored) {
         put_replicas(destination, crate::index::graph::graph_header_key, bytes)?;
         for (kind, name, bytes) in &metadata.graph_names {
             put_replicas(
@@ -712,10 +873,92 @@ fn seed_metadata(destination: &mut Destination, metadata: &Metadata) -> Result<(
             destination.put(&lookup, &ordered(name.id))?;
         }
     }
-    if let Some((_, bytes)) = &metadata.edge_id_allocator {
+    if let Some((_, bytes)) = metadata.edge_id_allocator.as_ref().filter(|_| !metadata.anchored) {
         put_replicas(destination, crate::index::graph::edge_id_allocator_key, bytes)?;
     }
-    Ok(())
+    Ok(kept)
+}
+
+fn put_empty_corpus(
+    destination: &mut Destination,
+    sup: &mut crate::supportive::header::Supportive,
+    id: IndexId,
+) -> Result<()> {
+    sup.put(
+        &mut destination.store,
+        &crate::supportive::schema::corpus_key(id.0),
+        crate::supportive::schema::line(b"tCRP", 1, 0),
+        &[0; 16],
+    )
+}
+
+/// The upgrade from 0.18 (`docs/core/SUPPORTIVE.md` section 3): every
+/// supportive fact of a 0.18 source written as Register entries into a
+/// fresh destination. Rows, vectors and edges are copied after this exactly
+/// as a rebuild copies them, and every index is rebuilt from them.
+fn seed_register_from_legacy(
+    destination: &mut Destination,
+    metadata: &Metadata,
+) -> Result<crate::supportive::header::Supportive> {
+    use super::register_catalog as rc;
+    use crate::supportive::schema::{self as sch, line};
+    let h = metadata.header;
+    let w = &mut destination.store;
+    let mut sup = crate::supportive::header::Supportive::create(w, h.limits.map(|l| l.encode()))?;
+    sup.write(w, h.next_collection, h.next_layout, h.indexes.map(|i| (i.features, i.next)))?;
+    let mut schemas = metadata.schemas.clone();
+    schemas.sort();
+    for schema in &schemas {
+        rc::create_schema(w, &mut sup, schema)?;
+    }
+    // Oldest first, so a column's id is the one its first layout gave it.
+    let mut layouts: Vec<&Layout> = metadata.layouts.iter().collect();
+    layouts.sort_by_key(|l| l.id);
+    for layout in layouts {
+        if let Some(table) = metadata.layout_tables.get(&layout.id) {
+            rc::write_layout(w, &mut sup, *table, layout)?;
+        }
+    }
+    for (catalog, next) in &metadata.catalogs {
+        rc::write_catalog(w, &mut sup, None, catalog)?;
+        let schema = rc::schema_id(w, &sup, catalog.schema.as_deref())?
+            .ok_or_else(|| corrupt("collection names a schema the source does not hold"))?;
+        if rc::table_id(w, &sup, schema, &catalog.name)?.is_some() {
+            return Err(corrupt("duplicate collection name in authoritative catalog"));
+        }
+        rc::put_table_name(w, &mut sup, schema, &catalog.name, catalog.id)?;
+        sup.put(
+            w,
+            &sch::sequence_key(u64::from(catalog.id.0)),
+            line(b"NEXT", 1, sch::NEXT_ROW as u32),
+            &next.to_be_bytes(),
+        )?;
+    }
+    if let Some((graph, _)) = &metadata.graph_header {
+        rc::write_graph(w, &mut sup, None, *graph)?;
+        for (kind, name, _) in &metadata.graph_names {
+            rc::put_graph_name(w, &mut sup, *kind, name.id, &name.name)?;
+        }
+    }
+    if let Some((next, _)) = &metadata.edge_id_allocator {
+        sup.put(w, &sch::edge_id_key(), line(b"NEXT", 1, sch::NEXT_EDGE_ID as u32), &next.to_be_bytes())?;
+    }
+    for index in &metadata.indexes {
+        let mut building = index.clone();
+        building.state = IndexState::Building { after: 0 };
+        if let Some(t) = building.tree {
+            building.tree = Some(catalog::IndexTree { id: t.id, root: 0 });
+        }
+        rc::write_index(w, &mut sup, None, &building)?;
+        if rc::index_id(w, &sup, index.collection, &index.name)?.is_some() {
+            return Err(corrupt("duplicate index name in authoritative catalog"));
+        }
+        rc::put_index_name(w, &mut sup, index.collection, &index.name, index.id)?;
+        if index.family == IndexFamily::Text {
+            sup.put(w, &sch::corpus_key(index.id.0), line(b"tCRP", 1, 0), &[0; 16])?;
+        }
+    }
+    Ok(sup)
 }
 
 fn layout_for<'a>(metadata: &'a Metadata, id: u32) -> Result<&'a Layout> {
@@ -1187,6 +1430,35 @@ pub fn rebuild_derived_indexes(
     destination: impl AsRef<Path>,
     limits: RebuildLimits,
 ) -> Result<RebuildReport> {
+    // Outside 0.18 compatibility, a 0.18 source is rebuilt into the 0.19
+    // format: the destination has to be a file this build opens.
+    rebuild(
+        source.as_ref(),
+        destination.as_ref(),
+        limits,
+        !crate::supportive::header::legacy_mode(),
+    )
+}
+
+/// The 0.18 -> 0.19 upgrade (`docs/core/SUPPORTIVE.md` section 3): the
+/// rebuild above with a Register-file destination. The source is read, never
+/// written; the destination is complete, verified and marked complete, or
+/// the call fails and the destination is an incomplete directory to delete.
+/// A Register-file source is rebuilt as one, as the plain rebuild does.
+pub fn upgrade_to_register(
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    limits: RebuildLimits,
+) -> Result<RebuildReport> {
+    rebuild(source.as_ref(), destination.as_ref(), limits, true)
+}
+
+fn rebuild(
+    source: &Path,
+    destination: &Path,
+    limits: RebuildLimits,
+    to_register: bool,
+) -> Result<RebuildReport> {
     validate_limits(limits)?;
     let (source_path, destination_path) = destination_path(source.as_ref(), destination.as_ref())?;
     let source_reader =
@@ -1197,7 +1469,7 @@ pub fn rebuild_derived_indexes(
         records: Cell::new(0),
         points: Cell::new(0),
     };
-    let metadata = collect_metadata(&source)?;
+    let metadata = collect_metadata(&source, to_register)?;
     validate_namespaces(&source, &metadata)?;
 
     let (control_reserve, maximum_completion_len) =
@@ -1247,16 +1519,22 @@ pub fn rebuild_derived_indexes(
         batch: limits.batch,
         pending: 0,
     };
-    seed_metadata(&mut destination, &metadata)?;
+    let mut sup = seed_metadata(&mut destination, &metadata)?;
     let (primary_rows, live_rows) = copy_primary_rows(&source, &mut destination, &metadata)?;
     for id in &metadata.row_counted {
-        destination.put(
-            &row_count::row_count_key(*id),
-            &row_count::encode(row_count::RowCountRecord {
-                rows: live_rows.get(id).copied().unwrap_or(0),
-                generation: 1,
-            }),
-        )?;
+        let record = row_count::encode(row_count::RowCountRecord {
+            rows: live_rows.get(id).copied().unwrap_or(0),
+            generation: 1,
+        });
+        match sup.as_mut() {
+            Some(sup) => sup.put(
+                &mut destination.store,
+                &crate::supportive::schema::row_count_key(u64::from(id.0)),
+                crate::supportive::schema::line(b"rCNT", 1, 0),
+                &record,
+            )?,
+            None => destination.put(&row_count::row_count_key(*id), &record)?,
+        }
     }
     let vector_sidecars = copy_vector_sidecars(&source, &mut destination, &metadata)?;
     let primary_edges = copy_graph(&source, &mut destination, &metadata)?;
@@ -1285,9 +1563,11 @@ pub fn rebuild_derived_indexes(
     let verified =
         verification::verify_indexed_source(&destination_path, verification_limits, |_| {})?;
     if !verified.complete || !verified.clean {
-        return Err(corrupt(
-            "independent verification rejected the rebuilt destination",
-        ));
+        let first: Vec<String> = verified.preview.iter().take(3).map(|i| i.message.clone()).collect();
+        return Err(corrupt(format!(
+            "independent verification rejected the rebuilt destination: {}",
+            first.join("; ")
+        )));
     }
     source.reader.recheck_source().map_err(Error::from)?;
 

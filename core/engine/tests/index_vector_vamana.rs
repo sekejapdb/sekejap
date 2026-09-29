@@ -356,6 +356,10 @@ fn the_graph_finds_most_of_the_true_nearest_neighbours_and_finds_more_of_them_wi
 /// The graph is on disk and nothing about it lives in the handle.
 #[test]
 fn the_graph_survives_a_reopen_and_answers_identically() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     let vectors = corpus(600, 0x1111_2222_3333_4444);
@@ -386,6 +390,10 @@ fn the_graph_survives_a_reopen_and_answers_identically() {
 /// name instead of answering from the part of the graph it has.
 #[test]
 fn a_build_that_stops_part_way_leaves_the_index_not_ready_and_refuses_to_answer() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     let vectors = corpus(300, 0xabcd_ef01_2345_6789);
@@ -457,6 +465,10 @@ fn a_build_that_stops_part_way_leaves_the_index_not_ready_and_refuses_to_answer(
 /// answers still agree with the brute-force top-k over what is LEFT.
 #[test]
 fn deletes_and_updates_orphan_no_node_and_strand_no_neighbour_list() {
+    // It reads or edits 0.18-format bytes (the header's feature word, a
+    // descriptor replica, a statistics record at its 0.18 key): pinned to
+    // that format. A Register file's are `supportive::*_tests`.
+    let _pin = sekejap_core::internal::LegacyFormat::pin();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     let vectors = corpus(500, 0x0f0f_0f0f_1234_5678);

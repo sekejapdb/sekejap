@@ -11,7 +11,7 @@ fn layout() -> Layout {
             ("location".into(), Kind::Geo),
             ("embedding".into(), Kind::Vector(3)),
             ("optional".into(), Kind::Text),
-        ],
+        ], absent: Default::default(),
     }
 }
 fn roundtrip(doc: serde_json::Value) {
@@ -214,7 +214,7 @@ fn dense_header_preserves_optional_fields_and_point_contract() {
             ("a".into(), Kind::Int),
             ("b".into(), Kind::Text),
             ("location".into(), Kind::Point),
-        ],
+        ], absent: Default::default(),
     };
     for d in [
         json!({}),
@@ -245,7 +245,7 @@ fn packed_integer_widths_preserve_full_range_missing_null_and_extras() {
         fields: (0..12)
             .map(|i| (format!("i{i}"), Kind::Int))
             .chain([("tail".into(), Kind::Json)])
-            .collect(),
+            .collect(), absent: Default::default(),
     };
     for offset in 0..12 {
         let mut doc = serde_json::Map::new();

@@ -547,7 +547,7 @@ pub(crate) struct Record {
 }
 
 pub(crate) fn read_header(db: &Database, id: IndexId) -> Result<GraphHeader> {
-    match db.store()?.get(&header_key(id))? {
+    match db.entry_get(&crate::supportive::schema::vamana_key(id.0), &header_key(id))? {
         Some(bytes) => decode_header(&bytes),
         None => Ok(GraphHeader {
             entry: 0,
@@ -559,7 +559,12 @@ pub(crate) fn read_header(db: &Database, id: IndexId) -> Result<GraphHeader> {
 
 fn put_header(db: &mut Database, id: IndexId, header: GraphHeader) -> Result<()> {
     let value = encode_header(header);
-    db.writer()?.put(&header_key(id), &value)?;
+    db.entry_put(
+        &crate::supportive::schema::vamana_key(id.0),
+        crate::supportive::schema::line(b"vENT", 1, 0),
+        &header_key(id),
+        &value,
+    )?;
     Ok(())
 }
 

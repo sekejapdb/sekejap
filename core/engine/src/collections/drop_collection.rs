@@ -191,9 +191,15 @@ pub struct DropProgress {
 pub(super) fn scan_dropping(
     s: &crate::pagewal::PageWalStore,
     header: Option<IndexHeader>,
+    sup: Option<&crate::supportive::header::Supportive>,
 ) -> Result<Option<CollectionId>> {
     if !header.is_some_and(|h| h.features & DROP_FEATURE != 0) {
         return Ok(None);
+    }
+    if let Some(sup) = sup {
+        // A Register file keeps the census line after the drop finished,
+        // so no running drop is an ordinary answer here.
+        return super::register_catalog::dropping_table(s, sup);
     }
     let prefix = [1u8, 0u8];
     for row in s.range(&prefix)? {
@@ -254,7 +260,7 @@ impl Database {
                 c.name
             )));
         }
-        if c.edge.as_ref().is_some_and(|e| e.binding.is_some()) {
+        if c.edge.as_ref().is_some_and(|e| e.binding.is_some()) && self.supportive.is_none() {
             return Err(invalid(format!(
                 "`{}` is an edge table a property graph declared: dropping one is not supported yet; its edges stay under its label",
                 c.name
@@ -450,6 +456,11 @@ impl Database {
         state: DropState,
         budget: usize,
     ) -> Result<DropProgress> {
+        // N6: a bound edge table holds no rows; its edges are the ones of its
+        // edge type in the base graph, filed under its source table.
+        if let Some(binding) = c.edge.as_ref().and_then(|e| e.binding.clone()) {
+            return self.drop_step_edges(c, state, budget, binding);
+        }
         let prefix = prefix(0x40, c.id);
         let keys = self.first_keys(&prefix, budget)?;
         let end = keys.len() < budget;
@@ -463,6 +474,78 @@ impl Database {
             self.note_deleted(id);
         }
         if end {
+            return self.advance(c, state, removed);
+        }
+        let total = state.removed + removed;
+        self.save_drop_state(c, DropState { removed: total, ..state })?;
+        Ok(DropProgress {
+            done: false,
+            removed,
+            total_removed: total,
+            phase: DropPhase::Rows,
+        })
+    }
+
+    /// One bounded step of removing a bound edge table's edges: at most
+    /// `budget` of them, found by walking the outgoing edges of its source
+    /// table from where the previous step stopped. A crash forgets where
+    /// that was, and the walk starts over, finding only what is left.
+    fn drop_step_edges(
+        &mut self,
+        c: &Catalog,
+        state: DropState,
+        budget: usize,
+        binding: crate::index::graph::edge_table::EdgeBinding,
+    ) -> Result<DropProgress> {
+        use crate::index::graph::{parse_edge, EdgeId, GraphContextId, PRIMARY_EDGE};
+        let table = c.edge.as_ref().expect("a bound edge table");
+        let source = table
+            .references
+            .iter()
+            .find(|(n, _)| *n == binding.source)
+            .map(|(_, s)| *s)
+            .ok_or_else(|| corrupt("edge table binding names a column it does not reference"))?;
+        let scope = prefix(PRIMARY_EDGE, source);
+        let start = self.edge_drop_cursor.take().unwrap_or_else(|| scope.clone());
+        let mut found = Vec::new();
+        let mut more = false;
+        let mut stop = None;
+        for row in self.store()?.range(&start)? {
+            let (k, _) = row?;
+            if !has_prefix(&k, &scope) {
+                break;
+            }
+            let (key, id) = parse_edge(&k, PRIMARY_EDGE)?;
+            if key.edge_type == binding.edge_type && key.context == GraphContextId::BASE {
+                found.push(EdgeId { key, id });
+                if found.len() == budget {
+                    stop = Some(k);
+                    more = true;
+                    break;
+                }
+            }
+        }
+        self.edge_drop_cursor = stop;
+        let removed = found.len() as u64;
+        for edge in found {
+            self.delete_edge_by_id(edge)?;
+        }
+        if !more {
+            // Every edge of the type is gone, so its name is free: a table
+            // declared later under it gets a NEW type id, never this one.
+            if let Some(mut sup) = self.supportive.take() {
+                let name = crate::collections::register_catalog::graph_name(self.store()?, &sup, 0, binding.edge_type.0)?;
+                let r = match name {
+                    Some(name) => self.writer().and_then(|w| {
+                        crate::collections::register_catalog::retire_graph_name(w, &mut sup, 0, &name)
+                    }),
+                    None => Ok(()),
+                };
+                self.supportive = Some(sup);
+                r?;
+            }
+            *self.bound_edge_types.borrow_mut() = None;
+            *self.bag_maps.borrow_mut() = None;
             return self.advance(c, state, removed);
         }
         let total = state.removed + removed;
@@ -525,11 +608,20 @@ impl Database {
         if self.sequence.as_ref().is_some_and(|s| s.collection == c.id) {
             self.sequence = None;
         }
-        self.writer()?.delete(&name_key_in(c.schema.as_deref(), &c.name))?;
+        self.row_id_blocks_forget(c.id);
+        self.delete_table_name(c.schema.as_deref(), &c.name)?;
         // The live row-count record of a collection that no longer exists.
         // Its keyspace is one key, so there is nothing to probe: it goes with
         // the name and the replicas.
         self.remove_row_count(c.id)?;
+        if let Some(mut sup) = self.supportive.take() {
+            let r = self.writer().and_then(|w| {
+                super::register_catalog::delete_table(w, &mut sup, c.id)?;
+                super::register_catalog::delete_layout(w, &mut sup, c.layout)
+            });
+            self.supportive = Some(sup);
+            r?;
+        }
         for copy in 0..3 {
             self.writer()?.delete(&replica_key(1, c.id.0, copy))?;
             self.writer()?.delete(&replica_key(2, c.id.0, copy))?;

@@ -280,9 +280,17 @@ fn the_index_maintenance_of_a_bulk_write_writes_exactly_what_it_wrote_before() {
         (76, 319_088),
         "the live-index batch's page-WAL frames and bytes moved"
     );
+    // Re-frozen on 2026-09-29 for the 0.19 format (`docs/core/SUPPORTIVE.md`):
+    // the bare batch's commit writes the table's row-sequence block as a
+    // `NEXT` entry, whose three copies live in three Register trees -- two
+    // pages more than the 0.18 counter, whose replicas shared a leaf in the
+    // primary tree (54 -> 56 frames, +8,288 bytes). NAMED COST: a commit that
+    // opens a new block of 1,024 row ids pays two pages; the commits inside a
+    // block write no counter at all (`collections::ROW_ID_BLOCK`). The indexed
+    // batch did not move.
     assert_eq!(
         (bare.frames, bare.bytes),
-        (54, 227_920),
+        (56, 236_208),
         "the no-index batch's page-WAL frames and bytes moved"
     );
     assert!(
