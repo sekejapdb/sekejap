@@ -426,8 +426,32 @@ pub struct SekejapStmt {
 /// The writer, held across many writes. Created by `sekejap_tx_begin` and
 /// consumed by `sekejap_tx_commit` or `sekejap_tx_rollback`; a handle
 /// dropped any other way ROLLS BACK.
+///
+/// Bound to the thread that began it: it holds the writer's mutex guard,
+/// and a mutex released from another thread is undefined behaviour. A call
+/// from another thread is refused before the guard is touched (finding
+/// vuln-f05).
 pub struct SekejapTx {
     inner: Option<Tx<'static>>,
+    owner: std::thread::ThreadId,
+}
+
+/// Refuse a transaction call from a thread other than the one that began it.
+///
+/// # Safety
+/// `tx` must be NULL or a live handle from `sekejap_tx_begin`.
+unsafe fn on_owner_thread(tx: *mut SekejapTx) -> Option<()> {
+    if tx.is_null() {
+        invalid("`tx` is NULL");
+        return None;
+    }
+    if (*tx).owner != std::thread::current().id() {
+        invalid(
+            "this transaction was begun on another thread: a SekejapTx is bound to the thread that began it (it holds the writer's lock), so pin the calling thread -- runtime.LockOSThread in Go, one dispatch thread in Swift or Kotlin",
+        );
+        return None;
+    }
+    Some(())
 }
 
 /// A paged walk: of one collection (`sekejap_scan_open`) or of one
@@ -1612,17 +1636,17 @@ pub unsafe extern "C" fn sekejap_tx_begin(db: *mut SekejapDb) -> *mut SekejapTx 
         let handle = handle(db).ok_or(())?;
         let tx = record(handle.db.transaction())?;
         let tx: Tx<'static> = std::mem::transmute::<Tx<'_>, Tx<'static>>(tx);
-        Ok(Box::into_raw(Box::new(SekejapTx { inner: Some(tx) })))
+        Ok(Box::into_raw(Box::new(SekejapTx {
+            inner: Some(tx),
+            owner: std::thread::current().id(),
+        })))
     })
 }
 
 /// # Safety
 /// `tx` must be a live handle from `sekejap_tx_begin`.
 unsafe fn tx_of<'a>(tx: *mut SekejapTx) -> Option<&'a mut Tx<'static>> {
-    if tx.is_null() {
-        invalid("`tx` is NULL");
-        return None;
-    }
+    on_owner_thread(tx)?;
     match (*tx).inner.as_mut() {
         Some(inner) => Some(inner),
         None => {
@@ -1719,7 +1743,8 @@ pub unsafe extern "C" fn sekejap_tx_execute(
 
 /// Commit the transaction and FREE the handle, whether the commit succeeded
 /// or not. `0` on success, `-1` on failure. The pointer is dangling after
-/// this call in both cases.
+/// this call in both cases -- except a call from a thread other than the
+/// one that began it, which is refused and frees nothing.
 ///
 /// # Safety
 /// `tx` must be a live handle that has not been committed or rolled back.
@@ -1743,10 +1768,9 @@ pub unsafe extern "C" fn sekejap_tx_rollback(tx: *mut SekejapTx) -> i32 {
 unsafe fn finish(tx: *mut SekejapTx, commit: bool) -> i32 {
     guard_i32(|| {
         clear_error();
-        if tx.is_null() {
-            invalid("`tx` is NULL");
-            return Err(());
-        }
+        // Checked before the handle is taken: a refused call leaves the
+        // transaction live for the thread that owns it.
+        on_owner_thread(tx).ok_or(())?;
         let mut handle = Box::from_raw(tx);
         let Some(inner) = handle.inner.take() else {
             invalid("this transaction has already been committed or rolled back");

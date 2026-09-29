@@ -1214,3 +1214,39 @@ fn a_waiting_subscription_does_not_hold_up_another() {
     );
     assert!(waiter.join().unwrap());
 }
+
+/// Finding vuln-f05 (0.18.5): a `SekejapTx` holds the writer's mutex guard
+/// across C calls, and releasing a mutex from a thread that did not take it
+/// is undefined behaviour (an abort on Apple's lock). A wrapper whose calls
+/// move between OS threads could do exactly that. A transaction is now
+/// bound to the thread that began it: a call from another thread is refused
+/// with Invalid and leaves the transaction untouched for its owner.
+#[test]
+fn a_transaction_refuses_a_call_from_another_thread() {
+    struct Shared(*mut SekejapTx);
+    unsafe impl Send for Shared {}
+    let db = Fixture::open();
+    assert!(db.create("m", &json!([{ "name": "v", "kind": "text" }])) >= 0);
+    let tx = unsafe { sekejap_tx_begin(db.db) };
+    assert!(!tx.is_null());
+    let shared = Shared(tx);
+    let refused = std::thread::spawn(move || {
+        let shared = shared;
+        let put = unsafe {
+            sekejap_tx_put(shared.0, c("m").as_ptr(), c("elsewhere").as_ptr(), c(r#"{"v":"x"}"#).as_ptr())
+        };
+        let put_code = unsafe { sekejap_last_error_code(ptr::null_mut()) };
+        let commit = unsafe { sekejap_tx_commit(shared.0) };
+        let commit_code = unsafe { sekejap_last_error_code(ptr::null_mut()) };
+        (put, put_code, commit, commit_code)
+    })
+    .join()
+    .unwrap();
+    assert_eq!(refused, (-1, SekejapStatus::Invalid, -1, SekejapStatus::Invalid));
+    // The owner still holds a live transaction, and finishes it.
+    assert_eq!(
+        unsafe { sekejap_tx_put(tx, c("m").as_ptr(), c("here").as_ptr(), c(r#"{"v":"y"}"#).as_ptr()) },
+        0
+    );
+    assert_eq!(unsafe { sekejap_tx_commit(tx) }, 0);
+}

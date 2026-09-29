@@ -121,8 +121,17 @@ time, and each reads its own error slot back. This is the change from 0.16,
 where `SekejapDb*` wrapped a single-threaded `CoreDB` and a second handle
 (`SekejapEngine*`) existed for the concurrent case; 0.17 has one handle.
 
-The DERIVED handles are not shared work. A `SekejapScan*`, a `SekejapStmt*`
-and a `SekejapTx*` are each used from ONE thread at a time.
+The DERIVED handles are not shared work. A `SekejapScan*` and a
+`SekejapStmt*` are each used from ONE thread at a time.
+
+A `SekejapTx*` is stricter: it is BOUND to the OS thread that began it,
+because it holds the writer's lock and a lock released from another thread
+is undefined behaviour. Every `sekejap_tx_*` call from another thread is
+refused with `SekejapStatus_Invalid` and leaves the transaction live for its
+owner (0.18.5). A wrapper whose calls can move between OS threads pins the
+thread for the transaction's life: `runtime.LockOSThread` in Go, one
+dispatch thread in Swift or Kotlin. The error slot is per thread too: read
+`sekejap_last_error` on the thread whose call failed.
 
 A `SekejapTx*` HOLDS the writer for its whole life. While one is open, a call
 on the same `SekejapDb*` that needs the writer -- from this thread or another
