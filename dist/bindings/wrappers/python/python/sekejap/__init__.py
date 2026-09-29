@@ -83,7 +83,7 @@ __all__ = [
     "DataFrameAccessor",
 ]
 
-__version__ = "0.18.5"
+__version__ = "0.19.0"
 
 
 def _dataframe_accessor(self):

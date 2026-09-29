@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.19.0 (in development)
+## 0.19.0
 
 The versatility foundation: a new supportive format, columns with stable
 ids, and the schema changes they make cheap. Search work (the skip table,
