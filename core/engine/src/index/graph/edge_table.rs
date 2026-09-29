@@ -12,7 +12,7 @@
 //! key names the source, the destination or both, so the edges that could
 //! collide are one adjacency range (§3 of the design).
 
-use super::adjacency::{primary_posting, AdjacencyCursor};
+use super::adjacency::{primary_posting, primary_posting_if_any, AdjacencyCursor};
 use super::*;
 use crate::collections::KEY_FIELD;
 use crate::encode_dense_v3;
@@ -731,6 +731,19 @@ impl Database {
         }
         let has_source = bound.table.key.contains(&bound.binding.source);
         let has_destination = bound.table.key.contains(&bound.binding.destination);
+        // `PRIMARY KEY (src, dst)`: the pair's one edge is the tuple's own,
+        // id 0 (`write_new_edge`), so the check is one lookup rather than a
+        // walk of every edge at one end -- which was O(degree) per insert
+        // and refused past `MAX_TUPLE_EDGES` (finding vuln-f09).
+        if has_source && has_destination && bound.table.key.len() == 2 {
+            return match primary_posting_if_any(self, key, 0)? {
+                Some(posting) => Ok(Some(Found {
+                    edge: EdgeId { key, id: 0 },
+                    bag: decode_properties(&posting)?,
+                })),
+                None => Ok(None),
+            };
+        }
         let (near, direction) = if has_source {
             (key.source, Direction::Outgoing)
         } else {

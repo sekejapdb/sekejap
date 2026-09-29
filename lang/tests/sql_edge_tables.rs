@@ -486,3 +486,56 @@ fn edge_columns_keep_their_rules() {
         ])
     );
 }
+
+/// Finding vuln-f09 (0.18.5): the conflict check of a keyed INSERT read
+/// every edge of the type at the source before comparing -- O(degree) per
+/// insert, O(N^2) to load one hub, and past 65,536 edges at one end every
+/// further INSERT was refused. With `PRIMARY KEY (src, dst)` the pair has at
+/// most one edge, at a known place, and the check is one lookup: one more
+/// INSERT at a hub of 2,000 edges touches about the pages it touches at a
+/// hub of 500 (buffer-pool page accesses, the metric), and a conflict is
+/// still found.
+#[test]
+fn a_keyed_insert_at_a_busy_hub_is_one_lookup() {
+    let dir = TempDir::new().unwrap();
+    let mut db = db(&dir);
+    run(&mut db, "CREATE TABLE node (_key TEXT PRIMARY KEY) WITH (index: none)");
+    for chunk in (0..2_100u32).collect::<Vec<_>>().chunks(700) {
+        let values: Vec<String> = chunk.iter().map(|i| format!("('n{i:05}')")).collect();
+        run(&mut db, &format!("INSERT INTO node (_key) VALUES {}", values.join(", ")));
+    }
+    for sql in [
+        "INSERT INTO node (_key) VALUES ('small'), ('big')",
+        "CREATE TABLE link (src TEXT REFERENCES node, dst TEXT REFERENCES node, w INT, PRIMARY KEY (src, dst))",
+        "ALTER PROPERTY GRAPH base ADD EDGE TABLES (link SOURCE KEY (src) REFERENCES node (_key) DESTINATION KEY (dst) REFERENCES node (_key))",
+        "COMMIT",
+    ] {
+        run(&mut db, sql);
+    }
+    for (hub, degree) in [("small", 500u32), ("big", 2_000)] {
+        for chunk in (0..degree).collect::<Vec<_>>().chunks(250) {
+            let values: Vec<String> = chunk.iter().map(|i| format!("('{hub}', 'n{i:05}', 1)")).collect();
+            run(&mut db, &format!("INSERT INTO link (src, dst, w) VALUES {}", values.join(", ")));
+        }
+    }
+    run(&mut db, "COMMIT");
+    let mut one_insert = |db: &mut Database, hub: &str| -> u64 {
+        let before = db.pool_accesses().unwrap();
+        run(db, &format!("INSERT INTO link (src, dst, w) VALUES ('{hub}', 'n02099', 1)"));
+        let used = db.pool_accesses().unwrap() - before;
+        let _ = db.sql("ROLLBACK", &[]);
+        used
+    };
+    let small = one_insert(&mut db, "small");
+    let big = one_insert(&mut db, "big");
+    assert!(
+        big <= small + small / 2 + 8,
+        "one INSERT touched {small} pages at a hub of 500 edges and {big} at a hub of 2,000"
+    );
+    // The lookup still finds the pair's edge.
+    assert_eq!(sqlstate(db.sql("INSERT INTO link (src, dst, w) VALUES ('big', 'n00007', 2)", &[])), "23505");
+    let _ = db.sql("ROLLBACK", &[]);
+    run(&mut db, "INSERT INTO link (src, dst, w) VALUES ('big', 'n00007', 3) ON CONFLICT (src, dst) DO UPDATE SET w = EXCLUDED.w");
+    run(&mut db, "COMMIT");
+    assert_eq!(rows(&mut db, "SELECT w FROM link WHERE src = 'big' AND dst = 'n00007'"), [[SqlValue::Int(3)]]);
+}
