@@ -1534,3 +1534,36 @@ fn a_truncated_describe_or_close_is_answered_not_a_panic() {
     }
     assert_eq!(rows_of(&ask(&mut connection, "SELECT id FROM place")).len(), 4, "the connection still answers");
 }
+
+/// Finding vuln-f07 (0.18.5): Describe of a read portal RAN the statement
+/// through the held path to learn its columns, so a driver that describes
+/// every portal (Parse, Bind, Describe, Execute 0) hit the held path's
+/// ceiling -- 65,536 rows or 16 MiB -- where the simple protocol streams.
+/// A read portal is described from its compiled statement, and the Execute
+/// that follows streams. About 18 MiB here.
+#[test]
+fn describing_a_read_portal_leaves_its_execute_streaming() {
+    let fixture = build(4);
+    let mut connection = connect(&fixture.service, 1);
+    assert!(first(&ask(&mut connection, "CREATE TABLE big (_key TEXT PRIMARY KEY, body TEXT) WITH (index: none)"), b'E').is_none());
+    let body = "rice terrace ".repeat(160);
+    for batch in 0..90 {
+        let values: Vec<String> = (0..100).map(|i| format!("('b{batch:03}-{i:03}', '{body}')")).collect();
+        let got = ask(&mut connection, &format!("INSERT INTO big (_key, body) VALUES {}", values.join(", ")));
+        assert!(first(&got, b'E').is_none(), "batch {batch}");
+    }
+    let mut batch = parse_message("s", "SELECT _key, body FROM big", &[]);
+    batch.extend_from_slice(&bind_message("p", "s", &[], &[]));
+    batch.extend_from_slice(&describe_message(b'P', "p"));
+    batch.extend_from_slice(&execute_message("p", 0));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    assert!(
+        first(&got, b'E').is_none(),
+        "{:?}",
+        first(&got, b'E').map(|f| String::from_utf8_lossy(&f.body).into_owned())
+    );
+    assert!(first(&got, b'T').is_some(), "Describe answered the columns");
+    assert_eq!(rows_of(&got).len(), 9_000);
+    assert_eq!(tag(&got), "SELECT 9000");
+}

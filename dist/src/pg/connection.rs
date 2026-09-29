@@ -726,21 +726,32 @@ impl<'a> Connection<'a> {
             }
             return;
         }
-        // A portal that has not run and is not a read: describe its shape
-        // from the statement, never by running it. Running a write here
-        // applied it before -- or without -- the client's `Execute`
-        // (finding vuln-a06). `Execute` runs it.
+        // A portal that has not run: describe its shape from the compiled
+        // statement, never by running it. Running a write here applied it
+        // before -- or without -- the client's `Execute` (finding
+        // vuln-a06); running a read held its whole answer under the held
+        // path's ceilings, so the `Execute` with no row limit that follows
+        // could not stream (finding vuln-f07). `Execute` runs it.
         if let Some(portal) = self.portals.get(&name) {
             let trimmed = portal.sql.trim().trim_end_matches(';').trim().to_owned();
-            if !portal.executed && portal.refused.is_none() && !is_read(&trimmed) {
+            if !portal.executed && portal.refused.is_none() {
+                let read = is_read(&trimmed);
                 let formats = portal.result_formats.clone();
                 let oids = vec![oid::TEXT; portal.params.len()];
                 let (fields, _) = self.describe_columns(&trimmed, &oids);
                 match fields {
-                    Some(fields) => f::row_description(out, &apply_formats(&fields, &formats)),
-                    None => f::no_data(out),
+                    Some(fields) => {
+                        f::row_description(out, &apply_formats(&fields, &formats));
+                        return;
+                    }
+                    None if !read => {
+                        f::no_data(out);
+                        return;
+                    }
+                    // A read the statement alone cannot describe (a session
+                    // statement): the held run below.
+                    None => {}
                 }
-                return;
             }
         }
         // A read portal. Running it now is what lets its columns be

@@ -112,9 +112,11 @@ its `ErrorResponse`, as PostgreSQL does.
   answered with the type the statement itself gives it
   (`PreparedSql::param_types`, §3.3) when it gives one, and `text`
   otherwise.
-* **`Describe('P')`** runs the portal and holds its answer, which is what
-  lets its columns be described; the `Execute` that follows does not repeat
-  the run.
+* **`Describe('P')`** describes a portal that has not run from its compiled
+  statement, without running it (0.18.5): a write is not applied early, and
+  the `Execute` with no row limit that follows still streams. A read the
+  statement alone cannot describe (a session statement) is run and held,
+  and the `Execute` that follows does not repeat the run.
 * **`Execute`** with NO row limit STREAMS (nothing held) and never sends a
   `RowDescription` — the client has one from `Describe`. With a row limit it
   hands out that many rows and answers `PortalSuspended`; the next `Execute`
