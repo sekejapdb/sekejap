@@ -309,6 +309,9 @@ impl Parser {
         if let Some(call) = self.crypto_call()? {
             return Ok(call);
         }
+        if let Some(clock) = self.clock_literal()? {
+            return Ok(clock);
+        }
         if !self.at_geo_constructor() {
             return self.literal();
         }
@@ -319,6 +322,24 @@ impl Parser {
             ));
         }
         Ok(Literal::Geo(Box::new(argument)))
+    }
+
+    /// `now()`, `current_timestamp` or `current_date` (with an optional
+    /// interval) as a value to write; `None` when the cursor is not on the
+    /// clock. `now` without its parentheses is a column name.
+    fn clock_literal(&mut self) -> SqlResult2<Option<Literal>> {
+        let at_clock = match self.word().map(|w| w.to_ascii_uppercase()).as_deref() {
+            Some("NOW") => matches!(self.peek_at(1), Tok::LParen),
+            Some("CURRENT_TIMESTAMP" | "CURRENT_DATE") => true,
+            _ => false,
+        };
+        if !at_clock {
+            return Ok(None);
+        }
+        Ok(match self.clock_value()? {
+            Some(TimeValue::Clock { date_only, offset }) => Some(Literal::Clock { date_only, offset }),
+            _ => None,
+        })
     }
 
     fn set_value(&mut self) -> SqlResult2<SetValue> {

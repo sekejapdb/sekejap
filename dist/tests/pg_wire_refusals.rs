@@ -196,9 +196,10 @@ fn a_named_refusal_the_engine_raises_never_arrives_as_an_internal_error() {
             "SELECT id FROM place WHERE note = 'x'",
             "a scalar index on `note` does not exist",
         ),
-        // §4.1: a fold with no expression index is refused, not scanned.
+        // §4.1: a folded prefix with no expression index is refused, not
+        // scanned (the fold's EQUALITY is a row check from 0.19.2).
         (
-            "SELECT id FROM place WHERE lower(name) = 'x'",
+            "SELECT id FROM place WHERE lower(name) LIKE 'x%'",
             "an expression index",
         ),
         // §3: a boolean leaf with no membership set. The one of the four

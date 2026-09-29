@@ -66,8 +66,9 @@ impl Db {
     /// Move a database written by a 0.18 release to the 0.19 format, once,
     /// before it is opened: 0.19 opens no 0.18-format file until then
     /// (`docs/core/SUPPORTIVE.md` section 3). Call it at startup before
-    /// [`Db::open`]; it does nothing for a 0.19 file or a path that does not
-    /// exist yet, so it is safe on every start.
+    /// [`Db::open`]; it does nothing for a 0.19 file, a path that does not
+    /// exist yet, or an empty folder made for the database, so it is safe on
+    /// every start.
     ///
     /// The 0.19 copy is built beside the original, verified, and swapped in;
     /// the original directory is kept untouched as `<path>.v018-backup` and

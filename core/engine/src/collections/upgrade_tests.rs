@@ -4,7 +4,10 @@
 //!   kept as the backup, and a second call does nothing
 //!   (`a_legacy_database_moves_and_keeps_its_original`);
 //! * a crash between the two renames is finished by the next call
-//!   (`an_interrupted_publication_is_finished`).
+//!   (`an_interrupted_publication_is_finished`);
+//! * a folder with no database in it yet -- missing, or created empty by
+//!   the application before its first open -- is left alone
+//!   (`a_folder_with_no_database_yet_is_left_alone`).
 
 use super::*;
 use crate::supportive::header::FORCE;
@@ -55,4 +58,16 @@ fn an_interrupted_publication_is_finished() {
     assert!(done.report.is_none());
     assert!(!is_legacy_format(&path).unwrap());
     assert!(backup.exists() && !staging.exists());
+}
+
+#[test]
+fn a_folder_with_no_database_yet_is_left_alone() {
+    let t = tempfile::tempdir().unwrap();
+    let missing = t.path().join("missing");
+    assert!(upgrade_format(&missing, Default::default()).unwrap().is_none());
+    assert!(!missing.exists());
+    let empty = t.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    assert!(upgrade_format(&empty, Default::default()).unwrap().is_none());
+    assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0, "nothing written into it");
 }

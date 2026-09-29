@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.19.2
+
+Fixes and small PostgreSQL forms found by running a real application on
+0.19.1.
+
+- **`Db::upgrade` on an empty folder** answered `NotFound`; a folder with no
+  database in it yet is now left alone, the same as a missing path.
+- **A quoted literal written into a JSONB column** (`'{"a":1}'`) was stored
+  as a JSON string; it is now parsed, as PostgreSQL does, and text that is
+  not JSON is refused naming the column. A bound parameter is unchanged.
+- **`now()`, `current_timestamp` and `current_date`** (with an optional
+  interval) are values in `INSERT ... VALUES` and `UPDATE ... SET`, as they
+  already were in `DEFAULT`; into a DATE column they write the day.
+- **`col->>'member'` in a select list** reads the member from the row: a
+  string as its text, any other value as its JSON spelling, an absent member
+  or JSON null as NULL.
+- **`lower(col) = v` without an expression index** is checked on each row,
+  as an unindexed ILIKE is, with a notice naming the index that would answer
+  it index-side. As in PostgreSQL, a `v` with an upper-case letter names no
+  row, with or without the index (the index path used to fold `v` too).
+- Clearer refusals: a LIKE inside OR/AND/NOT no longer says it "has no
+  index" when a trigram index serves it on its own, and the OFFSET refusal
+  shows the keyset rewrite to copy.
+
 ## 0.19.1
 
 - **The upgrade as one call, everywhere.** `Db::upgrade(path)` in Rust,

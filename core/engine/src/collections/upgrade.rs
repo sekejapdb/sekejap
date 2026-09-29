@@ -56,7 +56,7 @@ pub fn is_legacy_format(path: impl AsRef<Path>) -> Result<bool> {
 }
 
 /// Move the database at `path` to the 0.19 format. `Ok(None)` when it is
-/// already a Register file.
+/// already a Register file, or when `path` holds no database yet.
 pub fn upgrade_format(path: impl AsRef<Path>, limits: RebuildLimits) -> Result<Option<FormatUpgrade>> {
     let path = path.as_ref();
     let staging = sibling(path, ".v019-upgrading")?;
@@ -65,6 +65,11 @@ pub fn upgrade_format(path: impl AsRef<Path>, limits: RebuildLimits) -> Result<O
         fs::rename(&staging, path).map_err(kernel::Error::from)?;
         sync_parent(path)?;
         return Ok(Some(FormatUpgrade { backup, report: None }));
+    }
+    // No database here yet: a missing folder, or one the application made
+    // empty before its first open. Nothing to move.
+    if !path.join("data").exists() && !path.join("wal").exists() {
+        return Ok(None);
     }
     if !is_legacy_format(path)? {
         return Ok(None);

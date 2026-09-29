@@ -14,8 +14,8 @@
 //!    it would need, never demoted to a scan (QL_CONTRACT §6).
 //!
 //! `->`, `#>`, `#>>` and `json_array_length` stay refused by name, and so
-//! does `->>` in every other position: a SELECT list, an ORDER BY, an
-//! ordering comparison.
+//! does `->>` in an ORDER BY and an ordering comparison. From 0.19.2 it is a
+//! row function in the SELECT list (`sql_value_forms.rs`).
 //!
 //! The oracle is a brute-force extraction over the same corpus, held in this
 //! process and computed from the EXTRACTION RULE rather than from a second
@@ -365,8 +365,8 @@ fn the_json_operators_with_no_index_atomic_are_still_refused_by_name() {
             "SELECT _key FROM doc WHERE json_array_length(payload) = 2",
             "JSON_ARRAY_LENGTH",
         ),
-        // `->>` itself, outside the two positions that compile.
-        ("SELECT payload->>'status' FROM doc", "->>"),
+        // `->>` itself, outside the positions that compile (0.19.2 adds
+        // the select list, `sql_value_forms.rs`).
         (
             "SELECT _key FROM doc WHERE n < 10 ORDER BY payload->>'status'",
             "->>",

@@ -585,19 +585,18 @@ fn a_rewrite_that_would_need_a_union_is_refused_with_the_named_reason() {
 }
 
 #[test]
-fn a_fold_without_its_expression_index_is_refused_rather_than_scanned() {
+fn a_fold_without_its_expression_index_is_checked_on_each_row() {
     let dir = TempDir::new().unwrap();
     let mut f = build(&dir);
-    // There is no `lower(name)` index, only `lower(kind)`.
-    let error = f
+    // There is no `lower(name)` index, only `lower(kind)`. From 0.19.2 the
+    // equality is checked on each row the driver reaches, as an unindexed
+    // ILIKE is, and the notice names the index that would answer it
+    // index-side; `lang/tests/sql_value_forms.rs` holds its answers.
+    let answered = f
         .db
         .sql("SELECT k FROM evt WHERE lower(name) = 'tide0'", &[])
-        .expect_err("a fold with no expression index must be refused");
-    let text = error.to_string();
-    assert!(
-        text.contains("expression index") && text.contains("lower(col)"),
-        "the refusal must name the index that is missing: {text}"
-    );
+        .expect("a fold with no expression index is a row check");
+    assert!(matches!(answered, sekejap_lang::SqlResult::Rows { .. }));
     // A non-prefix LIKE is answered by checking each row (0.18.3, owner
     // decision 2026-09-28): no index, no extra storage. `lang/tests/sql_like.rs`
     // holds its semantics against PostgreSQL.

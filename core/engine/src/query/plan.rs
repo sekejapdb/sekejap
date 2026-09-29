@@ -1382,7 +1382,7 @@ fn compile_set_expr(
         }
         QueryFilter::Like { .. } => {
             return Err(invalid_query(
-                "a LIKE cannot be a boolean leaf: it has no index and is answered from the row, so there is no set to union or complement",
+                "a LIKE inside OR, AND or NOT is checked against each row, even when a trigram index serves the same LIKE on its own, so there is no set to union or complement; run each pattern as its own statement and merge the rows",
             ))
         }
         QueryFilter::RowCompare { .. } => {

@@ -21,7 +21,7 @@ impl Compiler<'_> {
     }
 
     /// A [`TimeValue`] folded to stored microseconds.
-    fn time_value(&self, value: &TimeValue, column: &str) -> SqlResult2<i64> {
+    pub(super) fn time_value(&self, value: &TimeValue, column: &str) -> SqlResult2<i64> {
         Ok(match value {
             TimeValue::Lit(literal) => self.time_literal(literal, column)?,
             TimeValue::Clock { date_only, offset } => {
@@ -338,6 +338,30 @@ impl Compiler<'_> {
                 "{what}: `{column}` is not a TEXT column, and a text-key range is over text keys"
             )));
         }
+        // `lower(col) = v` with no expression index over lower(col) is
+        // checked on each row the driver reaches, the way an unindexed ILIKE
+        // is (0.19.2): the same fold, no index, no extra storage. A `v` with
+        // an upper-case letter equals no lower-cased value, so it names no
+        // row.
+        if let TextShape::LowerEq { value } = shape {
+            if !self.expression_index_ready(c, column, IndexExpr::Lower)? {
+                let text = self.text_of(value)?;
+                self.notices.push(format!(
+                    "{what}: checked on each row the driver reaches -- no index, no extra storage; an expression index (`CREATE INDEX ... ON t (lower({column}))`) answers it index-side"
+                ));
+                if text != text.to_lowercase() {
+                    return Ok(OwnedFilter::Ids(Vec::new()));
+                }
+                let mut pattern = String::with_capacity(text.len());
+                for ch in text.chars() {
+                    if matches!(ch, '\\' | '%' | '_') {
+                        pattern.push('\\');
+                    }
+                    pattern.push(ch);
+                }
+                return self.like_filter(c, column, &Literal::Str(pattern), None, true, false);
+            }
+        }
         let lowered = matches!(shape, TextShape::LowerEq { .. } | TextShape::LowerPrefix { .. });
         let index = if lowered {
             self.index_for_expression(
@@ -361,7 +385,16 @@ impl Compiler<'_> {
         let predicate = match shape {
             // Answered above: it is the one shape whose column is JSONB.
             TextShape::JsonEq { .. } => unreachable!("JsonEq returns above"),
-            TextShape::LowerEq { value } => OwnedScalarFilter::Eq(Scalar::Text(literal(self, value)?)),
+            // PostgreSQL: `lower(col) = 'Ada'` names no row, because no
+            // lower-cased value has an upper-case letter. Folding the literal
+            // too would name the rows `lower(col) = 'ada'` names.
+            TextShape::LowerEq { value } => {
+                let text = self.text_of(value)?;
+                if text != text.to_lowercase() {
+                    return Ok(OwnedFilter::Ids(Vec::new()));
+                }
+                OwnedScalarFilter::Eq(Scalar::Text(text))
+            }
             TextShape::LowerPrefix { value, .. } | TextShape::Prefix { value, .. } => {
                 let raw = literal(self, value)?;
                 let prefix = match shape {

@@ -606,6 +606,10 @@ impl Compiler<'_> {
     /// A literal, as JSON. A subquery runs here, at compile time, because by
     /// the time the outer statement runs it is a constant.
     fn value_of(&self, literal: &Literal) -> SqlResult2<Value> {
+        if let Literal::Clock { date_only, offset } = literal {
+            let clock = TimeValue::Clock { date_only: *date_only, offset: *offset };
+            return Ok(Value::from(self.time_value(&clock, "")?));
+        }
         self.folds(literal, "a value read into the plan");
         self.binder().value_of(literal)
     }
@@ -805,6 +809,17 @@ impl Compiler<'_> {
                     && info.state == IndexState::Ready
             })
             .map(|info| info.id))
+    }
+
+    /// Whether a READY scalar expression index over `field` computes
+    /// `expression` (`lower(col)` is `IndexExpr::Lower`).
+    fn expression_index_ready(&self, c: CollectionId, field: &str, expression: IndexExpr) -> SqlResult2<bool> {
+        Ok(self.db.list_indexes(c).map_err(SqlError::from)?.iter().any(|info| {
+            info.field == field
+                && info.family == IndexFamily::Scalar
+                && info.expression.as_ref() == Some(&expression)
+                && info.state == IndexState::Ready
+        }))
     }
 
     /// The READY trigram index over `field` (`gin_trgm_ops`), if there is

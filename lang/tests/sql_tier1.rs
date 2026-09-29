@@ -2651,7 +2651,7 @@ fn a_string_function_in_a_select_list_is_a_row_function() {
 /// The eighth law: a rewrite whose pre-image is a SET of ranges has no
 /// atomic in this slice and is REFUSED, not answered by a scan.
 #[test]
-fn a_multi_range_rewrite_is_refused_and_a_missing_expression_index_too() {
+fn a_multi_range_rewrite_is_refused() {
     let (_dir, mut f) = open();
     timeline(&mut f.db);
     for sql in [
@@ -2666,15 +2666,12 @@ fn a_multi_range_rewrite_is_refused_and_a_missing_expression_index_too() {
             "{sql}"
         );
     }
-    // No `lower(kind)` index exists on the FIXTURE's collection.
-    let error = f
+    // No `lower(kind)` index exists on the FIXTURE's collection: from
+    // 0.19.2 the equality is checked on each row (`sql_value_forms.rs`).
+    assert!(f
         .db
         .sql("SELECT _id FROM place WHERE lower(kind) = 'home'", &[])
-        .unwrap_err();
-    assert!(
-        format!("{error}").contains("expression index"),
-        "the refusal names the index that is missing: {error}"
-    );
+        .is_ok());
     // An infix LIKE is answered by checking each row (0.18.3); its semantics
     // against PostgreSQL are `lang/tests/sql_like.rs`'s.
     assert!(f

@@ -138,6 +138,8 @@ fn offset_is_deviation_four() {
     assert_eq!(tier, 2);
     assert!(reason.contains("deviation 4"), "{reason}");
     assert!(reason.contains("keyset continuation"), "{reason}");
+    // The refusal shows the rewrite, ready to copy.
+    assert!(reason.contains("WHERE (name, _key) > ($last_name, $last_key)"), "{reason}");
 }
 
 /// `<>`, `!=` and `IS NOT NULL` moved from Tier 2 to Tier 1 with the

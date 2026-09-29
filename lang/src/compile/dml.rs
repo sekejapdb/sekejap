@@ -200,6 +200,11 @@ impl Compiler<'_> {
                 )))
             }
         };
+        // `now()` written into a DATE is its day, as PostgreSQL's assignment
+        // cast makes it; a written literal with a time of day is refused.
+        if declared == "DATE" && matches!(literal, Literal::Clock { .. }) {
+            return Ok(Value::from(functions::date_trunc(TimeUnit::Day, micros)?));
+        }
         if declared == "DATE" && micros != functions::date_trunc(TimeUnit::Day, micros)? {
             return Err(SqlError::Parameter(format!(
                 "`{column}` is declared DATE, which is midnight UTC of its day; `{}` carries a time of day and would be truncated silently",
@@ -302,7 +307,18 @@ impl Compiler<'_> {
                     )))
                 }
             },
-            Kind::Json => value,
+            // A quoted literal written in the SQL is jsonb TEXT, parsed as
+            // PostgreSQL parses `'{"a":1}'::jsonb`; storing it as a JSON
+            // string would answer `meta->>'a'` with nothing, silently. A
+            // bound parameter already carries its JSON value.
+            Kind::Json => match (literal, &value) {
+                (Literal::Str(_), Value::String(text)) => serde_json::from_str::<Value>(text).map_err(|e| {
+                    SqlError::Parameter(format!(
+                        "`{column}` is JSONB and the quoted value is not JSON ({e}); a JSON string is written with its own quotes, '\"text\"'"
+                    ))
+                })?,
+                _ => value,
+            },
         })
     }
 

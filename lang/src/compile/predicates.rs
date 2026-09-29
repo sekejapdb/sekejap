@@ -369,7 +369,7 @@ impl Compiler<'_> {
     /// always been. Every other pattern, `ILIKE` and `NOT LIKE` are checked on
     /// each row the driver reaches: no index and no extra storage, and a
     /// notice says so (owner decision 2026-09-28).
-    fn like_filter(
+    pub(super) fn like_filter(
         &mut self,
         c: CollectionId,
         column: &str,

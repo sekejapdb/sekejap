@@ -92,6 +92,17 @@ impl<'a> Binder<'a> {
                     _ => Value::Null,
                 }
             }
+            // Reached only without a compiler (whose one clock
+            // `Compiler::value_of` folds instead): read the wall clock now.
+            Literal::Clock { date_only, offset } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_micros() as i64);
+                let base = if *date_only { functions::date_trunc(TimeUnit::Day, now)? } else { now };
+                Value::from(base.checked_add(*offset).ok_or_else(|| {
+                    SqlError::unsupported("the folded clock arithmetic overflows i64 microseconds")
+                })?)
+            }
             Literal::Subquery(query) => {
                 let collection = collection(self.db, &query.table)?;
                 let key = self.text_of(&query.key)?;

@@ -52,6 +52,11 @@ pub(super) enum Literal {
     /// INSERT value, an UPDATE SET, a SELECT with no FROM. Its value is
     /// computed while the statement compiles, like a scalar subquery's.
     Call(Box<CallExpr>),
+    /// `now()` / `current_timestamp` / `current_date`, optionally `+`/`-` an
+    /// interval, in a VALUE position (INSERT values, UPDATE SET). Folded to
+    /// the statement's one clock while it compiles, like the same words in a
+    /// predicate.
+    Clock { date_only: bool, offset: i64 },
 }
 
 /// `name(arg, ...)` for a pgcrypto-compatible function.
@@ -430,6 +435,9 @@ pub(super) enum RowExpr {
     Concat(Box<RowExpr>, Box<RowExpr>),
     /// A geometry OUTPUT function over one geometry (QL_CONTRACT §4.4).
     Geo { func: GeoFunc, arg: Box<RowExpr> },
+    /// `col->>'member'` over a JSONB column: the member as text, read from
+    /// the row already fetched.
+    JsonText { column: String, member: String },
 }
 
 /// The geometry output functions: pure translations of the shape the row
@@ -1167,6 +1175,9 @@ impl Literal {
                 call.name,
                 call.args.iter().map(Literal::written).collect::<Vec<_>>().join(", ")
             ),
+            Self::Clock { date_only, offset } => {
+                TimeValue::Clock { date_only: *date_only, offset: *offset }.written()
+            }
         }
     }
 }
@@ -1273,6 +1284,7 @@ impl RowExpr {
             Self::ToDate(arg) => format!("to_date({})", arg.written()),
             Self::CastDate(arg) => format!("{}::date", arg.written()),
             Self::CastText(arg) => format!("{}::text", arg.written()),
+            Self::JsonText { column, member } => format!("{column}->>'{member}'"),
             Self::Str { func, args } => format!(
                 "{}({})",
                 func.written(),

@@ -32,6 +32,8 @@ pub(crate) enum CompiledRow {
     Concat(Box<CompiledRow>, Box<CompiledRow>),
     /// A §4.4 geometry output function over one shape.
     Geo { func: GeoFunc, arg: Box<CompiledRow> },
+    /// `col->>'member'`: the member of a JSONB object as text.
+    JsonText { arg: Box<CompiledRow>, member: String },
 }
 
 impl CompiledRow {
@@ -205,6 +207,17 @@ impl CompiledRow {
                 }
                 SqlValue::Text(want_text(&value, "::text")?)
             }
+            // PostgreSQL's `->>`: a string member is its text, any other
+            // member its JSON spelling, and an absent member, JSON null or a
+            // value that is not an object is NULL.
+            Self::JsonText { arg, member } => match arg.eval(values)? {
+                SqlValue::Json(Value::Object(object)) => match object.get(member) {
+                    None | Some(Value::Null) => SqlValue::Null,
+                    Some(Value::String(text)) => SqlValue::Text(text.clone()),
+                    Some(other) => SqlValue::Text(other.to_string()),
+                },
+                _ => SqlValue::Null,
+            },
             Self::Iso { arg, date_only } => {
                 let value = arg.eval(values)?;
                 if nullish(&value) {
@@ -441,6 +454,15 @@ impl Compiler<'_> {
             }
             RowExpr::CastDate(arg) => {
                 CompiledRow::CastDate(Box::new(self.row_function(c, arg, fields)?))
+            }
+            RowExpr::JsonText { column, member } => {
+                if !matches!(self.kind_of(c, column)?, Kind::Json) {
+                    return Err(SqlError::unsupported(format!(
+                        "{column}->>'{member}': `->>` extracts from a JSONB column, and `{column}` is not one"
+                    )));
+                }
+                let arg = self.row_function(c, &RowExpr::Column(column.clone()), fields)?;
+                CompiledRow::JsonText { arg: Box::new(arg), member: member.clone() }
             }
             RowExpr::CastText(arg) => {
                 let inner = self.row_function(c, arg, fields)?;

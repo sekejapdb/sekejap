@@ -1150,6 +1150,7 @@ impl Parser {
                 }
                 Tok::Comma if depth == 0 => return false,
                 Tok::Concat | Tok::Cast => return true,
+                Tok::LongArrow if depth == 0 => return true,
                 Tok::Word(word) if depth == 0 => {
                     let upper = word.to_ascii_uppercase();
                     if matches!(upper.as_str(), "AS" | "FROM") {
@@ -1234,7 +1235,7 @@ impl Parser {
 
     /// `now()` / `current_date` / `current_timestamp`, optionally `+` or `-`
     /// an interval. `None` when the cursor is not on the clock.
-    fn clock_value(&mut self) -> SqlResult2<Option<TimeValue>> {
+    pub(super) fn clock_value(&mut self) -> SqlResult2<Option<TimeValue>> {
         let word = self.word().map(|w| w.to_ascii_uppercase());
         let date_only = match word.as_deref() {
             Some("NOW") => {
@@ -1552,6 +1553,16 @@ impl Parser {
         Ok(expr)
     }
 
+    /// `name` as a column, or `name->>'member'` when the operator follows:
+    /// the member's text, read from the row (QL_CONTRACT §4.1).
+    fn json_text_after(&mut self, name: String) -> SqlResult2<RowExpr> {
+        if !self.eat(&Tok::LongArrow) {
+            return Ok(RowExpr::Column(name));
+        }
+        let member = self.json_member()?;
+        Ok(RowExpr::JsonText { column: name, member })
+    }
+
     fn row_atom(&mut self) -> SqlResult2<RowExpr> {
         if self.eat(&Tok::LParen) {
             let inner = self.row_expr()?;
@@ -1568,7 +1579,8 @@ impl Parser {
         // (`ST_AsBinary("geom", 'NDR')`).
         if matches!(self.peek(), Tok::Quoted(_)) {
             let name = self.name()?;
-            return self.row_casts(RowExpr::Column(name));
+            let column = self.json_text_after(name)?;
+            return self.row_casts(column);
         }
         let word = match self.word() {
             Some(word) => word.to_ascii_uppercase(),
@@ -1857,7 +1869,8 @@ impl Parser {
                         }
                         self.guard_word()?;
                         let name = self.name()?;
-                        return self.row_casts(RowExpr::Column(name));
+                        let column = self.json_text_after(name)?;
+                        return self.row_casts(column);
                     }
                 };
                 self.bump();
