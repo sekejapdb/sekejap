@@ -128,7 +128,7 @@ impl Parser {
         };
         let limit = if self.eat_word("LIMIT") {
             match self.bump() {
-                Tok::Num(n, true) if n >= 0.0 => Some(n as usize),
+                Tok::Num(n, Some(_)) if n >= 0.0 => Some(n as usize),
                 other => {
                     return Err(SqlError::syntax(
                         format!("LIMIT needs a whole number, found `{}`", other.written()),
@@ -166,7 +166,7 @@ impl Parser {
         let column = self.name()?;
         let divisor = if self.eat(&Tok::Slash) {
             match self.bump() {
-                Tok::Num(value, true) if value >= 1.0 => Some(value as i64),
+                Tok::Num(value, Some(_)) if value >= 1.0 => Some(value as i64),
                 other => {
                     return Err(SqlError::unsupported(format!(
                         "GROUP BY {column} / n takes a positive whole divisor -- only then is the expression monotone in the index's own order, which is what lets it stream; found `{}`",
@@ -313,7 +313,7 @@ impl Parser {
             let name = self.name()?;
             // `col / n`: the grouping expression, written in the select list
             // the way a statement reports what it grouped by.
-            if matches!(self.peek(), Tok::Slash) && matches!(self.peek_at(1), Tok::Num(_, true)) {
+            if matches!(self.peek(), Tok::Slash) && matches!(self.peek_at(1), Tok::Num(_, Some(_))) {
                 self.bump();
                 let Tok::Num(value, _) = self.bump() else {
                     unreachable!("the divisor was just peeked");
@@ -337,8 +337,11 @@ impl Parser {
             });
         }
         let at = self.here();
-        let _ = self.expression(0)?;
-        Ok(SelectItem::OrderValue(format!("expression at byte {at}")))
+        let expression = self.expression(0)?;
+        Ok(SelectItem::OrderValue {
+            what: format!("expression at byte {at}"),
+            key: super::expr::order_key_of(expression, false).ok(),
+        })
     }
 
 }

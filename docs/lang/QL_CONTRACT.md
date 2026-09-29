@@ -783,13 +783,13 @@ SET application_name = 'doc examples'
 SHOW client_encoding
 ```
 
-```sql
--- BEGIN opens the transaction the single writer is already inside
+```sql refused
+-- refused 0A000: BEGIN through the API (Db::execute / Db::query / Tx) -- the PostgreSQL wire honours it; the API's transaction is Db::transaction()
 BEGIN
 ```
 
-```sql
--- COMMIT is the durability barrier that closes it
+```sql refused
+-- refused 0A000: COMMIT through the API -- Tx::commit is the durability barrier there; the PostgreSQL wire honours the word
 COMMIT
 ```
 

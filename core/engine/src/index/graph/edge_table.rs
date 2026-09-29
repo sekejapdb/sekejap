@@ -12,7 +12,7 @@
 //! key names the source, the destination or both, so the edges that could
 //! collide are one adjacency range (§3 of the design).
 
-use super::adjacency::{primary_posting, AdjacencyCursor};
+use super::adjacency::{primary_posting, primary_posting_if_any, AdjacencyCursor};
 use super::*;
 use crate::collections::KEY_FIELD;
 use crate::encode_dense_v3;
@@ -414,6 +414,7 @@ impl Database {
                         }
                     }
                 }
+                self.refuse_null_properties(&bound, &merged)?;
                 self.check_properties(&bound, &merged)?;
                 let result = (|| {
                     self.write_edge_bag(taken.edge, &merged)?;
@@ -454,6 +455,7 @@ impl Database {
                     bag[column.as_str()] = value.clone();
                 }
             }
+            self.refuse_null_properties(&bound, &bag)?;
             self.check_properties(&bound, &bag)?;
             rewritten.push((f.edge, bag));
         }
@@ -643,20 +645,27 @@ impl Database {
         };
         let source = end(&bound.binding.source, bound.source_collection)?;
         let destination = end(&bound.binding.destination, bound.destination_collection)?;
-        let mut bag = serde_json::Map::new();
-        for (column, value) in row {
-            if !bound.is_end(column) && !value.is_null() {
-                bag.insert(column.clone(), value.clone());
-            }
-        }
-        let mut bag = Value::Object(bag);
+        // The column rules meet the whole logical row, ends and explicit
+        // NULLs included, as a row table's do: a DEFAULT fills only a column
+        // the statement left out, and a NOT NULL end is the end the edge
+        // names (finding vuln-a13). The bag keeps the properties that hold
+        // a value.
+        let mut full = Value::Object(row.clone());
         let catalog = self.catalog(bound.collection)?;
         if !catalog.rules.is_empty() {
-            self.apply_column_rules(&catalog, &mut bag).map_err(|e| match e {
+            self.apply_column_rules(&catalog, &mut full).map_err(|e| match e {
                 Error::InvalidInput(m) if m.contains("NOT NULL") => constraint(NOT_NULL_VIOLATION, m),
                 other => other,
             })?;
         }
+        let bag: serde_json::Map<String, Value> = full
+            .as_object()
+            .expect("built from an object")
+            .iter()
+            .filter(|(column, value)| !bound.is_end(column) && !value.is_null())
+            .map(|(column, value)| (column.clone(), value.clone()))
+            .collect();
+        let bag = Value::Object(bag);
         for column in &bound.table.key {
             if !bound.is_end(column) && bag.get(column).is_none_or(Value::is_null) {
                 return Err(constraint(
@@ -675,6 +684,25 @@ impl Database {
             },
             bag,
         ))
+    }
+
+    /// A property a NOT NULL rule covers that `bag` leaves NULL or missing
+    /// refuses the write with 23502: an UPDATE or an ON CONFLICT DO UPDATE
+    /// meets the rule an INSERT does (finding vuln-a13). The ends are never
+    /// in a bag; an edge always has both.
+    fn refuse_null_properties(&self, bound: &Bound, bag: &Value) -> Result<()> {
+        for (field, rule) in &self.catalog(bound.collection)?.rules {
+            if rule.not_null && !bound.is_end(field) && bag.get(field).is_none_or(Value::is_null) {
+                return Err(constraint(
+                    NOT_NULL_VIOLATION,
+                    format!(
+                        "null value in column \"{field}\" of relation \"{}\" violates not-null constraint",
+                        bound.name
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The bag's values are the kinds the layout declares, checked with the
@@ -703,6 +731,19 @@ impl Database {
         }
         let has_source = bound.table.key.contains(&bound.binding.source);
         let has_destination = bound.table.key.contains(&bound.binding.destination);
+        // `PRIMARY KEY (src, dst)`: the pair's one edge is the tuple's own,
+        // id 0 (`write_new_edge`), so the check is one lookup rather than a
+        // walk of every edge at one end -- which was O(degree) per insert
+        // and refused past `MAX_TUPLE_EDGES` (finding vuln-f09).
+        if has_source && has_destination && bound.table.key.len() == 2 {
+            return match primary_posting_if_any(self, key, 0)? {
+                Some(posting) => Ok(Some(Found {
+                    edge: EdgeId { key, id: 0 },
+                    bag: decode_properties(&posting)?,
+                })),
+                None => Ok(None),
+            };
+        }
         let (near, direction) = if has_source {
             (key.source, Direction::Outgoing)
         } else {
@@ -781,10 +822,13 @@ impl Database {
         let source = named(&bound.binding.source, bound.source_collection)?;
         let destination = named(&bound.binding.destination, bound.destination_collection)?;
         let (near, direction) = match (source, destination) {
+            // An end that names no row matches no edge -- checked FIRST: an
+            // existing source beside a missing destination used to take the
+            // walk below, where the missing end then restricted nothing, so a
+            // DELETE removed edges it never named (finding vuln-a01).
+            (Some(None), _) | (_, Some(None)) => return Ok(Vec::new()),
             (Some(Some(s)), _) => (s, Direction::Outgoing),
             (None, Some(Some(d))) => (d, Direction::Incoming),
-            // An end that names no row matches no edge.
-            (Some(None), _) | (_, Some(None)) => return Ok(Vec::new()),
             (None, None) => {
                 return Err(invalid(format!(
                     "a WHERE on `{}` must name `{}` or `{}`: without an end the read is every edge of the type, and there is no index over edge properties (docs/core/EDGE_TABLES.md §4.5)",

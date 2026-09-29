@@ -292,6 +292,34 @@ impl AggValue {
     }
 }
 
+/// Two values of one accumulator, compared as their own type: integers
+/// exactly (no `f64` rounding past 2^53), text as text, and NULL after
+/// every value, as PostgreSQL sorts NULL in an ascending order (finding
+/// vuln-a18).
+fn compare_agg(left: &AggValue, right: &AggValue) -> Ordering {
+    let exact = |v: &AggValue| match v {
+        AggValue::Count(n) => Some(i128::from(*n)),
+        AggValue::I64(n) => Some(i128::from(*n)),
+        AggValue::Bool(b) => Some(i128::from(*b)),
+        _ => None,
+    };
+    match (left, right) {
+        (AggValue::Null, AggValue::Null) => Ordering::Equal,
+        (AggValue::Null, _) => Ordering::Greater,
+        (_, AggValue::Null) => Ordering::Less,
+        (AggValue::Text(a), AggValue::Text(b)) => a.cmp(b),
+        (AggValue::Text(_), _) => Ordering::Greater,
+        (_, AggValue::Text(_)) => Ordering::Less,
+        _ => match (exact(left), exact(right)) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            _ => {
+                let number = |v: &AggValue| v.as_f64().unwrap_or(f64::NAN);
+                number(left).total_cmp(&number(right))
+            }
+        },
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupRow {
     /// `None` when the request named no group key: one group over everything.
@@ -949,8 +977,11 @@ impl Database {
         // cheapest complete enumeration of a collection -- the same choice
         // `popsim`'s and `q7_budget`'s `count_all` make
         // (`CandidateDriver::Keys`, `src/query/plan.rs`'s `keys_driver`).
+        // A HAVING is evaluated over the walked group, so it takes the walk
+        // (finding vuln-a16).
         let count_all = request.filters.is_empty()
             && request.group.is_none()
+            && request.having.is_empty()
             && !accumulators.is_empty()
             && accumulators
                 .iter()
@@ -1341,7 +1372,10 @@ impl PreparedAggregate<'_> {
         // is the whole point of the record. It is one group, once, and then
         // the aggregate is done.
         if let Some(rows) = self.live_count {
-            if self.done {
+            // `LIMIT 0` answers no group, from the record as from a walk
+            // (finding vuln-a16).
+            if self.done || self.total_limit == Some(0) {
+                self.done = true;
                 return Ok(GroupPage {
                     groups: Vec::new(),
                     done: true,
@@ -1638,12 +1672,7 @@ impl PreparedAggregate<'_> {
             return;
         };
         out.sort_by(|left, right| {
-            let ordering = match (left.values[at].as_f64(), right.values[at].as_f64()) {
-                (Some(a), Some(b)) => a.total_cmp(&b),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            };
+            let ordering = compare_agg(&left.values[at], &right.values[at]);
             let ordering = match direction {
                 SortDirection::Ascending => ordering,
                 SortDirection::Descending => ordering.reverse(),

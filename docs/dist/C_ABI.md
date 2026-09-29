@@ -121,8 +121,16 @@ time, and each reads its own error slot back. This is the change from 0.16,
 where `SekejapDb*` wrapped a single-threaded `CoreDB` and a second handle
 (`SekejapEngine*`) existed for the concurrent case; 0.17 has one handle.
 
-The DERIVED handles are not shared work. A `SekejapScan*`, a `SekejapStmt*`
-and a `SekejapTx*` are each used from ONE thread at a time.
+The DERIVED handles are not shared work. A `SekejapScan*` and a
+`SekejapStmt*` are each used from ONE thread at a time.
+
+A `SekejapTx*` runs on a WORKER THREAD of its own (0.18.5): the worker
+begins the transaction, runs every `sekejap_tx_*` call on it and commits or
+rolls it back, so the writer's lock is taken and released on one thread
+whichever thread calls. Any thread may call, one at a time -- a Go goroutine
+that moves between OS threads, a coroutine, a finalizer that rolls back.
+Each call's error lands in the CALLING thread's slot: read
+`sekejap_last_error` on the thread whose call failed.
 
 A `SekejapTx*` HOLDS the writer for its whole life. While one is open, a call
 on the same `SekejapDb*` that needs the writer -- from this thread or another
@@ -251,7 +259,7 @@ property with the whole answer in one string, because `Db::query` assembles a
 | `int32_t sekejap_link(SekejapDb*, const char *from_collection, const char *from_key, const char *edge_type, const char *to_collection, const char *to_key)` | `Db::link` | link two rows with a typed edge in the base graph context, committed | `0` / `-1` |
 | `int32_t sekejap_link_with(..., const char *properties_json)` | `Db::link_with` | the same, carrying a JSON properties object | `0` / `-1` |
 | `int32_t sekejap_unlink(SekejapDb*, ...)` | `Db::unlink` | remove one edge, committed | `1` / `0` / `-1` |
-| `char *sekejap_neighbours(SekejapDb*, const char *collection, const char *key, const char *edge_type, SekejapDirection, uintptr_t limit)` | `Db::neighbours` | the rows one hop away, in one direction. `edge_type` may be `NULL` for every type | JSON array (free) / `NULL` |
+| `char *sekejap_neighbours(SekejapDb*, const char *collection, const char *key, const char *edge_type, int32_t direction, uintptr_t limit)` | `Db::neighbours` | the rows one hop away, in one direction. `edge_type` may be `NULL` for every type; `direction` is a `SekejapDirection` value, and any other is `SekejapStatus_Invalid` | JSON array (free) / `NULL` |
 
 Both endpoints must EXIST: a missing one is `SekejapStatus_UnknownRow`, never
 a dangling identity (`docs/core/GRAPH_CONTRACT.md` §4).

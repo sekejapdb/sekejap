@@ -248,8 +248,8 @@ pub(crate) fn literal_value(literal: &SqlLiteral, params: &[BindingValue]) -> Ev
     Ok(match literal {
         SqlLiteral::Null => Value::Null,
         SqlLiteral::Bool(b) => Value::Bool(*b),
-        SqlLiteral::Num(v, exact) if *exact && v.fract() == 0.0 && v.abs() < 9.0e18 => Value::from(*v as i64),
-        SqlLiteral::Num(v, _) => Value::from(*v),
+        SqlLiteral::Num(_, Some(integer)) => Value::from(*integer),
+        SqlLiteral::Num(v, None) => Value::from(*v),
         SqlLiteral::Str(s) => Value::String(s.clone()),
         // Numbered from 1, and checked against the count at bind.
         SqlLiteral::Param(n) => match &params[*n - 1] {

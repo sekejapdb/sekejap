@@ -10,10 +10,12 @@ pub(crate) fn encode_direct(layout: &Layout, doc: &Value) -> Result<Encoded> {
         .fields
         .iter()
         .any(|(n, _)| obj.get(n).is_none_or(Value::is_null));
-    let extras: Vec<_> = obj
+    // Sorted by key, whatever order the map iterates in (see `json_write`).
+    let mut extras: Vec<_> = obj
         .iter()
         .filter(|(k, _)| !layout.fields.iter().any(|(n, _)| n == *k))
         .collect();
+    extras.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let mut out = Vec::new();
     uv(
         (layout.id << 2) | u64::from(has_states) | (u64::from(!extras.is_empty()) << 1),
@@ -289,16 +291,17 @@ pub(crate) fn read_fields(
             return Err("extras must be object".into());
         }
         let n = r.count()?;
-        let mut previous: Option<&str> = None;
+        let mut seen = std::collections::BTreeSet::new();
         for _ in 0..n {
             let key = std::str::from_utf8(r.blob()?)?;
-            if previous.is_some_and(|old| old >= key) {
-                return Err("unordered/duplicate object key".into());
+            // Any order: 0.18.x wrote a host's insertion order when the host
+            // enabled `serde_json/preserve_order`. A repeated key is refused.
+            if !seen.insert(key) {
+                return Err("duplicate object key".into());
             }
             if layout.fields.iter().any(|(name, _)| name == key) {
                 return Err("declared key in extras".into());
             }
-            previous = Some(key);
             let slot = undeclared.then(|| fields.iter().position(|field| field == key)).flatten();
             match slot {
                 Some(slot) => {
@@ -422,16 +425,17 @@ pub(crate) fn read_text_field_in<'b>(
             return Err("extras must be object".into());
         }
         let n = r.count()?;
-        let mut previous: Option<&str> = None;
+        let mut seen = std::collections::BTreeSet::new();
         for _ in 0..n {
             let key = std::str::from_utf8(r.blob()?)?;
-            if previous.is_some_and(|old| old >= key) {
-                return Err("unordered/duplicate object key".into());
+            // Any order: 0.18.x wrote a host's insertion order when the host
+            // enabled `serde_json/preserve_order`. A repeated key is refused.
+            if !seen.insert(key) {
+                return Err("duplicate object key".into());
             }
             if layout.fields.iter().any(|(name, _)| name == key) {
                 return Err("declared key in extras".into());
             }
-            previous = Some(key);
             json_skip(&mut r, 1)?;
         }
     }
@@ -562,16 +566,17 @@ pub(crate) fn read_field_in(layout: &Layout, bytes: &[u8], field: &str) -> Resul
             return Err("extras must be object".into());
         }
         let n = r.count()?;
-        let mut previous: Option<&str> = None;
+        let mut seen = std::collections::BTreeSet::new();
         for _ in 0..n {
             let key = std::str::from_utf8(r.blob()?)?;
-            if previous.is_some_and(|old| old >= key) {
-                return Err("unordered/duplicate object key".into());
+            // Any order: 0.18.x wrote a host's insertion order when the host
+            // enabled `serde_json/preserve_order`. A repeated key is refused.
+            if !seen.insert(key) {
+                return Err("duplicate object key".into());
             }
             if layout.fields.iter().any(|(name, _)| name == key) {
                 return Err("declared key in extras".into());
             }
-            previous = Some(key);
             if declared.is_none() && key == field {
                 let value = json_read(&mut r, 1)?;
                 selected = if value.is_null() {
@@ -854,16 +859,17 @@ pub(crate) fn locate_vector(
             return Err("extras must be object".into());
         }
         let n = r.count()?;
-        let mut previous: Option<&str> = None;
+        let mut seen = std::collections::BTreeSet::new();
         for _ in 0..n {
             let key = std::str::from_utf8(r.blob()?)?;
-            if previous.is_some_and(|old| old >= key) {
-                return Err("unordered/duplicate object key".into());
+            // Any order: 0.18.x wrote a host's insertion order when the host
+            // enabled `serde_json/preserve_order`. A repeated key is refused.
+            if !seen.insert(key) {
+                return Err("duplicate object key".into());
             }
             if layout.fields.iter().any(|(name, _)| name == key) {
                 return Err("declared key in extras".into());
             }
-            previous = Some(key);
             json_skip(&mut r, 1)?;
         }
     }
@@ -1446,7 +1452,25 @@ mod tests {
         json_write(&json!(1), &mut unordered, 1).unwrap();
         blob(b"a", &mut unordered);
         json_write(&json!(2), &mut unordered, 1).unwrap();
-        assert!(read_field(&layout, &unordered, "early").is_err());
+        // Keys out of order are a valid object: a build with
+        // `serde_json/preserve_order` wrote them so through 0.18.4.
+        assert_eq!(
+            read_field(&layout, &unordered, "a").unwrap(),
+            FieldValue::Inline(json!(2))
+        );
+        let mut repeated = Vec::new();
+        uv((layout.id << 2) | 2, &mut repeated);
+        blob(b"selected", &mut repeated);
+        json_write(&json!({"ok":true}), &mut repeated, 0).unwrap();
+        repeated.extend_from_slice(&1.0_f64.to_le_bytes());
+        repeated.extend_from_slice(&2.0_f64.to_le_bytes());
+        repeated.push(8);
+        uv(2, &mut repeated);
+        blob(b"z", &mut repeated);
+        json_write(&json!(1), &mut repeated, 1).unwrap();
+        blob(b"z", &mut repeated);
+        json_write(&json!(2), &mut repeated, 1).unwrap();
+        assert!(read_field(&layout, &repeated, "z").is_err(), "a repeated key is still refused");
 
         let mut collision = Vec::new();
         uv((layout.id << 2) | 2, &mut collision);

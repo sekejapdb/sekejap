@@ -861,55 +861,65 @@ impl Parser {
                 "NULLS FIRST / NULLS LAST: `compare_rank` fixes where a nullish key sorts, and it is not a per-query choice",
             ));
         }
-        Ok(match expression {
-            PExpr::Column(column) => OrderKey::Column { column, descending },
-            PExpr::Bm25 { column, query } => OrderKey::Bm25 {
-                column,
-                query,
-                descending,
-            },
-            PExpr::Distance { column, right, op } => match *right {
-                PExpr::Geo(GeoArg::Point(point)) => {
-                    if op != VecOp::L2 {
-                        return Err(SqlError::unsupported(
-                            "the PostGIS KNN operator is `<->`; `<=>` and `<#>` are pgvector's and take a vector",
-                        ));
-                    }
-                    OrderKey::Distance {
-                        column,
-                        point,
-                        descending,
-                    }
-                }
-                PExpr::Geo(_) => {
-                    return Err(SqlError::unsupported(
-                        "ORDER BY <-> takes a point: the nearest walk starts at one centre",
-                    ))
-                }
-                PExpr::Param(n) => OrderKey::Vector {
-                    column,
-                    query: Literal::Param(n),
-                    op,
-                    descending,
-                },
-                PExpr::Str(text) => OrderKey::Vector {
-                    column,
-                    query: Literal::Str(text),
-                    op,
-                    descending,
-                },
-                other => {
-                    return Err(SqlError::unsupported(format!(
-                        "the right side of a distance operator is a vector literal, a parameter or a point; found {other:?}"
-                    )))
-                }
-            },
-            other => OrderKey::Score {
-                expr: lower(other)?,
-                descending,
-            },
-        })
+        order_key_of(expression, descending)
     }
+}
+
+/// The ORDER BY key an expression is, in direction `descending`. A select
+/// list builds the same key from its own expression to ask whether it names
+/// this statement's ORDER BY (finding vuln-a17).
+pub(super) fn order_key_of(expression: PExpr, descending: bool) -> SqlResult2<OrderKey> {
+    Ok(match expression {
+        PExpr::Column(column) => OrderKey::Column { column, descending },
+        PExpr::Bm25 { column, query } => OrderKey::Bm25 {
+            column,
+            query,
+            descending,
+        },
+        PExpr::Distance { column, right, op } => match *right {
+            PExpr::Geo(GeoArg::Point(point)) => {
+                if op != VecOp::L2 {
+                    return Err(SqlError::unsupported(
+                        "the PostGIS KNN operator is `<->`; `<=>` and `<#>` are pgvector's and take a vector",
+                    ));
+                }
+                OrderKey::Distance {
+                    column,
+                    point,
+                    descending,
+                }
+            }
+            PExpr::Geo(_) => {
+                return Err(SqlError::unsupported(
+                    "ORDER BY <-> takes a point: the nearest walk starts at one centre",
+                ))
+            }
+            PExpr::Param(n) => OrderKey::Vector {
+                column,
+                query: Literal::Param(n),
+                op,
+                descending,
+            },
+            PExpr::Str(text) => OrderKey::Vector {
+                column,
+                query: Literal::Str(text),
+                op,
+                descending,
+            },
+            other => {
+                return Err(SqlError::unsupported(format!(
+                    "the right side of a distance operator is a vector literal, a parameter or a point; found {other:?}"
+                )))
+            }
+        },
+        other => OrderKey::Score {
+            expr: lower(other)?,
+            descending,
+        },
+    })
+}
+
+impl Parser {
 
     /// A precedence-climbing expression parser. Level 0 is `+`/`-`, level 1
     /// `*`/`/`, level 2 the distance operators, level 3 a primary.
@@ -1773,7 +1783,7 @@ impl Parser {
                     "ST_ASEWKB" => GeoFunc::AsEwkb(order(&option)?),
                     "ST_ASGEOJSON" => GeoFunc::AsGeoJson(match option {
                         None => 9,
-                        Some(Tok::Num(n, true)) if (0.0..=15.0).contains(&n) => n as usize,
+                        Some(Tok::Num(n, Some(_))) if (0.0..=15.0).contains(&n) => n as usize,
                         Some(other) => {
                             return Err(SqlError::unsupported(format!(
                                 "st_asgeojson(g, {}): maxdecimaldigits is a whole number from 0 to 15; the options argument is not carried",
@@ -1873,7 +1883,7 @@ impl Parser {
     fn literal_no_cast(&mut self) -> SqlResult2<Literal> {
         if self.eat(&Tok::Minus) {
             return match self.literal_no_cast()? {
-                Literal::Num(value, exact) => Ok(Literal::Num(-value, exact)),
+                Literal::Num(value, exact) => Ok(Literal::Num(-value, exact.and_then(i64::checked_neg))),
                 other => Err(SqlError::unsupported(format!(
                     "unary minus applies to a number, not to {other:?}"
                 ))),
@@ -1912,7 +1922,7 @@ impl Parser {
     fn literal_inner(&mut self) -> SqlResult2<Literal> {
         if self.eat(&Tok::Minus) {
             return match self.literal()? {
-                Literal::Num(value, exact) => Ok(Literal::Num(-value, exact)),
+                Literal::Num(value, exact) => Ok(Literal::Num(-value, exact.and_then(i64::checked_neg))),
                 other => Err(SqlError::unsupported(format!(
                     "unary minus applies to a number, not to {other:?}"
                 ))),

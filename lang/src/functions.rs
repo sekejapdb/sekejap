@@ -595,8 +595,13 @@ pub(crate) fn left(s: &str, n: i64) -> String {
 
 pub(crate) fn right(s: &str, n: i64) -> String {
     let chars: Vec<char> = s.chars().collect();
-    let len = chars.len() as i64;
-    let from = if n < 0 { (-n).min(len) } else { len - n.min(len) } as usize;
+    let len = chars.len();
+    // `unsigned_abs`, not `-n`: `-i64::MIN` overflows (finding vuln-a19).
+    let from = if n < 0 {
+        n.unsigned_abs().min(len as u64) as usize
+    } else {
+        len - (n as u64).min(len as u64) as usize
+    };
     chars[from..].iter().collect()
 }
 

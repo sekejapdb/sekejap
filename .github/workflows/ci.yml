@@ -67,6 +67,22 @@ jobs:
           PYTHONPATH=dist/bindings/wrappers/python/python \
             python3 -m pytest dist/bindings/wrappers/python/tests -q
 
+  # The same engine and SQL suites in a build where serde_json keeps
+  # INSERTION order (`serde_json/preserve_order`). A host turns that feature on
+  # for sekejap whether it means to or not -- Cargo unifies features, and
+  # common crates enable it -- and 0.18.4 and earlier wrote stored JSON objects
+  # that their own reads refused under it (0.18.5). Every stored object must
+  # read back under either map order.
+  test-preserve-order:
+    name: Test (serde_json preserve_order)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --no-fail-fast -p sekejap-core --features ${{ env.FEATURES }},serde_json/preserve_order
+      - run: cargo test --release --no-fail-fast -p sekejap-lang --features ${{ env.FEATURES }},serde_json/preserve_order
+
   # The agreement fuzzers on a seed nobody has run before.
   #
   # A campaign that is clean on a seed already used proves very little — it

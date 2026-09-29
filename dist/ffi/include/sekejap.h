@@ -118,6 +118,14 @@ typedef struct SekejapStmt SekejapStmt;
 // The writer, held across many writes. Created by `sekejap_tx_begin` and
 // consumed by `sekejap_tx_commit` or `sekejap_tx_rollback`; a handle
 // dropped any other way ROLLS BACK.
+//
+// The transaction lives on a WORKER THREAD of its own, which begins it,
+// runs every call on it and commits or rolls it back (finding vuln-f05). It
+// holds the writer's mutex guard, and a mutex released from a thread that
+// did not take it is undefined behaviour; a wrapper whose calls move
+// between OS threads (Go, Kotlin coroutines, Swift concurrency) or that
+// rolls back from a finalizer would do exactly that. Any thread may call,
+// one at a time; the guard never leaves the worker.
 typedef struct SekejapTx SekejapTx;
 
 #ifdef __cplusplus
@@ -421,13 +429,17 @@ int32_t sekejap_unlink(SekejapDb *db,
 // neighbour can be in another collection and its name is part of the
 // answer. `NULL` on failure.
 //
+// `direction` is a `SekejapDirection` value, received as the `int32_t` it
+// is in C: any other value is `SekejapStatus_Invalid`, never undefined
+// behaviour (finding vuln-f06).
+//
 // # Safety
 // As `sekejap_link`; `edge_type` may be NULL.
 char *sekejap_neighbours(SekejapDb *db,
                          const char *collection,
                          const char *key,
                          const char *edge_type,
-                         SekejapDirection direction,
+                         int32_t direction,
                          uintptr_t limit);
 
 // Declare a collection. `fields_json` is a JSON array of
@@ -546,7 +558,7 @@ long sekejap_tx_execute(SekejapTx *tx, const char *sql, const char *params_json)
 
 // Commit the transaction and FREE the handle, whether the commit succeeded
 // or not. `0` on success, `-1` on failure. The pointer is dangling after
-// this call in both cases.
+// this call in both cases. Any thread may call it.
 //
 // # Safety
 // `tx` must be a live handle that has not been committed or rolled back.

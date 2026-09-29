@@ -60,7 +60,7 @@ use sekejap_core::collections::{
 use sekejap_lang::{Param, SqlDatabase, SqlError, SqlResult};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
@@ -162,6 +162,10 @@ pub struct ServiceDatabase {
     /// the new one is in hand -- and is counted here rather than retried into
     /// a gap.
     publish_failures: AtomicU64,
+    /// The committed log is due a fold that a reader slot is holding off.
+    /// A holder of a private view that can let go between statements (a
+    /// wire connection) reads this and releases it (finding vuln-f01).
+    fold_wanted: AtomicBool,
 }
 
 impl ServiceDatabase {
@@ -172,7 +176,14 @@ impl ServiceDatabase {
     /// adds no second rule and emulates nothing.
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        let writer = Database::open(&path, config)?;
+        let mut writer = Database::open(&path, config)?;
+        // A log left due by the last run folds before the first view takes
+        // a slot; otherwise a restart could never fold it (finding
+        // vuln-f01). `Ok(false)` -- another process holds a slot -- leaves
+        // it to the commits' own fold point.
+        if writer.checkpoint_due()? {
+            writer.checkpoint()?;
+        }
         let (snapshot, _) = mint(&path, config, 1)?;
         Ok(Self {
             path,
@@ -189,7 +200,16 @@ impl ServiceDatabase {
             interrupt: InterruptHandle::new(),
             subscribers: Subscribers::new(),
             publish_failures: AtomicU64::new(0),
+            fold_wanted: AtomicBool::new(false),
         })
+    }
+
+    /// A fold of the committed log is due and a reader slot is holding it
+    /// off. A holder of a private view ([`ServiceDatabase::open_reader`])
+    /// that can let it go between statements should, and the next commit
+    /// folds (finding vuln-f01).
+    pub fn fold_wanted(&self) -> bool {
+        self.fold_wanted.load(Ordering::Relaxed)
     }
 
     /// The directory this service owns.
@@ -436,7 +456,7 @@ impl ServiceDatabase {
     ) -> Result<u64> {
         let budget = self.budget();
         let interrupt = self.interrupt.clone();
-        let guard = snapshot.lock();
+        let guard = snapshot.lock()?;
         let db: &Database = &guard;
         let prepared =
             sekejap_lang::prepare_sql_with(db, text, params, budget, &mut || {
@@ -490,7 +510,7 @@ impl ServiceDatabase {
     pub fn query(&self, snapshot: &Snapshot, text: &str, params: &[Param]) -> Result<SqlResult> {
         let budget = self.budget();
         let interrupt = self.interrupt.clone();
-        let mut guard = snapshot.lock();
+        let mut guard = snapshot.lock()?;
         Ok(guard.sql_with(text, params, budget, &mut || interrupt.is_cancelled())?)
     }
 
@@ -670,6 +690,9 @@ impl WriterGuard<'_> {
             // writer lock is still held: one event, once, in commit order.
             self.service.subscribers.deliver(event);
         }
+        if self.service.fold_if_due(&mut self.db) {
+            return Ok(());
+        }
         self.service.mark_dirty_and_maybe_publish();
         Ok(())
     }
@@ -686,7 +709,11 @@ impl WriterGuard<'_> {
 
 impl Drop for WriterGuard<'_> {
     fn drop(&mut self) {
-        if self.batch.touched() {
+        // Whatever this guard wrote and did not commit is discarded, whether
+        // or not the change feed was recording it: the feed records only
+        // while someone subscribes, and a pending write left here was
+        // committed by the NEXT guard (finding vuln-a03).
+        if self.batch.touched() || self.db.has_uncommitted_work() {
             self.batch.clear();
             sekejap_lang::end_transaction();
             let _ = self.db.rollback();
@@ -695,6 +722,38 @@ impl Drop for WriterGuard<'_> {
 }
 
 impl ServiceDatabase {
+    /// THE FOLD POINT (finding vuln-f01). The published view holds a reader
+    /// slot at every instant -- a replacement is minted before the old one
+    /// is dropped -- so the store's own checkpoint, which needs every slot
+    /// free, could never run, and past 16 MiB of log every write was
+    /// refused. When a commit leaves the log due and no caller holds the
+    /// published view, that view gives its slot back, the log folds, and a
+    /// fresh view is published. A slot held elsewhere defers the fold to a
+    /// later commit and raises [`ServiceDatabase::fold_wanted`].
+    ///
+    /// Returns whether it published, so the caller does not publish twice.
+    fn fold_if_due(&self, db: &mut Database) -> bool {
+        if !db.checkpoint_due().unwrap_or(false) {
+            self.fold_wanted.store(false, Ordering::Relaxed);
+            return false;
+        }
+        let mut state = self.publish.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let published = self.published.write().unwrap_or_else(|e| e.into_inner());
+            if Arc::strong_count(&published) == 1 {
+                published.release();
+            }
+        }
+        // `Ok(false)`: a slot is still out. An error poisons the writer,
+        // which the next write reports; the commit itself already holds.
+        let folded = matches!(db.checkpoint(), Ok(true));
+        self.fold_wanted.store(!folded, Ordering::Relaxed);
+        state.dirty = true;
+        // A failed mint leaves the released view, which re-opens on use.
+        let _ = self.publish_locked(&mut state);
+        true
+    }
+
     fn mark_dirty_and_maybe_publish(&self) {
         let mut state = self.publish.lock().unwrap_or_else(|e| e.into_inner());
         state.dirty = true;
@@ -714,7 +773,10 @@ fn mint(
     let started = Instant::now();
     let db = Database::open_snapshot(path, config)?;
     let cost = started.elapsed();
-    Ok((Snapshot::new(db, serial, Instant::now(), cost), cost))
+    Ok((
+        Snapshot::new(db, (path.to_owned(), config), serial, Instant::now(), cost),
+        cost,
+    ))
 }
 
 fn micros(d: Duration) -> u64 {
@@ -724,14 +786,14 @@ fn micros(d: Duration) -> u64 {
 /// The leading keyword when it is transaction control, `None` otherwise.
 /// True when the statement's first word is `word` (ASCII, any case).
 fn first_word_is(text: &str, word: &str) -> bool {
-    text.split_whitespace()
+    sekejap_lang::after_leading_comments(text)
+        .split_whitespace()
         .next()
         .is_some_and(|first| first.eq_ignore_ascii_case(word))
 }
 
 fn transaction_keyword(text: &str) -> Option<&'static str> {
-    let first: String = text
-        .trim_start()
+    let first: String = sekejap_lang::after_leading_comments(text)
         .chars()
         .take_while(|c| c.is_ascii_alphabetic())
         .collect::<String>()

@@ -786,16 +786,9 @@ fn encode_properties(value: &Value) -> Result<Vec<u8>> {
     // The overwhelmingly common edge carries no properties at all. Running the
     // binary-JSON writer over an empty map to rediscover three frozen bytes is
     // two allocations for a constant; `decode_properties` already short-cuts
-    // the same three, and the debug assertion below keeps the pair honest.
+    // the same three, and `empty_properties_are_what_the_writer_writes` keeps
+    // the pair honest -- once, in a test, not on every edge of a debug build.
     if object.is_empty() {
-        debug_assert!(
-            crate::binary_json(value).is_ok_and(|b| {
-                let mut written = vec![1u8];
-                written.extend(b);
-                written == EMPTY_PROPERTIES
-            }),
-            "the empty-object encoding moved out from under this shortcut"
-        );
         return Ok(EMPTY_PROPERTIES.to_vec());
     }
     let binary = crate::binary_json(value).map_err(invalid)?;
@@ -3235,3 +3228,16 @@ impl Database {
 #[cfg(test)]
 #[path = "../../faults/graph_fault_tests.rs"]
 mod fault_tests;
+
+#[cfg(test)]
+mod empty_properties_tests {
+    use super::*;
+
+    #[test]
+    fn empty_properties_are_what_the_writer_writes() {
+        let mut written = vec![1u8];
+        written.extend(crate::binary_json(&serde_json::json!({})).unwrap());
+        assert_eq!(written, EMPTY_PROPERTIES, "the empty-object encoding moved out from under encode_properties");
+        assert_eq!(encode_properties(&serde_json::json!({})).unwrap(), EMPTY_PROPERTIES);
+    }
+}

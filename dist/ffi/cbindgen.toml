@@ -43,6 +43,9 @@ header = """
 
 [export]
 prefix = ""
+# `sekejap_neighbours` takes its direction as `int32_t` (finding vuln-f06),
+# so no signature names this enum; its constants stay in the header.
+include = ["SekejapDirection"]
 
 [parse]
 parse_deps = false         # the sekejap handles are foreign -> emitted opaque

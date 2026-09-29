@@ -208,7 +208,7 @@ impl Parser {
     /// One quantifier bound: an integer literal (brief §7).
     fn gql_bound(&mut self) -> SqlResult2<u32> {
         match *self.peek() {
-            Tok::Num(value, true) if value >= 0.0 && value <= f64::from(u32::MAX) => {
+            Tok::Num(value, Some(_)) if value >= 0.0 && value <= f64::from(u32::MAX) => {
                 self.bump();
                 Ok(value as u32)
             }

@@ -213,10 +213,9 @@ fn catalog_row_function(
             time: false,
         },
         RowExpr::Lit(Literal::Str(text)) => CompiledRow::Lit(SqlValue::Text(text.clone())),
-        RowExpr::Lit(Literal::Num(value, exact)) => CompiledRow::Lit(if *exact {
-            SqlValue::Int(*value as i64)
-        } else {
-            SqlValue::Float(*value)
+        RowExpr::Lit(Literal::Num(value, exact)) => CompiledRow::Lit(match exact {
+            Some(integer) => SqlValue::Int(*integer),
+            None => SqlValue::Float(*value),
         }),
         RowExpr::Lit(Literal::Bool(b)) => CompiledRow::Lit(SqlValue::Bool(*b)),
         RowExpr::Lit(Literal::Null) => CompiledRow::Lit(SqlValue::Null),

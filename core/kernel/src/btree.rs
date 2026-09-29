@@ -690,6 +690,25 @@ fn replaced_overflow_pages(pool: &BufferPool, rec: &[u8]) -> Result<Vec<(u32, u6
 /// A leaf record whose value is an overflow marker: vlen = OVERFLOW_VLEN,
 /// body = enc_marker(). dec_val() on such a record returns the 12 marker
 /// bytes; is_marker() is how readers know to resolve them.
+thread_local! {
+    /// The page-number path a write descent records, kept between inserts so
+    /// a descent reuses its capacity instead of allocating one per insert.
+    /// A split keeps its path (and allocates, as before); the common insert
+    /// that fits hands it back. Only capacity is carried over: a descent
+    /// clears it first.
+    static PATH_BUFFER: std::cell::Cell<Vec<u32>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+fn take_path_buffer() -> Vec<u32> {
+    let mut path = PATH_BUFFER.take();
+    path.clear();
+    path
+}
+
+fn give_back_path_buffer(path: Vec<u32>) {
+    PATH_BUFFER.set(path);
+}
+
 pub(crate) fn enc_leaf_marker(key: &[u8], marker: &[u8; 12]) -> Vec<u8> {
     let mut r = Vec::with_capacity(4 + key.len() + 12);
     r.extend_from_slice(&(key.len() as u16).to_le_bytes());
@@ -1798,7 +1817,7 @@ impl<'p> BTree<'p> {
         if self.pool.is_frozen(self.root) {
             self.root = shadow_page(self.pool, self.root)?;
         }
-        let mut path = Vec::new();
+        let mut path = take_path_buffer();
         let mut cur = self.root;
         let mut fences = LeafFences::NONE;
         loop {
@@ -2191,6 +2210,7 @@ impl<'p> BTree<'p> {
             if let Some(started) = insert_started {
                 crate::write_trace::add(crate::write_trace::Field::LeafInsert, started.elapsed());
             }
+            give_back_path_buffer(path);
             return Ok(());
         }
         #[cfg(feature = "write-trace")]

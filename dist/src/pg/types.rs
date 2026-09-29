@@ -478,10 +478,9 @@ pub fn decode_param(bytes: Option<&[u8]>, type_oid: i32, format: i16) -> Result<
         return decode_array_text(&text, element);
     }
     Ok(match type_oid {
-        oid::BOOL => Param::Bool(matches!(
-            text.as_str(),
-            "t" | "true" | "TRUE" | "y" | "yes" | "on" | "1"
-        )),
+        oid::BOOL => Param::Bool(sekejap_lang::parse_bool(&text).ok_or_else(|| {
+            SqlError::Parameter(format!("invalid input syntax for type boolean: \"{text}\""))
+        })?),
         oid::INT2 | oid::INT4 | oid::INT8 => Param::Int(text.trim().parse().map_err(|_| {
             SqlError::Parameter(format!("`{text}` is not the whole number its type declares"))
         })?),
@@ -727,11 +726,17 @@ fn decode_array_binary(bytes: &[u8], type_oid: i32, element: i32) -> Result<Para
 
 /// An undeclared text parameter, read by shape.
 fn sniff(text: String) -> Param {
-    if let Ok(n) = text.trim().parse::<i64>() {
-        return Param::Int(n);
+    // Only a number's own canonical spelling is read as that number, so
+    // nothing the client sent is lost: '00123', ' 7' and '1e3' stay text,
+    // and '1001' as a number is exactly '1001' again wherever the binder
+    // wants text (finding vuln-f08).
+    if let Ok(n) = text.parse::<i64>() {
+        if n.to_string() == text {
+            return Param::Int(n);
+        }
     }
-    if let Ok(f) = text.trim().parse::<f64>() {
-        if f.is_finite() {
+    if let Ok(f) = text.parse::<f64>() {
+        if serde_json::Number::from_f64(f).is_some_and(|number| number.to_string() == text) {
             return Param::Float(f);
         }
     }

@@ -227,6 +227,10 @@ fn handle(
     stream.set_nodelay(true).ok();
     stream.set_read_timeout(Some(READ_POLL))?;
     let mut connection = Connection::new(service, key, token);
+    // A streamed answer goes to the socket while it runs, not after
+    // (`STREAM_FLUSH_BYTES`); `feed` returns only what followed the last
+    // write, so the two stay in order.
+    connection.set_sink(Box::new(stream.try_clone()?));
     let mut buffer = vec![0u8; READ_BUFFER];
     loop {
         if shutdown.is_stopped() {
@@ -243,7 +247,9 @@ fn handle(
             Err(error)
                 if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
             {
-                // Idle. §9.3: a session that is LISTENing gets whatever the
+                // Idle: a snapshot a log fold waits on is let go.
+                connection.idle();
+                // §9.3: a session that is LISTENing gets whatever the
                 // change feed delivered while it was waiting.
                 if connection.is_listening() {
                     let push = connection.poll_notify();

@@ -298,6 +298,12 @@ impl AdjacentEdge<'_> {
 /// bag, the one read an incoming posting leaves to its caller. The edge was
 /// walked, or its reference made, in this same snapshot, so a missing
 /// posting is corruption -- as a missing row is to every query candidate.
+/// The primary posting of edge `(key, id)`, or `None` when there is no such
+/// edge: one lookup, for a caller that knows where the edge would be.
+pub(crate) fn primary_posting_if_any(db: &Database, key: EdgeKey, id: u64) -> Result<Option<Vec<u8>>> {
+    Ok(db.store()?.get(&edge_key_id(PRIMARY_EDGE, key, id))?)
+}
+
 pub(crate) fn primary_posting(db: &Database, key: EdgeKey, id: u64) -> Result<Vec<u8>> {
     db.store()?
         .get(&edge_key_id(PRIMARY_EDGE, key, id))?

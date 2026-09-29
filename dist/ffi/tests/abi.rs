@@ -545,7 +545,7 @@ fn a_link_is_visible_to_neighbours_in_the_direction_it_was_made_and_an_unlink_re
                 c("people").as_ptr(),
                 c(key).as_ptr(),
                 c("knows").as_ptr(),
-                direction,
+                direction as i32,
                 16,
             )
         });
@@ -897,12 +897,22 @@ fn every_failure_returns_its_sentinel_and_leaves_a_message_and_a_code_on_this_th
             c("t").as_ptr(),
             c("here").as_ptr(),
             ptr::null(),
-            SekejapDirection::Outgoing,
+            SekejapDirection::Outgoing as i32,
             100_000,
         )
     }
     .is_null());
     assert_eq!(last(db.db).1, SekejapStatus::Refused);
+
+    // A direction that is none of the three (finding vuln-f06): received as
+    // an int and refused, never turned into an enum value it cannot hold.
+    for direction in [3, -1, i32::MAX] {
+        assert!(unsafe {
+            sekejap_neighbours(db.db, c("t").as_ptr(), c("here").as_ptr(), ptr::null(), direction, 16)
+        }
+        .is_null());
+        assert_eq!(last(db.db).1, SekejapStatus::Invalid, "direction {direction}");
+    }
 
     // A field kind that is not one of the eight.
     assert_eq!(
@@ -1168,4 +1178,92 @@ fn one_database_handle_serves_two_threads_at_once_and_each_keeps_its_own_error_s
     // This thread's slot was never touched by either of them.
     assert_eq!(unsafe { sekejap_last_error_code(db) }, SekejapStatus::Ok);
     unsafe { sekejap_close(db) };
+}
+
+/// Finding vuln-f11 (0.18.5): `sekejap_next_change` held the handle's whole
+/// subscription table locked while it waited, so a second subscription's
+/// poll -- even with a zero timeout, promised to return at once -- waited
+/// out the first one's timeout. A wait now holds only its own subscription.
+#[test]
+fn a_waiting_subscription_does_not_hold_up_another() {
+    struct Shared(*mut SekejapDb);
+    unsafe impl Send for Shared {}
+    unsafe impl Sync for Shared {}
+    let db = Fixture::service();
+    let first = unsafe { sekejap_subscribe(db.db) };
+    let second = unsafe { sekejap_subscribe(db.db) };
+    assert!(first >= 0 && second >= 0);
+    let shared = std::sync::Arc::new(Shared(db.db));
+    let waiter = {
+        let shared = std::sync::Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let shared = shared;
+            // A quiet feed: this waits its whole 3 seconds.
+            unsafe { sekejap_next_change(shared.0, first, 3_000) }.is_null()
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    assert!(unsafe { sekejap_next_change(db.db, second, 0) }.is_null());
+    let third = unsafe { sekejap_subscribe(db.db) };
+    let waited = started.elapsed();
+    assert!(third >= 0);
+    assert!(
+        waited < std::time::Duration::from_millis(1_000),
+        "a zero-timeout poll and a subscribe waited {waited:?} behind another subscription's wait"
+    );
+    assert!(waiter.join().unwrap());
+}
+
+/// Finding vuln-f05 (0.18.5): a `SekejapTx` held the writer's mutex guard
+/// across C calls, and a commit or rollback from a thread other than the one
+/// that began it released that mutex from the wrong thread -- undefined
+/// behaviour, and exactly what a Go finalizer or a coroutine hop does. The
+/// transaction now lives on its own worker thread: any thread may call it,
+/// one at a time, and the writer is taken and released on the worker. A
+/// transaction begun here, written on a second thread and committed on a
+/// third leaves the writer free and its rows written; one rolled back from
+/// another thread (a finalizer) leaves nothing.
+#[test]
+fn a_transaction_may_be_finished_on_another_thread() {
+    // The soundness half, checked by the compiler: a handle that holds the
+    // writer's `MutexGuard` is not `Send`, so this line does not compile
+    // against the old handle, and does against one whose guard never
+    // leaves its worker thread.
+    fn sendable<T: Send + Sync>() {}
+    sendable::<SekejapTx>();
+    struct Shared(*mut SekejapTx);
+    unsafe impl Send for Shared {}
+    let db = Fixture::open();
+    assert!(db.create("m", &json!([{ "name": "v", "kind": "text" }])) >= 0);
+    let on_another_thread = |tx: *mut SekejapTx, body: fn(*mut SekejapTx) -> i32| -> i32 {
+        let shared = Shared(tx);
+        std::thread::spawn(move || {
+            let shared = shared;
+            body(shared.0)
+        })
+        .join()
+        .unwrap()
+    };
+
+    let tx = unsafe { sekejap_tx_begin(db.db) };
+    assert!(!tx.is_null());
+    let put = on_another_thread(tx, |tx| unsafe {
+        sekejap_tx_put(tx, c("m").as_ptr(), c("kept").as_ptr(), c(r#"{"v":"x"}"#).as_ptr())
+    });
+    assert_eq!(put, 0);
+    assert_eq!(on_another_thread(tx, |tx| unsafe { sekejap_tx_commit(tx) }), 0);
+    // The writer is free again: a plain write commits.
+    assert_eq!(db.put("m", "after", &json!({ "v": "y" })), 0);
+    assert!(db.get("m", "kept").is_some(), "the transaction's row");
+
+    let tx = unsafe { sekejap_tx_begin(db.db) };
+    assert!(!tx.is_null());
+    assert_eq!(
+        unsafe { sekejap_tx_put(tx, c("m").as_ptr(), c("dropped").as_ptr(), c(r#"{"v":"z"}"#).as_ptr()) },
+        0
+    );
+    assert_eq!(on_another_thread(tx, |tx| unsafe { sekejap_tx_rollback(tx) }), 0);
+    assert_eq!(db.put("m", "later", &json!({ "v": "w" })), 0);
+    assert!(db.get("m", "dropped").is_none(), "a rolled-back row");
 }

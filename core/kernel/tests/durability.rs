@@ -129,3 +129,39 @@ fn reopening_after_a_checkpoint_finds_everything() {
 // WITHOUT `--cfg test`, so those methods would be absent, not merely
 // private. They live in kernel/src/store.rs's own `#[cfg(test)] mod tests`
 // instead, where the gate actually applies.
+
+/// Finding vuln-a02 (0.18.5): recovery replayed the committed prefix of the
+/// log but left the abandoned, uncommitted frames after it in the file. The
+/// next commit appended its marker AFTER them, so the reopen that followed
+/// took them for committed: an overwrite nobody committed came back. The log
+/// is cut to its last commit when it is recovered.
+#[test]
+fn an_abandoned_write_never_becomes_committed_by_a_later_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = || Config {
+        budget_bytes: 1 << 20,
+        io: kernel::io::IoMode::Buffered,
+        sync: kernel::store::SyncMode::Full,
+    };
+    {
+        let mut store = Store::open(dir.path(), cfg()).unwrap();
+        store.put(b"k", b"old").unwrap();
+        store.commit().unwrap();
+        // Larger than the WAL buffer, so its frames reach the file; then the
+        // process goes away without a commit.
+        store.put(b"k", &vec![7u8; 300 * 1024]).unwrap();
+    }
+    {
+        let mut store = Store::open(dir.path(), cfg()).unwrap();
+        assert_eq!(store.get(b"k").unwrap().as_deref(), Some(&b"old"[..]));
+        store.put(b"other", b"x").unwrap();
+        store.commit().unwrap();
+    }
+    let store = Store::open(dir.path(), cfg()).unwrap();
+    assert_eq!(
+        store.get(b"k").unwrap().as_deref(),
+        Some(&b"old"[..]),
+        "the abandoned overwrite came back after an unrelated commit"
+    );
+    assert_eq!(store.get(b"other").unwrap().as_deref(), Some(&b"x"[..]));
+}

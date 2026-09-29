@@ -56,6 +56,7 @@
 //! running the statement again would pass a new one off as its rest.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,6 +80,12 @@ pub const CURSOR_ROW_CAP: usize = 65_536;
 /// 16 MiB. The second half of the same bound, because 65,536 rows of one
 /// column and 65,536 rows of a hundred are not the same quantity.
 pub const CURSOR_BYTES_CAP: usize = 16 << 20;
+/// Encoded bytes a streamed answer holds before they go to the sink:
+/// 64 KiB. A connection with a sink (`Connection::set_sink`, the socket in
+/// `sekejap-pg`) writes its pending output there whenever a streamed answer
+/// passes this, so an answer of any size holds about this much at once
+/// (Law 1; finding vuln-a12).
+pub const STREAM_FLUSH_BYTES: usize = 64 << 10;
 /// Rows one page of a walk asks for. The same 8,192 `sekejap_lang` pages at.
 const PAGE_ROWS: usize = 8_192;
 /// The `server_version` this surface reports.
@@ -224,6 +231,9 @@ pub struct Connection<'a> {
     changes: Option<Receiver>,
     /// Notifications drained from the feed but not yet written out.
     pending_notifications: Vec<(String, String)>,
+    /// Where a streamed answer's output goes while it runs; `None` holds it
+    /// all for `feed` to return.
+    sink: Option<Box<dyn Write + Send + 'a>>,
 }
 
 impl<'a> Connection<'a> {
@@ -249,6 +259,24 @@ impl<'a> Connection<'a> {
             listening: Vec::new(),
             changes: None,
             pending_notifications: Vec::new(),
+            sink: None,
+        }
+    }
+
+    /// Send streamed output to `sink` as it is produced instead of holding
+    /// it for `feed` to return (`STREAM_FLUSH_BYTES`). What `feed` returns
+    /// is the output after the last write to the sink, in order.
+    pub fn set_sink(&mut self, sink: Box<dyn Write + Send + 'a>) {
+        self.sink = Some(sink);
+    }
+
+    /// Called by the server while the connection waits for its client: the
+    /// snapshot this connection keeps between statements holds a reader
+    /// slot, and while the service wants the log folded it is let go -- the
+    /// next statement mints a fresh one (finding vuln-f01).
+    pub fn idle(&mut self) {
+        if self.service.fold_wanted() {
+            self.reader = None;
         }
     }
 
@@ -349,6 +377,8 @@ impl<'a> Connection<'a> {
         if at > 0 {
             self.inbuf.drain(..at);
         }
+        // The round trip is over: let the snapshot go if a fold waits on it.
+        self.idle();
         out
     }
 
@@ -636,6 +666,14 @@ impl<'a> Connection<'a> {
         let mut reader = f::Reader::new(body);
         let kind = reader.byte();
         let name = reader.cstr();
+        if reader.overran() {
+            let error = WireError::new(
+                types::PROTOCOL_VIOLATION,
+                "a Describe or Close message shorter than its type byte and name",
+            );
+            self.fail(out, &error);
+            return;
+        }
         if kind == b'S' {
             let Some(prepared) = self.statements.get(&name).cloned() else {
                 let error = WireError::new(
@@ -688,8 +726,36 @@ impl<'a> Connection<'a> {
             }
             return;
         }
-        // A portal. Running it now is what lets its columns be described,
-        // and the run is held so `Execute` does not repeat it.
+        // A portal that has not run: describe its shape from the compiled
+        // statement, never by running it. Running a write here applied it
+        // before -- or without -- the client's `Execute` (finding
+        // vuln-a06); running a read held its whole answer under the held
+        // path's ceilings, so the `Execute` with no row limit that follows
+        // could not stream (finding vuln-f07). `Execute` runs it.
+        if let Some(portal) = self.portals.get(&name) {
+            let trimmed = portal.sql.trim().trim_end_matches(';').trim().to_owned();
+            if !portal.executed && portal.refused.is_none() {
+                let read = is_read(&trimmed);
+                let formats = portal.result_formats.clone();
+                let oids = vec![oid::TEXT; portal.params.len()];
+                let (fields, _) = self.describe_columns(&trimmed, &oids);
+                match fields {
+                    Some(fields) => {
+                        f::row_description(out, &apply_formats(&fields, &formats));
+                        return;
+                    }
+                    None if !read => {
+                        f::no_data(out);
+                        return;
+                    }
+                    // A read the statement alone cannot describe (a session
+                    // statement): the held run below.
+                    None => {}
+                }
+            }
+        }
+        // A read portal. Running it now is what lets its columns be
+        // described, and the run is held so `Execute` does not repeat it.
         match self.portal_answer(&name, out) {
             Ok(Some(fields)) => f::row_description(out, &fields),
             Ok(None) => f::no_data(out),
@@ -771,6 +837,14 @@ impl<'a> Connection<'a> {
         let mut reader = f::Reader::new(body);
         let kind = reader.byte();
         let name = reader.cstr();
+        if reader.overran() {
+            let error = WireError::new(
+                types::PROTOCOL_VIOLATION,
+                "a Describe or Close message shorter than its type byte and name",
+            );
+            self.fail(out, &error);
+            return;
+        }
         if kind == b'S' {
             self.statements.remove(&name);
         } else {
@@ -803,17 +877,42 @@ impl<'a> Connection<'a> {
             return Ok(());
         }
         if is_read(trimmed) {
-            let mut rendered: Vec<u8> = Vec::new();
+            // Rows go straight into `out`, the `RowDescription` in front of
+            // the first, and past `STREAM_FLUSH_BYTES` everything pending
+            // goes to the sink: an answer of any size is held about that
+            // much at once (finding vuln-a12). A walk that fails after some
+            // rows leaves them in front of its `ErrorResponse`, as
+            // PostgreSQL's own do.
+            let mut sink = self.sink.take();
+            let mut lost: Option<std::io::Error> = None;
+            let mut described = !describe;
             let mut count = 0u64;
-            let fields = self.walk(trimmed, params, &mut |row, fields| {
-                emit_row(&mut rendered, &row.values, fields);
+            let walked = self.walk(trimmed, params, &mut |row, fields| {
+                if !described {
+                    f::row_description(out, fields);
+                    described = true;
+                }
+                emit_row(out, &row.values, fields);
                 count += 1;
+                if out.len() >= STREAM_FLUSH_BYTES {
+                    if let Some(sink) = sink.as_mut() {
+                        if let Err(error) = sink.write_all(out) {
+                            lost = Some(error);
+                            return Err(SqlError::Unsupported("the client connection was lost mid-answer".into()));
+                        }
+                        out.clear();
+                    }
+                }
                 Ok(())
-            }, formats)?;
-            if describe {
+            }, formats);
+            self.sink = sink;
+            if lost.is_some() {
+                self.closed = true;
+            }
+            let fields = walked?;
+            if !described {
                 f::row_description(out, &fields);
             }
-            out.extend_from_slice(&rendered);
             f::command_complete(out, &format!("SELECT {count}"));
             return Ok(());
         }
@@ -930,56 +1029,20 @@ impl<'a> Connection<'a> {
         let budget = self.budget();
         let cancel = self.cancel.clone();
         let interrupt = self.service.interrupt_handle();
+        let mut cancelled = || cancel.is_cancelled() || interrupt.is_cancelled();
+        // Inside a `BEGIN` block the read goes through the held writer, so
+        // it sees the block's own uncommitted writes, as PostgreSQL's does
+        // (finding vuln-a14). Outside one it reads this connection's
+        // snapshot.
+        if let Some(txn) = self.txn.as_mut() {
+            let db: &Database = txn.database();
+            return walk_on(db, sql, params, body, formats, budget, &mut cancelled);
+        }
         self.refresh_reader()?;
         let snapshot = self.reader.as_ref().expect("refresh_reader mints one");
-
-        snapshot.with(|db| {
-            let db: &Database = db;
-            let mut cancelled = || cancel.is_cancelled() || interrupt.is_cancelled();
-            let prepared = sekejap_lang::prepare_sql_with(db, sql, params, budget, &mut cancelled)
-                .map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
-
-            if prepared.is_select() || prepared.is_aggregate() {
-                let fields = apply_formats(&field_descriptions(db, &prepared), formats);
-                let paged = if prepared.is_aggregate() {
-                    prepared.for_each_group_with(db, PAGE_ROWS, budget, &mut cancelled, &mut |row| {
-                        body(row, &fields)
-                    })
-                } else {
-                    prepared.for_each_row_with(db, PAGE_ROWS, budget, &mut cancelled, &mut |row| {
-                        body(row, &fields)
-                    })
-                };
-                paged.map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
-                return Ok(fields);
-            }
-
-            // EXPLAIN and the notice families: one answer, not a walk.
-            match prepared.run(db) {
-                Ok(SqlResult::Rows { columns, rows }) => {
-                    let fields = apply_formats(
-                        &columns.iter().map(|name| text_field(name)).collect::<Vec<_>>(),
-                        formats,
-                    );
-                    for row in &rows {
-                        body(row, &fields)
-                            .map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
-                    }
-                    Ok(fields)
-                }
-                Ok(SqlResult::Explain(text)) | Ok(SqlResult::Notice(text)) => {
-                    let fields = apply_formats(&[text_field("QUERY PLAN")], formats);
-                    let row = SqlRow {
-                        id: EntityId::NO_OWNER,
-                        values: vec![SqlValue::Text(text)],
-                    };
-                    body(&row, &fields).map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
-                    Ok(fields)
-                }
-                Ok(SqlResult::Affected(_)) => Ok(Vec::new()),
-                Err(e) => Err(types::wire_error(&ServiceError::Sql(e))),
-            }
-        })
+        snapshot
+            .try_with(|db| walk_on(db, sql, params, body, formats, budget, &mut cancelled))
+            .map_err(|e| types::wire_error(&ServiceError::Core(e)))?
     }
 
     /// Run a statement through the service's single WRITER, committing it
@@ -997,6 +1060,15 @@ impl<'a> Connection<'a> {
         debug_assert!(!self.txn_failed, "session_statement refuses a failed block first");
         let result = if self.txn.is_some() {
             let guard = self.txn.as_mut().expect("checked above");
+            // DDL commits on its own; after this block's writes it would
+            // commit them too, and the block's ROLLBACK would undo nothing
+            // (finding vuln-f03).
+            if sekejap_lang::commits_on_its_own(sql) && guard.database().has_uncommitted_work() {
+                return Err(WireError::new(
+                    "25001",
+                    "DDL inside a transaction block that has written: sekejap's DDL commits on its own and would commit the block's writes with it; COMMIT or ROLLBACK first, or run the DDL first",
+                ));
+            }
             guard.sql(sql, params)
         } else {
             match self.service.try_writer() {
@@ -1491,20 +1563,22 @@ impl<'a> Connection<'a> {
         let Some(snapshot) = self.reader.as_ref() else {
             return (None, Vec::new());
         };
-        snapshot.with(|db| {
-            let db: &Database = db;
-            let Ok(prepared) =
-                sekejap_lang::prepare_sql_with(db, trimmed, &probe, budget, &mut || false)
-            else {
-                return (None, Vec::new());
-            };
-            let fields = if prepared.is_select() || prepared.is_aggregate() {
-                field_descriptions(db, &prepared)
-            } else {
-                vec![text_field("QUERY PLAN")]
-            };
-            (Some(fields), prepared.param_types())
-        })
+        snapshot
+            .try_with(|db| {
+                let db: &Database = db;
+                let Ok(prepared) =
+                    sekejap_lang::prepare_sql_with(db, trimmed, &probe, budget, &mut || false)
+                else {
+                    return (None, Vec::new());
+                };
+                let fields = if prepared.is_select() || prepared.is_aggregate() {
+                    field_descriptions(db, &prepared)
+                } else {
+                    vec![text_field("QUERY PLAN")]
+                };
+                (Some(fields), prepared.param_types())
+            })
+            .unwrap_or((None, Vec::new()))
     }
 
     /// The typed columns an `INSERT ... RETURNING` answers, compiled (never
@@ -1518,14 +1592,17 @@ impl<'a> Connection<'a> {
         let budget = self.budget();
         self.refresh_reader().ok()?;
         let snapshot = self.reader.as_ref()?;
-        snapshot.with(|db| {
-            let db: &Database = db;
-            let prepared =
-                sekejap_lang::prepare_sql_with(db, trimmed, params, budget, &mut || false).ok()?;
-            prepared
-                .returns_rows_from_a_write()
-                .then(|| field_descriptions(db, &prepared))
-        })
+        snapshot
+            .try_with(|db| {
+                let db: &Database = db;
+                let prepared =
+                    sekejap_lang::prepare_sql_with(db, trimmed, params, budget, &mut || false).ok()?;
+                prepared
+                    .returns_rows_from_a_write()
+                    .then(|| field_descriptions(db, &prepared))
+            })
+            .ok()
+            .flatten()
     }
 
     // ── §9.3 notifications ───────────────────────────────────────────────
@@ -1589,6 +1666,62 @@ fn emit_outcome(out: &mut Vec<u8>, outcome: Outcome, formats: &[i16], describe: 
         }
         Outcome::Command(tag) => f::command_complete(out, &tag),
         Outcome::Empty => f::empty_query_response(out),
+    }
+}
+
+/// One read statement over `db`: a SELECT or aggregate paged into `body`,
+/// or EXPLAIN / a notice as one row. `Connection::walk` picks the `db`.
+fn walk_on(
+    db: &Database,
+    sql: &str,
+    params: &[Param],
+    body: &mut dyn FnMut(&SqlRow, &[FieldDescription]) -> Result<(), SqlError>,
+    formats: &[i16],
+    budget: QueryBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Vec<FieldDescription>, WireError> {
+    let prepared = sekejap_lang::prepare_sql_with(db, sql, params, budget, cancelled)
+        .map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
+
+    if prepared.is_select() || prepared.is_aggregate() {
+        let fields = apply_formats(&field_descriptions(db, &prepared), formats);
+        let paged = if prepared.is_aggregate() {
+            prepared.for_each_group_with(db, PAGE_ROWS, budget, cancelled, &mut |row| {
+                body(row, &fields)
+            })
+        } else {
+            prepared.for_each_row_with(db, PAGE_ROWS, budget, cancelled, &mut |row| {
+                body(row, &fields)
+            })
+        };
+        paged.map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
+        return Ok(fields);
+    }
+
+    // EXPLAIN and the notice families: one answer, not a walk.
+    match prepared.run(db) {
+        Ok(SqlResult::Rows { columns, rows }) => {
+            let fields = apply_formats(
+                &columns.iter().map(|name| text_field(name)).collect::<Vec<_>>(),
+                formats,
+            );
+            for row in &rows {
+                body(row, &fields)
+                    .map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
+            }
+            Ok(fields)
+        }
+        Ok(SqlResult::Explain(text)) | Ok(SqlResult::Notice(text)) => {
+            let fields = apply_formats(&[text_field("QUERY PLAN")], formats);
+            let row = SqlRow {
+                id: EntityId::NO_OWNER,
+                values: vec![SqlValue::Text(text)],
+            };
+            body(&row, &fields).map_err(|e| types::wire_error(&ServiceError::Sql(e)))?;
+            Ok(fields)
+        }
+        Ok(SqlResult::Affected(_)) => Ok(Vec::new()),
+        Err(e) => Err(types::wire_error(&ServiceError::Sql(e))),
     }
 }
 
@@ -1810,32 +1943,11 @@ fn command_tag(sql: &str, rows: u64) -> String {
 }
 
 /// The highest `$n` a statement writes. Used only to pad a
-/// `ParameterDescription` that a `Parse` left short.
+/// `ParameterDescription` that a `Parse` left short. The lexer's count, so
+/// a `$n` in a comment or a quoted identifier is not one, and never past
+/// `MAX_PARAMETER` (finding vuln-a11).
 fn count_parameters(sql: &str) -> usize {
-    let bytes = sql.as_bytes();
-    let mut highest = 0usize;
-    let mut at = 0usize;
-    let mut in_string = false;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'\'' => in_string = !in_string,
-            b'$' if !in_string => {
-                let mut end = at + 1;
-                while end < bytes.len() && bytes[end].is_ascii_digit() {
-                    end += 1;
-                }
-                if end > at + 1 {
-                    if let Ok(n) = sql[at + 1..end].parse::<usize>() {
-                        highest = highest.max(n);
-                    }
-                }
-                at = end.saturating_sub(1);
-            }
-            _ => {}
-        }
-        at += 1;
-    }
-    highest
+    sekejap_lang::highest_parameter(sql).min(sekejap_lang::MAX_PARAMETER)
 }
 
 /// A zero value of the type an OID names, for the describe-time probe.

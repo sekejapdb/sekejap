@@ -124,6 +124,7 @@ mod explain;
 mod functions;
 mod gql;
 mod lexer;
+pub use lexer::{after_leading_comments, commits_on_its_own, highest_parameter, MAX_PARAMETER};
 mod parser;
 mod pgcrypto;
 mod refuse;
@@ -344,6 +345,26 @@ pub enum Param {
     Text(String),
     Vector(Vec<f32>),
     Json(Value),
+}
+
+/// PostgreSQL's `boolin`: surrounding whitespace ignored, any case, and a
+/// unique prefix of `true`, `false`, `yes`, `no`, `on` (two letters at
+/// least), `off` (two letters at least), or exactly `1` / `0`. Anything else
+/// is `None`, never `false` (finding vuln-a15).
+pub fn parse_bool(text: &str) -> Option<bool> {
+    let word = text.trim().to_ascii_lowercase();
+    let prefix_of = |full: &str, least: usize| word.len() >= least && full.starts_with(word.as_str());
+    match word.as_bytes().first()? {
+        b't' if prefix_of("true", 1) => Some(true),
+        b'f' if prefix_of("false", 1) => Some(false),
+        b'y' if prefix_of("yes", 1) => Some(true),
+        b'n' if prefix_of("no", 1) => Some(false),
+        b'o' if prefix_of("on", 2) => Some(true),
+        b'o' if prefix_of("off", 2) => Some(false),
+        b'1' if word == "1" => Some(true),
+        b'0' if word == "0" => Some(false),
+        _ => None,
+    }
 }
 
 /// One projected value.

@@ -78,7 +78,10 @@ the connection's ordinal, and **stated as not cryptographic**
 `Q` runs a `;`-separated statement list, in order, abandoning the rest at the
 first error — PostgreSQL's rule. A row-returning statement answers
 `RowDescription`, then one `DataRow` per row, then `CommandComplete`; the
-rows are STREAMED page by page and nothing is held.
+rows are STREAMED: the server writes them to the socket whenever 64 KiB is
+pending (`STREAM_FLUSH_BYTES`), so an answer of any size holds about that
+much at once. A statement that fails after some rows sends those rows, then
+its `ErrorResponse`, as PostgreSQL does.
 
 `CommandComplete` tags: `SELECT <n>`, `INSERT 0 <n>`, `UPDATE <n>`,
 `DELETE <n>`, `FETCH <n>`, `MOVE <n>`, `CREATE TABLE`, `DROP TABLE`,
@@ -109,9 +112,11 @@ rows are STREAMED page by page and nothing is held.
   answered with the type the statement itself gives it
   (`PreparedSql::param_types`, §3.3) when it gives one, and `text`
   otherwise.
-* **`Describe('P')`** runs the portal and holds its answer, which is what
-  lets its columns be described; the `Execute` that follows does not repeat
-  the run.
+* **`Describe('P')`** describes a portal that has not run from its compiled
+  statement, without running it (0.18.5): a write is not applied early, and
+  the `Execute` with no row limit that follows still streams. A read the
+  statement alone cannot describe (a session statement) is run and held,
+  and the `Execute` that follows does not repeat the run.
 * **`Execute`** with NO row limit STREAMS (nothing held) and never sends a
   `RowDescription` — the client has one from `Describe`. With a row limit it
   hands out that many rows and answers `PortalSuspended`; the next `Execute`
@@ -291,10 +296,15 @@ the statement then decodes that position by that OID at `Bind`, so the value
 is read as the type the client was told. Every statement compiled today
 gives none, so such a position is answered `text` (25) — a real type whose
 value maps onto `Param::Text` with nothing inferred — and a text parameter
-with no declared OID at all is read
-by SHAPE (a whole number, then a number, then text), because `Param`'s type
-is read from WHERE it is used and handing `Param::Text("42")` to an `INT`
-column refuses where `Param::Int(42)` does not.
+with no declared OID at all (0, or 705 `unknown`) is read by SHAPE: a whole
+number or a number only when the text is that number's own canonical
+spelling (`42`, `1.5`), otherwise text, so `00123`, ` 7` and `1e3` keep
+their spelling (0.18.5). Where it is used, a BOUND parameter then takes the
+place's type as PostgreSQL reads an untyped literal: a number where text is
+wanted (a key, a `TEXT` column) is its spelling, and numeric or boolean text
+into an `INT`, `REAL` or `BOOLEAN` column is that value. A literal written in
+the SQL keeps its own type. One looser edge than PostgreSQL, named: a
+parameter DECLARED `text` bound to a number column is read the same way.
 
 **So a client that wants an INT parameter says so.** `rust-postgres` spells
 that `prepare_typed(sql, &[Type::INT8])`; pgjdbc spells it `setLong`; psycopg
@@ -422,16 +432,21 @@ Three things this states rather than implies:
 3. **DDL is not transactional.** `CREATE TABLE`, `ALTER TABLE` and the drop
    steps commit inside their own statement (`lang/src/compile/plan.rs`), so a
    `ROLLBACK` after one does not undo it. PostgreSQL's DDL is transactional;
-   sekejap's is not, and there is no savepoint to make it so.
+   sekejap's is not, and there is no savepoint to make it so. Because it
+   would also commit the block's earlier writes, DDL after a block has
+   written is refused with `25001` and fails the block; DDL as a block's
+   first statement runs.
 
-A read takes THIS connection's own snapshot handle
-(`ServiceDatabase::open_reader`), re-minted when the service publishes a new
-generation — so two connections walk at once instead of taking turns on one
-published handle, at the cost of one reader slot each (`OPS_CONTRACT` §1
-bounds them). `sekejap-pg` sets the publish interval to **zero** by default,
-because a wire client expects to read its own writes on the next statement;
-that costs one snapshot mint per commit, and `--publish-interval <ms>` buys
-it back.
+Inside a `BEGIN` block a read goes through the held writer, so the block
+sees its own uncommitted writes, as in PostgreSQL; no other connection sees
+them before `COMMIT`. Outside a block a read takes THIS connection's own
+snapshot handle (`ServiceDatabase::open_reader`), re-minted when the service
+publishes a new generation — so two connections walk at once instead of
+taking turns on one published handle, at the cost of one reader slot each
+(`OPS_CONTRACT` §1 bounds them). `sekejap-pg` sets the publish interval to
+**zero** by default, because a wire client expects to read its own writes on
+the next statement; that costs one snapshot mint per commit, and
+`--publish-interval <ms>` buys it back.
 
 ---
 

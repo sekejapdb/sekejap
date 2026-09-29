@@ -20,7 +20,15 @@
 //!   (`select_reads_one_ends_edges`);
 //! * what is refused, by name (`what_is_not_mapped_is_refused_by_name`);
 //! * DROP PROPERTY GRAPH forgets the graph and keeps every edge
-//!   (`drop_property_graph_keeps_the_edges`).
+//!   (`drop_property_graph_keeps_the_edges`);
+//! * ALTER TABLE cannot change an edge table's columns, whose ends its
+//!   binding names; a renamed edge table keeps its edges
+//!   (`alter_table_leaves_an_edge_tables_columns_alone`, finding
+//!   `vuln-a10`);
+//! * an edge table's NOT NULL and DEFAULT hold as a row table's do: an end
+//!   declared NOT NULL admits an edge, an explicit NULL is kept, and
+//!   INSERT, UPDATE and ON CONFLICT all refuse a NULL in a NOT NULL column
+//!   (`edge_columns_keep_their_rules`, finding `vuln-a13`).
 
 use kernel::{
     io::IoMode,
@@ -355,4 +363,179 @@ fn drop_property_graph_keeps_the_edges() {
         "SELECT * FROM GRAPH_TABLE (base MATCH (a IS artist)-[:wrote]->(s IS song) RETURN a._key AS a)",
     );
     assert_eq!(sorted_texts(got), ["andra", "dhani"]);
+}
+
+/// Finding vuln-a01 (0.18.5): a WHERE naming BOTH ends, one of which is a
+/// row that does not exist, matched every edge of the other end -- a
+/// `DELETE` then removed edges it never named. An end that names no row
+/// matches no edge, whichever end it is and whichever statement reads it.
+#[test]
+fn an_end_that_names_no_row_matches_no_edge() {
+    let dir = TempDir::new().unwrap();
+    let mut db = db(&dir);
+    for sql in [
+        "CREATE TABLE node (_key TEXT PRIMARY KEY)",
+        "INSERT INTO node (_key) VALUES ('a'), ('b'), ('c')",
+        "CREATE TABLE link (src TEXT REFERENCES node, dst TEXT REFERENCES node, w INT, PRIMARY KEY (src, dst))",
+        "ALTER PROPERTY GRAPH base ADD EDGE TABLES (link SOURCE KEY (src) REFERENCES node (_key) DESTINATION KEY (dst) REFERENCES node (_key))",
+        "INSERT INTO link (src, dst, w) VALUES ('a', 'b', 1), ('a', 'c', 2), ('b', 'c', 3)",
+        "COMMIT",
+    ] {
+        run(&mut db, sql);
+    }
+    for (where_clause, what) in [
+        ("src = 'a' AND dst = 'missing'", "a missing destination"),
+        ("src = 'missing' AND dst = 'c'", "a missing source"),
+    ] {
+        assert!(
+            rows(&mut db, &format!("SELECT src, dst FROM link WHERE {where_clause}")).is_empty(),
+            "SELECT with {what} matched edges"
+        );
+        run(&mut db, &format!("UPDATE link SET w = 99 WHERE {where_clause}"));
+        run(&mut db, &format!("DELETE FROM link WHERE {where_clause}"));
+        run(&mut db, "COMMIT");
+    }
+    // Every edge is still there, unchanged.
+    assert_eq!(
+        sorted_texts(rows(&mut db, "SELECT src, dst, w FROM link WHERE src = 'a'")),
+        sorted_texts(vec![
+            vec![SqlValue::Text("a".into()), SqlValue::Text("b".into()), SqlValue::Int(1)],
+            vec![SqlValue::Text("a".into()), SqlValue::Text("c".into()), SqlValue::Int(2)],
+        ])
+    );
+    assert_eq!(rows(&mut db, "SELECT src FROM link WHERE dst = 'c'").len(), 2);
+}
+
+#[test]
+fn alter_table_leaves_an_edge_tables_columns_alone() {
+    let dir = TempDir::new().unwrap();
+    let mut db = db(&dir);
+    for sql in [
+        "CREATE TABLE node (_key TEXT PRIMARY KEY)",
+        "INSERT INTO node (_key) VALUES ('a'), ('b'), ('c')",
+        "CREATE TABLE link (src TEXT REFERENCES node, dst TEXT REFERENCES node, w INT, PRIMARY KEY (src, dst))",
+        "ALTER PROPERTY GRAPH base ADD EDGE TABLES (link SOURCE KEY (src) REFERENCES node (_key) DESTINATION KEY (dst) REFERENCES node (_key))",
+        "INSERT INTO link (src, dst, w) VALUES ('a', 'b', 1), ('a', 'c', 2)",
+        "COMMIT",
+    ] {
+        run(&mut db, sql);
+    }
+    for sql in [
+        "ALTER TABLE link RENAME COLUMN src TO origin",
+        "ALTER TABLE link RENAME COLUMN w TO weight",
+        "ALTER TABLE link DROP COLUMN w",
+        "ALTER TABLE link DROP COLUMN dst",
+        "ALTER TABLE link ADD COLUMN note TEXT NOT NULL",
+        "ALTER TABLE link ALTER COLUMN w TYPE BIGINT",
+    ] {
+        refused(db.sql(sql, &[]), "edge table");
+        let _ = db.sql("ROLLBACK", &[]);
+    }
+    let want = sorted_texts(vec![
+        vec![SqlValue::Text("a".into()), SqlValue::Text("b".into()), SqlValue::Int(1)],
+        vec![SqlValue::Text("a".into()), SqlValue::Text("c".into()), SqlValue::Int(2)],
+    ]);
+    assert_eq!(sorted_texts(rows(&mut db, "SELECT src, dst, w FROM link WHERE src = 'a'")), want);
+    run(&mut db, "ALTER TABLE link RENAME TO route");
+    run(&mut db, "COMMIT");
+    assert_eq!(sorted_texts(rows(&mut db, "SELECT src, dst, w FROM route WHERE src = 'a'")), want);
+    run(&mut db, "INSERT INTO route (src, dst, w) VALUES ('b', 'c', 3)");
+    run(&mut db, "COMMIT");
+    assert_eq!(rows(&mut db, "SELECT src FROM route WHERE dst = 'c'").len(), 2);
+}
+
+#[test]
+fn edge_columns_keep_their_rules() {
+    let dir = TempDir::new().unwrap();
+    let mut db = db(&dir);
+    for sql in [
+        "CREATE TABLE node (_key TEXT PRIMARY KEY)",
+        "INSERT INTO node (_key) VALUES ('a'), ('b'), ('c')",
+        "CREATE TABLE link (src TEXT NOT NULL REFERENCES node, dst TEXT REFERENCES node, note TEXT NOT NULL, w INT DEFAULT 7, PRIMARY KEY (src, dst))",
+        "ALTER PROPERTY GRAPH base ADD EDGE TABLES (link SOURCE KEY (src) REFERENCES node (_key) DESTINATION KEY (dst) REFERENCES node (_key))",
+        // An end declared NOT NULL admits an edge that names it.
+        "INSERT INTO link (src, dst, note) VALUES ('a', 'b', 'x')",
+        // An explicit NULL is kept: the DEFAULT fills only a left-out column.
+        "INSERT INTO link (src, dst, note, w) VALUES ('a', 'c', 'y', NULL)",
+        "COMMIT",
+    ] {
+        run(&mut db, sql);
+    }
+    assert_eq!(
+        sorted_texts(rows(&mut db, "SELECT dst, w FROM link WHERE src = 'a'")),
+        sorted_texts(vec![
+            vec![SqlValue::Text("b".into()), SqlValue::Int(7)],
+            vec![SqlValue::Text("c".into()), SqlValue::Null],
+        ])
+    );
+    for sql in [
+        "INSERT INTO link (src, dst) VALUES ('b', 'c')",
+        "INSERT INTO link (src, dst, note) VALUES ('b', 'c', NULL)",
+        "UPDATE link SET note = NULL WHERE src = 'a'",
+        "INSERT INTO link (src, dst, note) VALUES ('a', 'b', NULL) ON CONFLICT (src, dst) DO UPDATE SET note = EXCLUDED.note",
+    ] {
+        let got = db.sql(sql, &[]);
+        let _ = db.sql("ROLLBACK", &[]);
+        assert_eq!(sqlstate(got), "23502", "`{sql}`");
+    }
+    assert_eq!(
+        sorted_texts(rows(&mut db, "SELECT dst, note FROM link WHERE src = 'a'")),
+        sorted_texts(vec![
+            vec![SqlValue::Text("b".into()), SqlValue::Text("x".into())],
+            vec![SqlValue::Text("c".into()), SqlValue::Text("y".into())],
+        ])
+    );
+}
+
+/// Finding vuln-f09 (0.18.5): the conflict check of a keyed INSERT read
+/// every edge of the type at the source before comparing -- O(degree) per
+/// insert, O(N^2) to load one hub, and past 65,536 edges at one end every
+/// further INSERT was refused. With `PRIMARY KEY (src, dst)` the pair has at
+/// most one edge, at a known place, and the check is one lookup: one more
+/// INSERT at a hub of 2,000 edges touches about the pages it touches at a
+/// hub of 500 (buffer-pool page accesses, the metric), and a conflict is
+/// still found.
+#[test]
+fn a_keyed_insert_at_a_busy_hub_is_one_lookup() {
+    let dir = TempDir::new().unwrap();
+    let mut db = db(&dir);
+    run(&mut db, "CREATE TABLE node (_key TEXT PRIMARY KEY) WITH (index: none)");
+    for chunk in (0..2_100u32).collect::<Vec<_>>().chunks(700) {
+        let values: Vec<String> = chunk.iter().map(|i| format!("('n{i:05}')")).collect();
+        run(&mut db, &format!("INSERT INTO node (_key) VALUES {}", values.join(", ")));
+    }
+    for sql in [
+        "INSERT INTO node (_key) VALUES ('small'), ('big')",
+        "CREATE TABLE link (src TEXT REFERENCES node, dst TEXT REFERENCES node, w INT, PRIMARY KEY (src, dst))",
+        "ALTER PROPERTY GRAPH base ADD EDGE TABLES (link SOURCE KEY (src) REFERENCES node (_key) DESTINATION KEY (dst) REFERENCES node (_key))",
+        "COMMIT",
+    ] {
+        run(&mut db, sql);
+    }
+    for (hub, degree) in [("small", 500u32), ("big", 2_000)] {
+        for chunk in (0..degree).collect::<Vec<_>>().chunks(250) {
+            let values: Vec<String> = chunk.iter().map(|i| format!("('{hub}', 'n{i:05}', 1)")).collect();
+            run(&mut db, &format!("INSERT INTO link (src, dst, w) VALUES {}", values.join(", ")));
+        }
+    }
+    run(&mut db, "COMMIT");
+    let mut one_insert = |db: &mut Database, hub: &str| -> u64 {
+        let before = db.pool_accesses().unwrap();
+        run(db, &format!("INSERT INTO link (src, dst, w) VALUES ('{hub}', 'n02099', 1)"));
+        let used = db.pool_accesses().unwrap() - before;
+        let _ = db.sql("ROLLBACK", &[]);
+        used
+    };
+    let small = one_insert(&mut db, "small");
+    let big = one_insert(&mut db, "big");
+    assert!(
+        big <= small + small / 2 + 8,
+        "one INSERT touched {small} pages at a hub of 500 edges and {big} at a hub of 2,000"
+    );
+    // The lookup still finds the pair's edge.
+    assert_eq!(sqlstate(db.sql("INSERT INTO link (src, dst, w) VALUES ('big', 'n00007', 2)", &[])), "23505");
+    let _ = db.sql("ROLLBACK", &[]);
+    run(&mut db, "INSERT INTO link (src, dst, w) VALUES ('big', 'n00007', 3) ON CONFLICT (src, dst) DO UPDATE SET w = EXCLUDED.w");
+    run(&mut db, "COMMIT");
+    assert_eq!(rows(&mut db, "SELECT w FROM link WHERE src = 'big' AND dst = 'n00007'"), [[SqlValue::Int(3)]]);
 }

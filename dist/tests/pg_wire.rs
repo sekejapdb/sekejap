@@ -1297,3 +1297,310 @@ fn set_local_ef_search_lasts_for_its_transaction_block_on_the_wire() {
     let _ = ask(&mut connection, "SET LOCAL ef_search = 1");
     assert_eq!(rows_of(&ask(&mut connection, top3)).len(), 3, "outside a block it ended with its statement");
 }
+
+/// Finding vuln-a06 (0.18.5): `Describe` of a portal RAN its statement so
+/// its columns could be described -- for a `DELETE`, the rows were gone
+/// before the client sent `Execute`, or without it ever sending one. A
+/// portal's Describe reports the shape; only a read may run early (its rows
+/// are held for the Execute), and a write runs on `Execute` alone.
+#[test]
+fn describing_a_write_portal_does_not_run_it() {
+    let fixture = build(4);
+    let mut connection = connect(&fixture.service, 1);
+    let count = |connection: &mut Connection<'_>| rows_of(&ask(connection, "SELECT id FROM place")).len();
+    assert_eq!(count(&mut connection), 4);
+
+    // Parse, Bind, Describe the portal, Close it: never executed.
+    let mut batch = parse_message("del", "DELETE FROM place WHERE id = $1", &[oid::TEXT]);
+    batch.extend_from_slice(&bind_message("p", "del", &[Some(b"k000001")], &[]));
+    batch.extend_from_slice(&describe_message(b'P', "p"));
+    let mut close = vec![b'P'];
+    cstring(&mut close, "p");
+    batch.extend_from_slice(&framed(b'C', &close));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    assert!(first(&got, b'E').is_none(), "no error: {:?}", types_of(&got));
+    assert!(first(&got, b'n').is_some(), "a DELETE describes as NoData: {:?}", types_of(&got));
+    assert_eq!(count(&mut connection), 4, "Describe deleted a row the client never executed");
+
+    // Described, then executed: the row goes exactly once.
+    let mut batch = bind_message("p", "del", &[Some(b"k000001")], &[]);
+    batch.extend_from_slice(&describe_message(b'P', "p"));
+    batch.extend_from_slice(&execute_message("p", 0));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    assert!(first(&got, b'E').is_none(), "no error: {:?}", types_of(&got));
+    assert_eq!(tag(&got), "DELETE 1");
+    assert_eq!(count(&mut connection), 3);
+}
+
+/// Finding vuln-f02 (0.18.5): an autocommit statement that failed on the
+/// wire left the shared writer holding its work or its failure. A UNIQUE
+/// violation left the handle failed, so every later write from any
+/// connection was refused; a multi-row INSERT failing on its second row left
+/// its first row pending, and the next successful statement committed it.
+/// A failed autocommit statement leaves nothing behind.
+#[test]
+fn a_failed_autocommit_statement_leaves_nothing_behind() {
+    let fixture = build(4);
+    let mut one = connect(&fixture.service, 1);
+    let mut two = connect(&fixture.service, 2);
+    assert!(first(&ask(&mut one, "CREATE TABLE tag (_key TEXT PRIMARY KEY, label TEXT UNIQUE)"), b'E').is_none());
+    assert!(first(&ask(&mut one, "INSERT INTO tag (_key, label) VALUES ('t1', 'reef')"), b'E').is_none());
+
+    // A UNIQUE violation, then another connection writes.
+    assert!(first(&ask(&mut one, "INSERT INTO tag (_key, label) VALUES ('t2', 'reef')"), b'E').is_some());
+    let got = ask(&mut two, "INSERT INTO tag (_key, label) VALUES ('t3', 'lagoon')");
+    assert!(first(&got, b'E').is_none(), "a later write from another connection was refused: {:?}", got.iter().map(|f| f.typ as char).collect::<String>());
+
+    // A two-row INSERT whose second row repeats the first row's new key.
+    assert!(first(&ask(&mut one, "INSERT INTO tag (_key, label) VALUES ('t4', 'surf'), ('t4', 'dive')"), b'E').is_some());
+    assert!(first(&ask(&mut two, "INSERT INTO tag (_key, label) VALUES ('t5', 'temple')"), b'E').is_none());
+    let keys: Vec<String> = rows_of(&ask(&mut one, "SELECT _key FROM tag"))
+        .into_iter()
+        .filter_map(|r| r[0].clone())
+        .collect();
+    let mut keys = keys;
+    keys.sort();
+    assert_eq!(keys, ["t1", "t3", "t5"], "the failed statement's first row was committed by the next one");
+}
+
+/// Finding vuln-a11 (0.18.5): Describe counted parameters by scanning the
+/// text for `$n`, so a `$n` in a comment or a quoted identifier counted, and
+/// a number as large as `$1000000000` made Describe allocate that many type
+/// OIDs. The count is now the lexer's, and a parameter number past the
+/// protocol's 65,535 is refused at Parse.
+#[test]
+fn a_parameter_in_a_comment_is_not_a_parameter() {
+    let fixture = build(4);
+    let mut connection = connect(&fixture.service, 1);
+    for sql in [
+        "SELECT id FROM place /* $3 */",
+        "SELECT id FROM place -- $3\n",
+        "SELECT id AS \"$3\" FROM place",
+    ] {
+        let mut batch = parse_message("s", sql, &[]);
+        batch.extend_from_slice(&describe_message(b'S', "s"));
+        batch.extend_from_slice(&sync_message());
+        let got = frames(&connection.feed(&batch));
+        assert!(first(&got, b'E').is_none(), "`{sql}`: {:?}", types_of(&got));
+        let description = first(&got, b't').expect("ParameterDescription");
+        assert_eq!(
+            i16::from_be_bytes([description.body[0], description.body[1]]),
+            0,
+            "`{sql}` has no parameter"
+        );
+        let mut close = vec![b'S'];
+        cstring(&mut close, "s");
+        let mut batch = framed(b'C', &close);
+        batch.extend_from_slice(&sync_message());
+        connection.feed(&batch);
+    }
+    let mut batch = parse_message("big", "SELECT id FROM place WHERE id = $70000", &[]);
+    batch.extend_from_slice(&describe_message(b'S', "big"));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    assert!(first(&got, b'E').is_some(), "$70000 is past the protocol's parameter limit: {:?}", types_of(&got));
+    assert!(first(&got, b't').is_none(), "no ParameterDescription for a refused statement");
+}
+
+/// Finding vuln-a12 (0.18.5): a simple-query SELECT, documented as
+/// streaming, encoded every row into one buffer, copied it into a second,
+/// and handed the socket nothing until the last row -- memory grew with the
+/// whole answer, past the ceilings the held path keeps. With a sink, the
+/// rows reach it while the statement runs, and what is held at once stays
+/// near `STREAM_FLUSH_BYTES`.
+#[test]
+fn a_streamed_answer_reaches_the_sink_while_it_runs() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    struct Shared(Arc<Mutex<(Vec<u8>, usize)>>);
+    impl Write for Shared {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let mut held = self.0.lock().unwrap();
+            held.1 = held.1.max(bytes.len());
+            held.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let fixture = build(5_000);
+    let mut connection = connect(&fixture.service, 1);
+    let seen = Arc::new(Mutex::new((Vec::new(), 0usize)));
+    connection.set_sink(Box::new(Shared(seen.clone())));
+    let reply = connection.feed(&query("SELECT id, name, n, born, alive FROM place"));
+    let (spilled, largest) = {
+        let held = seen.lock().unwrap();
+        (held.0.clone(), held.1)
+    };
+    let limit = sekejap_dist::pg::connection::STREAM_FLUSH_BYTES + 1024;
+    assert!(!spilled.is_empty(), "nothing reached the sink before the statement ended");
+    assert!(largest <= limit, "one write carried {largest} bytes");
+    assert!(reply.len() <= limit, "feed still held {} bytes", reply.len());
+    let mut all = spilled;
+    all.extend_from_slice(&reply);
+    let got = frames(&all);
+    assert_eq!(got.first().map(|f| f.typ), Some(b'T'), "RowDescription first");
+    assert_eq!(rows_of(&got).len(), 5_000);
+    assert_eq!(tag(&got), "SELECT 5000");
+    assert_eq!(got.last().map(|f| f.typ), Some(b'Z'));
+}
+
+/// Finding vuln-a14 (0.18.5): inside a `BEGIN` block, writes went to the
+/// held writer while every SELECT read the published snapshot, so a block
+/// never saw its own inserts or updates. A block reads its own writes, as
+/// PostgreSQL's does; another connection still sees none of them until
+/// COMMIT.
+#[test]
+fn a_transaction_reads_its_own_writes() {
+    let fixture = build(4);
+    let mut one = connect(&fixture.service, 1);
+    let mut two = connect(&fixture.service, 2);
+    let name_of = |connection: &mut Connection<'_>, id: &str| -> Vec<Vec<Option<String>>> {
+        rows_of(&ask(connection, &format!("SELECT name FROM place WHERE id = '{id}'")))
+    };
+    assert!(first(&ask(&mut one, "BEGIN"), b'E').is_none());
+    assert!(first(&ask(&mut one, "INSERT INTO place (id, name, n, born, alive) VALUES ('k900000', 'new', 900000, 1, true)"), b'E').is_none());
+    assert!(first(&ask(&mut one, "UPDATE place SET name = 'renamed' WHERE id = 'k000001'"), b'E').is_none());
+    assert_eq!(name_of(&mut one, "k900000"), [[Some("new".to_owned())]], "the block sees its insert");
+    assert_eq!(name_of(&mut one, "k000001"), [[Some("renamed".to_owned())]], "the block sees its update");
+    assert!(name_of(&mut two, "k900000").is_empty(), "another connection sees nothing uncommitted");
+    assert!(first(&ask(&mut one, "COMMIT"), b'E').is_none());
+    assert_eq!(name_of(&mut two, "k900000"), [[Some("new".to_owned())]]);
+}
+
+/// Finding vuln-f01 (0.18.5), the wire half: every connection keeps its own
+/// snapshot between statements, one reader slot each, so one idle
+/// connection that had read once held the log's fold off forever and the
+/// writers stopped at 16 MiB. A connection lets its snapshot go when the
+/// service wants a fold -- at the end of a round trip, or on the server's
+/// idle poll (`Connection::idle`) -- and the writes go on.
+#[test]
+fn an_idle_reader_connection_does_not_stop_the_log_folding() {
+    let fixture = build(4);
+    let mut reader = connect(&fixture.service, 1);
+    let mut writer = connect(&fixture.service, 2);
+    assert!(first(&ask(&mut writer, "CREATE TABLE note (_key TEXT PRIMARY KEY, body TEXT) WITH (index: none)"), b'E').is_none());
+    assert_eq!(rows_of(&ask(&mut reader, "SELECT id FROM place")).len(), 4);
+    let body = "reef lagoon terrace ".repeat(150);
+    for batch in 0..400 {
+        let values: Vec<String> = (0..20).map(|i| format!("('n{batch:04}-{i:02}', '{body}')")).collect();
+        let got = ask(&mut writer, &format!("INSERT INTO note (_key, body) VALUES {}", values.join(", ")));
+        assert!(first(&got, b'E').is_none(), "batch {batch}: {:?}", first(&got, b'E').map(|f| String::from_utf8_lossy(&f.body).into_owned()));
+        // The server's idle poll, while this connection waits for a query.
+        reader.idle();
+    }
+    assert_eq!(rows_of(&ask(&mut reader, "SELECT _key FROM note WHERE _key = 'n0399-19'")).len(), 1);
+}
+
+/// Finding vuln-f03 (0.18.5), the wire half: DDL inside a `BEGIN` block
+/// committed the block's earlier writes, so the ROLLBACK that followed undid
+/// nothing. DDL after the block has written is refused with 25001 and fails
+/// the block; DDL as a block's first statement still runs.
+#[test]
+fn ddl_after_writes_in_a_block_is_refused() {
+    let fixture = build(4);
+    let mut one = connect(&fixture.service, 1);
+    let count = |c: &mut Connection<'_>| rows_of(&ask(c, "SELECT id FROM place")).len();
+    assert!(first(&ask(&mut one, "BEGIN"), b'E').is_none());
+    assert!(first(&ask(&mut one, "INSERT INTO place (id, name, n, born, alive) VALUES ('k900000', 'new', 900000, 1, true)"), b'E').is_none());
+    let refused = ask(&mut one, "CREATE TABLE later (_key TEXT PRIMARY KEY)");
+    let error = first(&refused, b'E').expect("DDL after a write in a block is refused");
+    assert!(String::from_utf8_lossy(&error.body).contains("25001"), "{}", String::from_utf8_lossy(&error.body));
+    assert!(first(&ask(&mut one, "ROLLBACK"), b'E').is_none());
+    assert_eq!(count(&mut one), 4, "the block's insert was committed by the DDL");
+    // First in a block, DDL runs.
+    assert!(first(&ask(&mut one, "BEGIN"), b'E').is_none());
+    assert!(first(&ask(&mut one, "CREATE TABLE later (_key TEXT PRIMARY KEY)"), b'E').is_none());
+    assert!(first(&ask(&mut one, "COMMIT"), b'E').is_none());
+}
+
+/// Finding vuln-f10 (0.18.5): a Describe or Close whose body was empty read
+/// one byte past the end and then sliced an empty body from 0 to 1, which
+/// panicked the connection thread. A body shorter than its fixed fields is a
+/// protocol violation, answered, and the connection goes on.
+#[test]
+fn a_truncated_describe_or_close_is_answered_not_a_panic() {
+    let fixture = build(4);
+    let mut connection = connect(&fixture.service, 1);
+    for typ in [b'D', b'C'] {
+        let mut batch = framed(typ, &[]);
+        batch.extend_from_slice(&sync_message());
+        let got = frames(&connection.feed(&batch));
+        let error = first(&got, b'E').unwrap_or_else(|| panic!("`{}` with no body: {:?}", typ as char, types_of(&got)));
+        assert!(String::from_utf8_lossy(&error.body).contains("08P01"), "{}", String::from_utf8_lossy(&error.body));
+    }
+    assert_eq!(rows_of(&ask(&mut connection, "SELECT id FROM place")).len(), 4, "the connection still answers");
+}
+
+/// Finding vuln-f07 (0.18.5): Describe of a read portal RAN the statement
+/// through the held path to learn its columns, so a driver that describes
+/// every portal (Parse, Bind, Describe, Execute 0) hit the held path's
+/// ceiling -- 65,536 rows or 16 MiB -- where the simple protocol streams.
+/// A read portal is described from its compiled statement, and the Execute
+/// that follows streams. About 18 MiB here.
+#[test]
+fn describing_a_read_portal_leaves_its_execute_streaming() {
+    let fixture = build(4);
+    let mut connection = connect(&fixture.service, 1);
+    assert!(first(&ask(&mut connection, "CREATE TABLE big (_key TEXT PRIMARY KEY, body TEXT) WITH (index: none)"), b'E').is_none());
+    let body = "rice terrace ".repeat(160);
+    for batch in 0..90 {
+        let values: Vec<String> = (0..100).map(|i| format!("('b{batch:03}-{i:03}', '{body}')")).collect();
+        let got = ask(&mut connection, &format!("INSERT INTO big (_key, body) VALUES {}", values.join(", ")));
+        assert!(first(&got, b'E').is_none(), "batch {batch}");
+    }
+    let mut batch = parse_message("s", "SELECT _key, body FROM big", &[]);
+    batch.extend_from_slice(&bind_message("p", "s", &[], &[]));
+    batch.extend_from_slice(&describe_message(b'P', "p"));
+    batch.extend_from_slice(&execute_message("p", 0));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    assert!(
+        first(&got, b'E').is_none(),
+        "{:?}",
+        first(&got, b'E').map(|f| String::from_utf8_lossy(&f.body).into_owned())
+    );
+    assert!(first(&got, b'T').is_some(), "Describe answered the columns");
+    assert_eq!(rows_of(&got).len(), 9_000);
+    assert_eq!(tag(&got), "SELECT 9000");
+}
+
+/// Finding vuln-f08 (0.18.5): a parameter the client left untyped (OID 0,
+/// or 705 `unknown`) was read by its shape at Bind, so '1001' bound as a
+/// row key and '00123' bound to a TEXT column became integers and were
+/// refused -- unless the client happened to Describe the statement first,
+/// which resolves untyped positions from the statement. Bind now resolves
+/// them the same way, once per statement.
+#[test]
+fn an_untyped_text_parameter_takes_its_columns_type() {
+    let fixture = build(4);
+    let mut connection = connect(&fixture.service, 1);
+    for (statement, unknown) in [("s0", 0), ("s705", 705)] {
+        let key = format!("{statement}-1001").replace("s0-", "").replace("s705-", "7");
+        let sql = "INSERT INTO place (id, name, n, born, alive) VALUES ($1, $2, $3, $4, $5)";
+        let mut batch = parse_message(statement, sql, &[unknown, unknown, unknown, unknown, unknown]);
+        let n = if unknown == 0 { b"900001".as_slice() } else { b"900002".as_slice() };
+        batch.extend_from_slice(&bind_message(
+            "p",
+            statement,
+            &[Some(key.as_bytes()), Some(b"00123"), Some(n), Some(b"1"), Some(b"t")],
+            &[],
+        ));
+        batch.extend_from_slice(&execute_message("p", 0));
+        batch.extend_from_slice(&sync_message());
+        let got = frames(&connection.feed(&batch));
+        assert!(
+            first(&got, b'E').is_none(),
+            "OID {unknown}: {:?}",
+            first(&got, b'E').map(|f| String::from_utf8_lossy(&f.body).into_owned())
+        );
+        assert_eq!(
+            rows_of(&ask(&mut connection, &format!("SELECT name FROM place WHERE id = '{key}'"))),
+            [[Some("00123".to_owned())]],
+            "OID {unknown}: the text kept its spelling"
+        );
+    }
+}

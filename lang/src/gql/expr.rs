@@ -646,13 +646,10 @@ fn constant(literal: &Literal) -> BindingValue {
     match literal {
         Literal::Null => BindingValue::Null,
         Literal::Bool(b) => BindingValue::Bool(*b),
-        Literal::Num(value, exact) => {
-            if *exact && value.fract() == 0.0 && value.abs() < 9.2e18 {
-                BindingValue::Int(*value as i64)
-            } else {
-                BindingValue::Float(*value)
-            }
-        }
+        Literal::Num(value, exact) => match exact {
+            Some(integer) => BindingValue::Int(*integer),
+            None => BindingValue::Float(*value),
+        },
         Literal::Str(text) => BindingValue::Text(text.as_str().into()),
     }
 }

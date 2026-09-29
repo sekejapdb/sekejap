@@ -275,7 +275,7 @@ impl Parser {
         self.shallower();
         Ok(match inner? {
             Expr::Literal(Literal::Num(value, exact)) => {
-                Expr::Literal(Literal::Num(-value, exact))
+                Expr::Literal(Literal::Num(-value, exact.and_then(i64::checked_neg)))
             }
             inner => Expr::Neg(Box::new(inner)),
         })

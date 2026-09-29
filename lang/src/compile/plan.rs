@@ -1205,6 +1205,10 @@ impl WritePlan {
                             if db.get(collection, &key)?.is_none() {
                                 db.insert(collection, &key, &document)?;
                             } else if let Some(columns) = action {
+                                // `EXCLUDED` is the row the INSERT proposed,
+                                // its DEFAULTs filled: a column the INSERT
+                                // left out takes its DEFAULT, not NULL.
+                                db.fill_column_defaults(collection, &mut document)?;
                                 let mut patch = serde_json::Map::new();
                                 for column in columns {
                                     patch.insert(
