@@ -666,6 +666,14 @@ impl<'a> Connection<'a> {
         let mut reader = f::Reader::new(body);
         let kind = reader.byte();
         let name = reader.cstr();
+        if reader.overran() {
+            let error = WireError::new(
+                types::PROTOCOL_VIOLATION,
+                "a Describe or Close message shorter than its type byte and name",
+            );
+            self.fail(out, &error);
+            return;
+        }
         if kind == b'S' {
             let Some(prepared) = self.statements.get(&name).cloned() else {
                 let error = WireError::new(
@@ -818,6 +826,14 @@ impl<'a> Connection<'a> {
         let mut reader = f::Reader::new(body);
         let kind = reader.byte();
         let name = reader.cstr();
+        if reader.overran() {
+            let error = WireError::new(
+                types::PROTOCOL_VIOLATION,
+                "a Describe or Close message shorter than its type byte and name",
+            );
+            self.fail(out, &error);
+            return;
+        }
         if kind == b'S' {
             self.statements.remove(&name);
         } else {

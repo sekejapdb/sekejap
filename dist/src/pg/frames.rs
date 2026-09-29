@@ -259,11 +259,18 @@ pub fn notification_response(out: &mut Vec<u8>, pid: i32, channel: &str, payload
 pub struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// A read wanted a byte past the end, or a string had no NUL: the body
+    /// is shorter than its own fields (finding vuln-f10).
+    overran: bool,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
+        Self {
+            bytes,
+            at: 0,
+            overran: false,
+        }
     }
 
     /// Bytes still unread. A COUNT field says how many items follow; this
@@ -273,10 +280,24 @@ impl<'a> Reader<'a> {
         self.bytes.len().saturating_sub(self.at)
     }
 
+    /// The body was shorter than the fields read from it. Reads past the
+    /// end answer zeros and never move past it, so a short body cannot
+    /// panic; a handler checks this to answer a protocol violation.
+    pub fn overran(&self) -> bool {
+        self.overran
+    }
+
     pub fn byte(&mut self) -> u8 {
-        let value = self.bytes.get(self.at).copied().unwrap_or(0);
-        self.at += 1;
-        value
+        match self.bytes.get(self.at).copied() {
+            Some(value) => {
+                self.at += 1;
+                value
+            }
+            None => {
+                self.overran = true;
+                0
+            }
+        }
     }
 
     pub fn i16(&mut self) -> i16 {
@@ -314,6 +335,8 @@ impl<'a> Reader<'a> {
         let text = String::from_utf8_lossy(&self.bytes[start..self.at]).into_owned();
         if self.at < self.bytes.len() {
             self.at += 1;
+        } else {
+            self.overran = true;
         }
         text
     }

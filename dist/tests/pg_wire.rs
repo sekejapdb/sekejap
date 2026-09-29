@@ -1516,3 +1516,21 @@ fn ddl_after_writes_in_a_block_is_refused() {
     assert!(first(&ask(&mut one, "CREATE TABLE later (_key TEXT PRIMARY KEY)"), b'E').is_none());
     assert!(first(&ask(&mut one, "COMMIT"), b'E').is_none());
 }
+
+/// Finding vuln-f10 (0.18.5): a Describe or Close whose body was empty read
+/// one byte past the end and then sliced an empty body from 0 to 1, which
+/// panicked the connection thread. A body shorter than its fixed fields is a
+/// protocol violation, answered, and the connection goes on.
+#[test]
+fn a_truncated_describe_or_close_is_answered_not_a_panic() {
+    let fixture = build(4);
+    let mut connection = connect(&fixture.service, 1);
+    for typ in [b'D', b'C'] {
+        let mut batch = framed(typ, &[]);
+        batch.extend_from_slice(&sync_message());
+        let got = frames(&connection.feed(&batch));
+        let error = first(&got, b'E').unwrap_or_else(|| panic!("`{}` with no body: {:?}", typ as char, types_of(&got)));
+        assert!(String::from_utf8_lossy(&error.body).contains("08P01"), "{}", String::from_utf8_lossy(&error.body));
+    }
+    assert_eq!(rows_of(&ask(&mut connection, "SELECT id FROM place")).len(), 4, "the connection still answers");
+}
