@@ -20,17 +20,19 @@ another, and what was asked one way can be asked another.
                           meaning is owned by 2.a)
    1.b Rows               the row encoding (every row names its layout), the
                           key map, vector sidecars; RESERVED (no code yet):
-                          value kind 8 = BYTES, and keyspace 0x61 for
+                          layout kind 8 = BYTES, and keyspace 0x61 for
                           large-object chunks
    1.c Edges              adjacency postings and property bags
    1.d Index postings     scalar, text, trigram, vector, spatial, endpoint
                           sets
 
 2. Supportive — everything that describes, finds or maintains the core.
-   2.0 Anchor             the one entry point: the roots of 2.a-2.g and the
-                          census of entry kinds and versions the file uses
+   2.0 Anchor             the one entry point: the three Register roots and
+                          the census of entry kinds, versions and variants
+                          the file uses
    2.a Paging and space   tree ownership, allocation, reclamation, limits
-   2.b Identity and names ids and their counters, never reused; names of
+   2.b Identity and names identities and their counters, never reused
+                          (storage slots such as tree ids may be); names of
                           tables, columns, indexes, schemas, edge types and
                           contexts -- a name is a label on an id
    2.c Schema             tables, columns (id, type, rules, defaults, state),
@@ -57,8 +59,9 @@ another, and what was asked one way can be asked another.
 4. **Older readers stay honest.** A release that meets an unknown entry skips
    it when it is ignorable, and refuses the file by name when it is critical
    ("needs a newer sekejap"), never as corruption. Law 8 lives here. A writer
-   that meets an unknown 2.g entry deletes it before its first write to that
-   entry's owner, so a stale statistic never answers a question.
+   that meets an ignorable entry it does not know deletes it, in any node,
+   before its first write to that entry's owner, so a stale statistic or name
+   index never answers a question.
 5. **Every change of format carries its upgrader.** Moving a file to a new
    entry kind is done by the upgrade that ships in the same release.
 6. **Fix the node that matters.** A problem in one node is fixed in that node.
