@@ -33,7 +33,7 @@ class SekejapTest {
 
     @Test
     fun `the library reports the version and the disk format this build carries`() {
-        assertEquals("0.18.4", Db.version())
+        assertEquals("0.18.5", Db.version())
         assertEquals(2, Db.formatVersion())
     }
 

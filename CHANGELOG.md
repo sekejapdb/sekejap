@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.18.5
+
+Thirty correctness and robustness fixes from a two-reviewer audit of 0.18.4,
+and the fix for JSON written by a build that enables serde_json's
+`preserve_order`. A 0.18.4 database opens as it is; nothing needs rebuilding.
+
+**Data and durability**
+
+- **JSON written with `serde_json/preserve_order` enabled is readable.** Any
+  crate in a build can turn that feature on. Edge properties and JSONB
+  objects were then written in insertion order, and the same build's reads
+  refused them. Keys are now written sorted and read in any order; a
+  repeated key is still refused. Files already written that way read again.
+- **A service no longer stops accepting writes after 16 MiB of log.** Its
+  published read view held a reader slot at every instant, so the log could
+  never be folded. The service now folds at a commit that leaves the log
+  due, and a wire connection lets its snapshot go between statements while
+  a fold waits. Restarting a service folds a log the last run left due.
+- **A failed statement no longer leaves half its rows behind.** An
+  abandoned writer's work is rolled back even with no change-feed
+  subscriber, a failed wire autocommit statement leaves nothing, an
+  uncommitted write can no longer become committed by a later commit after
+  a crash, and a failed statement aborts a Rust `Tx` as in PostgreSQL
+  (`25P02`; `commit` then rolls back).
+- **A torn last log frame no longer stops the database opening.** A frame
+  past the last commit whose last sector never reached the disk is the end
+  of the log. A frame that did land and is damaged still refuses.
+
+**SQL**
+
+- `ON CONFLICT DO UPDATE SET c = EXCLUDED.c` gives a left-out column its
+  DEFAULT, not NULL.
+- Edge tables apply NOT NULL and DEFAULT on INSERT, UPDATE and upsert alike,
+  keep an explicit NULL, and check a `PRIMARY KEY (src, dst)` conflict with
+  one lookup instead of reading every edge at the source.
+- `COUNT(*)` honours HAVING and `LIMIT 0`; ORDER BY a text MIN/MAX or a
+  large integer aggregate orders by the value itself.
+- Integer literals past 2^53 keep every digit; `right(s, n)` with the
+  smallest integer answers `''` instead of panicking; an edge end naming no
+  row matches no edge.
+- **Behaviour changes, refused by name:** `UPDATE ... SET` of a declared
+  PRIMARY KEY column; `ALTER TABLE` on an edge table other than `RENAME TO`;
+  a select-list expression that is not the statement's ORDER BY expression
+  (it used to report the ORDER BY value); DDL inside a transaction that has
+  already written (`25001`) -- it would have committed those writes; a
+  parameter number above `$65535`.
+
+**PostgreSQL wire**
+
+- A `BEGIN` block reads its own uncommitted writes.
+- Query answers stream to the socket in 64 KiB steps instead of being held
+  whole, and a portal that is described before it runs still streams.
+- Describe never runs a write, and `$n` inside a comment is not a
+  parameter.
+- A text boolean parameter follows PostgreSQL's spellings (`True`, `yes`,
+  ` on `) and anything else is an error, never `false`.
+- An untyped parameter keeps its text (`'00123'`, `'1001'` as a key), and a
+  bound parameter takes the column's type as PostgreSQL reads an untyped
+  literal.
+- A comment before `BEGIN`/`COMMIT` no longer hides it, and an empty
+  Describe or Close message is a protocol error, not a crash.
+
+**C ABI**
+
+- `sekejap_neighbours` takes its direction as `int32_t`; any value other
+  than the three `SekejapDirection` constants is `SekejapStatus_Invalid`.
+  Source compatible for C and C++.
+- A `SekejapTx` runs on a worker thread of its own, so any thread may call
+  it -- including a finalizer or a goroutine that moved threads.
+- `sekejap_next_change` waiting on one subscription no longer holds up the
+  others.
+
 ## 0.18.4
 
 A fix to the full-text index.

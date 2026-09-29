@@ -53,7 +53,7 @@ source (`dist/ffi/sekejap.pc.in` / the packaging step that stages
 
 ```lua
 local sekejap = require("sekejap")
-print(sekejap.version())                    -- "0.18.4"
+print(sekejap.version())                    -- "0.18.5"
 
 local db = sekejap.open("./data")            -- a directory on disk
 
@@ -182,11 +182,11 @@ once the rock builds against a real `libsekejap`:
 
 ```bash
 # from this directory, with a LuaRocks API key configured:
-luarocks upload sekejap-0.18.4-1.rockspec --api-key=<your-api-key>
+luarocks upload sekejap-0.18.5-1.rockspec --api-key=<your-api-key>
 
 # or build + install locally, then push the same rockspec:
-luarocks make sekejap-0.18.4-1.rockspec
-luarocks upload sekejap-0.18.4-1.rockspec --api-key=<your-api-key>
+luarocks make sekejap-0.18.5-1.rockspec
+luarocks upload sekejap-0.18.5-1.rockspec --api-key=<your-api-key>
 ```
 
 The rockspec's `source.url` is the sekejap repository
