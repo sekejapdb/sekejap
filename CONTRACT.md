@@ -1,5 +1,73 @@
 # sekejap
 
+## The shape — the hyper contract
+
+Adopted 2026-09-29. This sits above the laws: the laws below govern how each
+part behaves; this fixes WHAT the parts are. It holds until a board-level
+decision replaces it. Changing sekejap means changing the one node that
+matters, never adding a structure beside the tree.
+
+sekejap is for people whose ideas move fast and change shape. An idea must not
+be held back by a technicality: what was structured one way can be structured
+another, and what was asked one way can be asked another.
+
+### The structure
+
+```
+1. Core — the multimodel data. Designed to last; never changed for a feature.
+   1.a Pages and log      the page format, the write-ahead log, checkpoints
+   1.b Rows               the row encoding; every row names its layout
+   1.c Edges              adjacency postings and property bags
+   1.d Index postings     scalar, text, trigram, vector, spatial
+
+2. Supportive — everything that describes, finds or maintains the core.
+   2.a Paging and space   allocation, free space, reclamation
+   2.b Identity and names ids never reused; a name is a label on an id
+   2.c Schema             layouts with column ids, defaults, rules, keys
+   2.d Access paths       index definitions: columns, expression, analyzer,
+                          parameters
+   2.e Graph              edge types, table bindings, labels, graphs
+   2.f Jobs               resumable state of long work: builds, drops,
+                          conversions
+   2.g Statistics         counts and hints; always ignorable
+```
+
+### The rules of the structure
+
+1. **Two kinds, only two.** A persisted byte is core (section 1) or supportive
+   (section 2). There is no third place.
+2. **Core is frozen.** A feature never changes 1.a-1.d. A change there is a
+   board decision, rare, and designed for an algorithm family, not a need.
+3. **Supportive grows by typed entries, never by new structure.** Each node in
+   section 2 is one parent structure holding typed child entries. An entry
+   carries its kind, its version, whether it is critical, its length and a
+   checksum. A new need is a new entry kind under the node it belongs to --
+   never a new bit, tail or keyspace.
+4. **Older readers stay honest.** A release that meets an unknown entry skips
+   it when it is ignorable, and refuses the file by name when it is critical
+   ("needs a newer sekejap"), never as corruption. Law 8 lives here.
+5. **Every change of format carries its upgrader.** Moving a file to a new
+   entry kind is done by the upgrade that ships in the same release.
+6. **Fix the node that matters.** A problem in one node is fixed in that node.
+   Developers improve algorithms; the tree stays.
+
+### The foundations every interface stands on
+
+- **A. Names are labels on ids.** Columns, rows, edge types, indexes and
+  schemas have ids that are never reused; renaming, dropping and adding are
+  changes to labels (2.b, 2.c).
+- **B. Everything is a relation.** A row and an edge share one row interface,
+  and any answer can feed another question.
+- **C. Build beside, swap, clean up in steps.** Heavy work runs beside what
+  is served, publishes in one commit, and resumes after a crash (2.f).
+- **D. Bounded memory, unbounded answers.** Memory is always bounded; past a
+  limit the work pages, spills or resumes instead of refusing.
+
+Status: the code does not fully match yet. Today's supportive metadata is
+partly scattered (catalog tails and feature bits added release by release).
+The design that folds it into section 2, with its upgrader, is the next format
+decision; until it ships, new work must not add to the scatter.
+
 ## North Star — the 8 laws
 
 1. **Disk-first** — no operation holds RAM ∝ database. RAM ∝ change is fine.
