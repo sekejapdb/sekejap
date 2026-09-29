@@ -103,6 +103,7 @@ const fn = {
   sekejap_open_service: lib.func('SekejapDb *sekejap_open_service(const char *path)'),
   sekejap_close: lib.func('void sekejap_close(SekejapDb *db)'),
   sekejap_version: lib.func('const char *sekejap_version(void)'), // NOT HeapStr: static
+  sekejap_upgrade: lib.func('HeapStr sekejap_upgrade(const char *path)'),
   sekejap_format_version: lib.func('int32_t sekejap_format_version(void)'),
 
   // 4.2 Errors and memory
@@ -818,6 +819,20 @@ function version() {
   return fn.sekejap_version();
 }
 
+/**
+ * Move a database a 0.18 release wrote to the 0.19 format, once, before
+ * opening it; 0.19 opens no 0.18 file until then. Safe on every start: a 0.19
+ * file or a missing path is left alone and `null` returned. When it moves one,
+ * the untouched 0.18 original is kept and its path returned. Nothing may have
+ * the database open meanwhile.
+ */
+function upgrade(path) {
+  const text = fn.sekejap_upgrade(path);
+  if (text === null) throw lastError(null);
+  const moved = JSON.parse(text);
+  return moved.moved ? moved.backup : null;
+}
+
 /** The sekejap disk format this build reads and writes. */
 function formatVersion() {
   return fn.sekejap_format_version();
@@ -832,5 +847,6 @@ module.exports = {
   SekejapStatus,
   SekejapDirection,
   version,
+  upgrade,
   formatVersion,
 };

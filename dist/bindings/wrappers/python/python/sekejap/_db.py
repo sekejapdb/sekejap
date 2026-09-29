@@ -223,6 +223,19 @@ def version() -> str:
     return value.decode("utf-8") if value else ""
 
 
+def upgrade(path: str) -> Optional[str]:
+    """Move a database a 0.18 release wrote to the 0.19 format, once, before
+    opening it; 0.19 opens no 0.18 file until then. Safe on every start: a
+    0.19 file or a missing path is left alone and ``None`` returned. When it
+    moves one, the untouched 0.18 original is kept and its path returned.
+    Nothing may have the database open meanwhile."""
+    answer = _ffi.take_string(_ffi.library().sekejap_upgrade(_ffi.encode(path)))
+    if answer is None:
+        raise _fail("upgrade(%s)" % path)
+    moved = json.loads(answer)
+    return moved.get("backup") if moved.get("moved") else None
+
+
 def format_version() -> int:
     """The disk format this build reads and writes."""
     return int(_ffi.library().sekejap_format_version())

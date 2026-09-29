@@ -105,7 +105,22 @@ pub(crate) fn legacy_mode() -> bool {
     if let Some(register) = FORCE.with(|f| f.get()) {
         return !register;
     }
+    if let Some(legacy) = PIN.with(|p| p.get()) {
+        return legacy;
+    }
     std::env::var_os("SEKEJAP_CREATE_REGISTER").is_some_and(|v| v == "0")
+}
+
+thread_local! {
+    /// `internal::LegacyFormat`'s pin: THIS thread only, so a test that pins
+    /// 0.18 compatibility never changes what a test running beside it on
+    /// another thread creates or opens.
+    static PIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Set this thread's pin, returning the one it replaces.
+pub(crate) fn pin_legacy(on: Option<bool>) -> Option<bool> {
+    PIN.with(|p| p.replace(on))
 }
 
 /// Whether new databases are created as Register files.

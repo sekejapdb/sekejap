@@ -98,9 +98,11 @@ fn report(db: &Database, shown: &str) -> Result<(Value, Vec<String>), String> {
             }));
         }
     }
+    // A 0.19-format file opens in no 0.18 release, whatever its features.
+    let register = db.has_column_ids();
     let readable: serde_json::Map<String, Value> = RELEASES
         .iter()
-        .map(|(release, mask)| (release.to_string(), json!(features & !mask == 0)))
+        .map(|(release, mask)| (release.to_string(), json!(!register && features & !mask == 0)))
         .collect();
     let advice = if older.is_empty() {
         "nothing to upgrade: every index is in this build's format".to_owned()

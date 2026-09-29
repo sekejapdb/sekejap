@@ -118,6 +118,32 @@ func (db *DB) Close() {
 // Version returns the library version, as MAJOR.MINOR.PATCH.
 func Version() string { return C.GoString(C.sekejap_version()) }
 
+// Upgrade moves a database a 0.18 release wrote to the 0.19 format, once,
+// before it is opened; 0.19 opens no 0.18 file until then. It is safe on
+// every start: a 0.19 file or a missing path is left alone and "" returned.
+// When it moves one, the untouched 0.18 original is kept and its path
+// returned. Nothing may have the database open meanwhile.
+func Upgrade(path string) (string, error) {
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	out := C.sekejap_upgrade(cpath)
+	if out == nil {
+		return "", lastError()
+	}
+	defer C.sekejap_string_free(out)
+	var moved struct {
+		Moved  bool   `json:"moved"`
+		Backup string `json:"backup"`
+	}
+	if err := json.Unmarshal([]byte(C.GoString(out)), &moved); err != nil {
+		return "", err
+	}
+	if !moved.Moved {
+		return "", nil
+	}
+	return moved.Backup, nil
+}
+
 // FormatVersion returns the disk format this build reads and writes.
 func FormatVersion() int32 { return int32(C.sekejap_format_version()) }
 

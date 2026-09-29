@@ -30,7 +30,6 @@ fn cfg() -> Config {
     Config { budget_bytes: 1 << 20, io: IoMode::Buffered, sync: SyncMode::Full }
 }
 fn register_file(path: &std::path::Path) -> Database {
-    std::env::set_var("SEKEJAP_CREATE_REGISTER", "1");
     Database::create(path, cfg()).unwrap()
 }
 fn run(db: &mut Database, sql: &str) -> SqlResult {

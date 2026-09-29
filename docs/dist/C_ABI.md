@@ -20,7 +20,7 @@ JSON encode.
 Units: bytes are bytes, timeouts are milliseconds, counts are rows or edges
 and are named as such.
 
-59 functions. The header is `#include <stdint.h>`-clean C99 with a
+60 functions. The header is `#include <stdint.h>`-clean C99 with a
 `__cplusplus` guard, so a C++ consumer includes the same file.
 
 ---
@@ -154,6 +154,7 @@ thread, in every row.
 | signature | `Db` call | one line | error |
 |---|---|---|---|
 | `SekejapDb *sekejap_open(const char *path)` | `Db::open` | open the directory, creating it when it holds none | `NULL` |
+| `char *sekejap_upgrade(const char *path)` | `Db::upgrade` | move a database a 0.18 release wrote to the 0.19 format, once, before opening it (0.19.1); `{"moved": false}` for a 0.19 file or a missing path, `{"moved": true, "backup": "<path>"}` when moved, the 0.18 original kept untouched at that path | `NULL` |
 | `SekejapDb *sekejap_open_with_config(const char *path, const char *config_json)` | `Db::open_with` | the same under a store configuration; a `NULL` config is sekejap's default, which is `SyncMode::Full` | `NULL` |
 | `SekejapDb *sekejap_open_service(const char *path)` | `Db::open_service` | SERVICE mode: one writer, parallel readers on a published snapshot, the change feed, the statement timeout, the cancel (`docs/dist/OPS_CONTRACT.md` §1-§5) | `NULL` |
 | `void sekejap_close(SekejapDb *db)` | `Db::close` | close and free. Null-safe. Uncommitted work is discarded: a close is not a commit | -- |

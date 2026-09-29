@@ -63,6 +63,37 @@ impl Db {
         Self::open_with(path, Self::config())
     }
 
+    /// Move a database written by a 0.18 release to the 0.19 format, once,
+    /// before it is opened: 0.19 opens no 0.18-format file until then
+    /// (`docs/core/SUPPORTIVE.md` section 3). Call it at startup before
+    /// [`Db::open`]; it does nothing for a 0.19 file or a path that does not
+    /// exist yet, so it is safe on every start.
+    ///
+    /// The 0.19 copy is built beside the original, verified, and swapped in;
+    /// the original directory is kept untouched as `<path>.v018-backup` and
+    /// its path returned. Nothing may have the database open meanwhile. It
+    /// needs room for a second copy, and its time grows with the database:
+    /// every row is copied and every index rebuilt. Interrupted, the next
+    /// call finishes it. Later releases open 0.19 files as they are.
+    pub fn upgrade(path: impl AsRef<Path>) -> Result<Option<std::path::PathBuf>> {
+        use sekejap_core::collections::rebuild::RebuildLimits;
+        let path = path.as_ref();
+        let mut staging = path.as_os_str().to_owned();
+        staging.push(".v019-upgrading");
+        if !path.exists() && !Path::new(&staging).exists() {
+            return Ok(None);
+        }
+        // A deliberate, one-time move of the caller's own database: bounded
+        // by the size limit, not by record or read counts.
+        let limits = RebuildLimits {
+            cache_bytes: 64 << 20,
+            max_records: u64::MAX,
+            max_point_reads: u64::MAX,
+            ..RebuildLimits::default()
+        };
+        Ok(sekejap_core::collections::upgrade::upgrade_format(path, limits)?.map(|done| done.backup))
+    }
+
     /// The store configuration this crate opens with when the caller names
     /// none: `kernel::store::Config` with [`SyncMode::Normal`], so every
     /// commit is published with a data barrier -- `fdatasync` on Linux, plain

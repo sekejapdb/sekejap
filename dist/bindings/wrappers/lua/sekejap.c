@@ -166,6 +166,15 @@ static int l_open_memory(lua_State *L) {
     return 1;
 }
 
+// Upgrade a 0.18 database to the current format, in place. Returns the
+// JSON report: {"moved":false} or {"moved":true,"backup":"<path>"}.
+static int l_upgrade(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    char *r = sekejap_upgrade(path);
+    if (r == NULL) return raise_last(L, NULL, "upgrade");
+    return push_owned_or_nil(L, r);
+}
+
 static int l_version(lua_State *L) {
     lua_pushstring(L, sekejap_version()); // static: never freed
     return 1;
@@ -733,6 +742,7 @@ static const luaL_Reg module_fns[] = {
     {"open_with_config", l_open_with_config},
     {"open_service", l_open_service},
     {"open_memory", l_open_memory},
+    {"upgrade", l_upgrade},
     {"version", l_version},
     {"format_version", l_format_version},
     {NULL, NULL},

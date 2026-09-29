@@ -1,4 +1,4 @@
-// The 59 `extern "C"` entry points of `libsekejap`, looked up one to one.
+// The 60 `extern "C"` entry points of `libsekejap`, looked up one to one.
 //
 // This file is the only place that names a C symbol. It is written against
 // `dist/ffi/include/sekejap.h` (contract: `docs/dist/C_ABI.md`) and adds
@@ -54,6 +54,10 @@ class SekejapBindings {
 
   late final version = library.lookupFunction<Pointer<Utf8> Function(),
       Pointer<Utf8> Function()>('sekejap_version');
+
+  late final upgrade = library.lookupFunction<
+      Pointer<Utf8> Function(Pointer<Utf8>),
+      Pointer<Utf8> Function(Pointer<Utf8>)>('sekejap_upgrade');
 
   late final formatVersion =
       library.lookupFunction<Int32 Function(), int Function()>(

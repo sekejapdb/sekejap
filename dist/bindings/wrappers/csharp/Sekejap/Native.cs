@@ -5,7 +5,7 @@ namespace Sekejap
 {
     // Raw P/Invoke declarations for the sekejap 0.17.0 C ABI: one entry per
     // `extern "C"` function in dist/ffi/include/sekejap.h (contract:
-    // docs/dist/C_ABI.md). 59 functions, none of them hand-written beyond
+    // docs/dist/C_ABI.md). 60 functions, none of them hand-written beyond
     // this file -- everything idiomatic (exceptions, IDisposable, optional
     // parameters) lives in the wrapper types that call through this class.
     //
@@ -41,6 +41,9 @@ namespace Sekejap
             [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
 
         [DllImport(Lib)] internal static extern void sekejap_close(IntPtr db);
+
+        [DllImport(Lib)] internal static extern IntPtr sekejap_upgrade(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
 
         [DllImport(Lib)] internal static extern IntPtr sekejap_version();
 

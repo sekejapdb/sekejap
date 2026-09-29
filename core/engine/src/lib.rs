@@ -50,23 +50,19 @@ pub mod internal {
     pub use crate::query::EDGE_FIELD_PREFIX;
 
     /// For a test that reads or edits 0.18-format bytes: while the guard
-    /// lives, databases this process creates are 0.18-format files; the
-    /// setting before it is restored when it drops, so no later test is
-    /// changed by it.
-    pub struct LegacyFormat(Option<std::ffi::OsString>);
+    /// lives, databases THIS THREAD creates are 0.18-format files and it
+    /// opens 0.18-format files. The pin is per thread, so tests running in
+    /// parallel never see each other's; the pin before it is restored when
+    /// it drops.
+    pub struct LegacyFormat(Option<bool>);
     impl LegacyFormat {
         pub fn pin() -> Self {
-            let before = std::env::var_os("SEKEJAP_CREATE_REGISTER");
-            std::env::set_var("SEKEJAP_CREATE_REGISTER", "0");
-            Self(before)
+            Self(crate::supportive::header::pin_legacy(Some(true)))
         }
     }
     impl Drop for LegacyFormat {
         fn drop(&mut self) {
-            match self.0.take() {
-                Some(v) => std::env::set_var("SEKEJAP_CREATE_REGISTER", v),
-                None => std::env::remove_var("SEKEJAP_CREATE_REGISTER"),
-            }
+            crate::supportive::header::pin_legacy(self.0);
         }
     }
 }

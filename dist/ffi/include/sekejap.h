@@ -139,6 +139,19 @@ extern "C" {
 // `path` must be a valid null-terminated UTF-8 C string.
 SekejapDb *sekejap_open(const char *path);
 
+// Move a database written by a 0.18 release to the 0.19 format, once,
+// before it is opened (`sekejap::Db::upgrade`). Safe to call on every start:
+// a 0.19 file or a path that does not exist is left alone.
+//
+// Returns a JSON object the caller frees with `sekejap_string_free`:
+// `{"moved": false}`, or `{"moved": true, "backup": "<path>"}` where the
+// untouched 0.18 original now lives. `NULL` on failure, the reason in
+// `sekejap_last_error(NULL)`. Nothing may have the database open meanwhile.
+//
+// # Safety
+// `path` must be a valid null-terminated UTF-8 C string.
+char *sekejap_upgrade(const char *path);
+
 // `sekejap_open` under a store configuration, given as a JSON object:
 // `{"budget_bytes": 268435456, "io": "buffered"|"direct",
 // "sync": "full"|"normal"|"off"}`. Every member is optional and an absent

@@ -257,6 +257,16 @@ public final class Db {
 
     deinit { if !closed { sekejap_close(handle) } }
 
+    /// Upgrade a database written by 0.18 to the current format, in place.
+    /// Returns the path of the kept original, or nil when nothing needed
+    /// upgrading. Call it before `open`.
+    @discardableResult
+    public static func upgrade(path: String) throws -> String? {
+        guard let out = takeString(sekejap_upgrade(path)) else { throw lastSekejapError() }
+        let report = try JSON.decodeObject(out)
+        return (report["moved"] as? Bool) == true ? report["backup"] as? String : nil
+    }
+
     /// `MAJOR.MINOR.PATCH` of the linked library.
     public static var version: String { String(cString: sekejap_version()) }
 

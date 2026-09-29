@@ -3,11 +3,12 @@
 //!
 //! What is at risk, one test each:
 //!
-//! * `--check` on the preserved 0.18.3 release files reports every index as
-//!   current and the file as still readable by 0.18.3, and changes no byte
+//! * `--check` on the preserved 0.18.3 release files says the file is in the
+//!   0.18 format and changes no byte
 //!   (`check_reports_a_release_file_and_changes_nothing`);
-//! * `--apply` with nothing older changes no byte and makes no backup
-//!   (`apply_with_nothing_older_changes_nothing`);
+//! * `--apply` on it moves it to the 0.19 format, keeps the original
+//!   directory untouched as the backup, and a second `--apply` has nothing
+//!   to do (`apply_moves_a_release_file_and_keeps_the_original`);
 //! * a file carrying a feature 0.18.3 does not know -- a trigram index -- is
 //!   reported as no longer readable by it
 //!   (`check_says_when_an_older_release_can_no_longer_open_the_file`).
@@ -66,25 +67,27 @@ fn check_reports_a_release_file_and_changes_nothing() {
     let (ok, out, err) = upgrade(&["--check", db.to_str().unwrap()]);
     assert!(ok, "{err}");
     let report: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(report["older"], 0);
-    assert_eq!(report["readable_by"]["0.18.3"], true);
-    let indexes = report["indexes"].as_array().unwrap();
-    assert!(indexes.len() >= 20, "{indexes:?}");
-    assert!(indexes.iter().all(|i| i["format"] == "current"));
+    assert_eq!(report["format"], "0.18");
+    assert!(report["advice"].as_str().unwrap().contains("--apply"));
     assert_eq!(bytes(&db), before, "--check wrote to the database");
 }
 
 #[test]
-fn apply_with_nothing_older_changes_nothing() {
+fn apply_moves_a_release_file_and_keeps_the_original() {
     let dir = tempfile::tempdir().unwrap();
     let db = release_copy(dir.path());
     let before = bytes(&db);
+    let (ok, _, err) = upgrade(&["--apply", db.to_str().unwrap()]);
+    assert!(ok, "{err}");
+    assert!(!sekejap_core::collections::upgrade::is_legacy_format(&db).unwrap());
+    assert_eq!(bytes(&dir.path().join("db.v018-backup")), before, "the backup is the original");
+    let report: Value = serde_json::from_str(&upgrade(&["--check", db.to_str().unwrap()]).1).unwrap();
+    assert_eq!(report["older"], 0);
+    assert_eq!(report["readable_by"]["0.18.3"], false, "no 0.18 release opens a 0.19 file");
+    // A second `--apply` has nothing left to do.
     let (ok, out, err) = upgrade(&["--apply", db.to_str().unwrap()]);
     assert!(ok, "{err}");
     assert!(out.contains("nothing to upgrade"), "{out}");
-    assert_eq!(bytes(&db), before, "--apply changed a database it had nothing to do to");
-    let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
-    assert_eq!(entries.len(), 1, "a backup was made with nothing to back up for");
 }
 
 #[test]

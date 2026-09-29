@@ -111,6 +111,19 @@ class Db {
   /// Static program data on the C side: it is read, never freed.
   static String get version => sekejap.version().toDartString();
 
+  /// Upgrade a database written by 0.18 to the current format, in place.
+  ///
+  /// Returns the path of the kept original (`<path>.v018-backup`), or null
+  /// when nothing needed upgrading. Call it before [open]; a file already in
+  /// the current format is left alone.
+  static String? upgrade(String path) => using((arena) {
+        final owned = sekejap.upgrade(path.toNativeUtf8(allocator: arena));
+        final json = takeString(owned);
+        if (json == null) throwLast(nullptr, 'upgrade');
+        final report = decodeDocument(json);
+        return report['moved'] == true ? report['backup'] as String : null;
+      });
+
   /// The sekejap disk format this build reads and writes.
   static int get formatVersion => sekejap.formatVersion();
 

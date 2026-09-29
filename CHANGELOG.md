@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.19.1
+
+- **The upgrade as one call, everywhere.** `Db::upgrade(path)` in Rust,
+  `sekejap_upgrade` in the C ABI (60 functions now), and `upgrade` in every
+  binding (Python, Node, Go, Kotlin/Java, Dart, Swift, C#, Lua). It moves a
+  0.18 database to the 0.19 format and keeps the original beside it as
+  `<path>.v018-backup`; for a 0.19 database or a path that does not exist
+  it does nothing, so an application can call it on every start, before
+  opening.
+- **`sekejap-upgrade --check`** no longer says a 0.19 file is readable by a
+  0.18 release.
+- Tests that write 0.18-format files no longer switch the format for the
+  whole process, which made parallel test runs fail at random.
+
 ## 0.19.0
 
 The versatility foundation: a new supportive format, columns with stable

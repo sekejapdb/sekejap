@@ -56,6 +56,18 @@ namespace Sekejap
             return new SekejapDb(db);
         }
 
+        /// <summary><c>sekejap_upgrade</c>: upgrade a database written by
+        /// 0.18 to the current format, in place, before opening it. Returns
+        /// the JSON report: <c>{"moved":false}</c> when nothing needed
+        /// upgrading, or <c>{"moved":true,"backup":"..."}</c> naming the kept
+        /// original.</summary>
+        public static string Upgrade(string path)
+        {
+            IntPtr r = Native.sekejap_upgrade(path);
+            if (r == IntPtr.Zero) throw Interop.Fail("upgrade");
+            return Interop.TakeString(r);
+        }
+
         /// <summary><c>sekejap_version</c>: <c>MAJOR.MINOR.PATCH</c>, e.g. "0.17.0".</summary>
         public static string Version() => Interop.TakeStaticString(Native.sekejap_version());
 

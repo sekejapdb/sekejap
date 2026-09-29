@@ -139,6 +139,7 @@ _SIGNATURES = (
     ("sekejap_open_service", [c_char_p], c_void_p),
     ("sekejap_close", [c_void_p], None),
     ("sekejap_version", [], c_char_p),
+    ("sekejap_upgrade", [c_char_p], c_void_p),
     ("sekejap_format_version", [], c_int32),
     # -- errors and memory ---------------------------------------------------
     ("sekejap_last_error", [c_void_p], c_void_p),

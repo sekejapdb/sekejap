@@ -29,7 +29,7 @@ each `IDisposable`, exceptions (`SekejapException`, carrying the closed
 using Sekejap;
 
 using var db = SekejapDb.Open("./data");         // IDisposable -> closes on scope exit
-Console.WriteLine(SekejapDb.Version());           // "0.19.0"
+Console.WriteLine(SekejapDb.Version());           // "0.19.1"
 
 db.CreateCollection("places",
     "[{\"name\":\"name\",\"kind\":\"text\"},{\"name\":\"area\",\"kind\":\"text\"}]");
@@ -146,7 +146,7 @@ This wrapper has not been built or run with `dotnet` yet -- neither
   `wrappers/csharp/native/<rid>/native/`, then `dotnet pack Sekejap/Sekejap.csproj`
   (the csproj packs `../native/**` under `runtimes/`). `DllImport("sekejap")`
   resolves the right `libsekejap.{so,dylib}` / `sekejap.dll` per platform.
-  `PackageId` is `Sekejap`, `Version` is `0.19.0` in step with the workspace.
+  `PackageId` is `Sekejap`, `Version` is `0.19.1` in step with the workspace.
 - **Unity:** place `libsekejap` for each platform under `Assets/Plugins/<platform>/`
   and add the `Sekejap` assembly.
 - **CI / release job:** this wrapper's publish job in

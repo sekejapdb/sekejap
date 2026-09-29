@@ -52,6 +52,7 @@ from ._db import (
     last_error_code,
     library_path,
     open_memory,
+    upgrade,
     version,
 )
 from ._ffi import SEKEJAP_LIBRARY_ENV, LibraryNotFound
@@ -75,6 +76,7 @@ __all__ = [
     "LibraryNotFound",
     "SEKEJAP_LIBRARY_ENV",
     "version",
+    "upgrade",
     "format_version",
     "library_path",
     "last_error",
@@ -83,7 +85,7 @@ __all__ = [
     "DataFrameAccessor",
 ]
 
-__version__ = "0.19.0"
+__version__ = "0.19.1"
 
 
 def _dataframe_accessor(self):

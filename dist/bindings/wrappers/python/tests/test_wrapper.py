@@ -60,6 +60,12 @@ def test_the_wrapper_reports_the_library_version_and_disk_format():
     assert sekejap.library_path()
 
 
+def test_upgrade_leaves_a_current_or_missing_database_alone(tmp_path):
+    assert sekejap.upgrade(str(tmp_path / "absent")) is None
+    Db(str(tmp_path / "store")).close()
+    assert sekejap.upgrade(str(tmp_path / "store")) is None
+
+
 def test_the_package_carries_no_compiled_extension_of_its_own():
     # The binding is ctypes over the C ABI: the only native code is the
     # library it loads, which is not part of this package's source.

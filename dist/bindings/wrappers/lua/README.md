@@ -53,7 +53,7 @@ source (`dist/ffi/sekejap.pc.in` / the packaging step that stages
 
 ```lua
 local sekejap = require("sekejap")
-print(sekejap.version())                    -- "0.19.0"
+print(sekejap.version())                    -- "0.19.1"
 
 local db = sekejap.open("./data")            -- a directory on disk
 
@@ -155,7 +155,7 @@ and a by-name refusal) that both surface `sekejap_last_error()`.
 
 ## Gaps in the C ABI / build found while wrapping
 
-None in the C ABI itself: all 59 functions in `dist/ffi/include/sekejap.h`
+None in the C ABI itself: all 60 functions in `dist/ffi/include/sekejap.h`
 bind cleanly and the full checklist above runs against the real library.
 
 - `CREATE PROPERTY GRAPH` (naming a graph context for `GRAPH_TABLE`) is
@@ -182,11 +182,11 @@ once the rock builds against a real `libsekejap`:
 
 ```bash
 # from this directory, with a LuaRocks API key configured:
-luarocks upload sekejap-0.19.0-1.rockspec --api-key=<your-api-key>
+luarocks upload sekejap-0.19.1-1.rockspec --api-key=<your-api-key>
 
 # or build + install locally, then push the same rockspec:
-luarocks make sekejap-0.19.0-1.rockspec
-luarocks upload sekejap-0.19.0-1.rockspec --api-key=<your-api-key>
+luarocks make sekejap-0.19.1-1.rockspec
+luarocks upload sekejap-0.19.1-1.rockspec --api-key=<your-api-key>
 ```
 
 The rockspec's `source.url` is the sekejap repository

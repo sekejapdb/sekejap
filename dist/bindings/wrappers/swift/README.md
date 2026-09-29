@@ -89,7 +89,7 @@ SwiftPM consumes packages from a **Git URL whose root has a `Package.swift`**
 -- so, unlike Go's subdirectory module, sekejap's Swift package needs its own
 distribution repo. The plan (unchanged from before this repoint):
 
-**To publish via SwiftPM** (`.package(url: …, from: "0.19.0")`), three steps
+**To publish via SwiftPM** (`.package(url: …, from: "0.19.1")`), three steps
 -- best done together in an Xcode session on real hardware:
 
 1. **Create `sekejapdb/sekejap-swift`** (a small repo whose root is a

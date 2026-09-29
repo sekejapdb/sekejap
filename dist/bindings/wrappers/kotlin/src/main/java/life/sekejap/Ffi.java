@@ -115,6 +115,7 @@ final class Ffi {
     private static final MethodHandle OPEN_SERVICE = h("sekejap_open_service", FunctionDescriptor.of(PTR, PTR));
     private static final MethodHandle CLOSE = h("sekejap_close", FunctionDescriptor.ofVoid(PTR));
     private static final MethodHandle VERSION = h("sekejap_version", FunctionDescriptor.of(PTR));
+    private static final MethodHandle UPGRADE = h("sekejap_upgrade", FunctionDescriptor.of(PTR, PTR));
     private static final MethodHandle FORMAT_VERSION = h("sekejap_format_version", FunctionDescriptor.of(I32));
 
     // 4.2 errors and memory
@@ -242,6 +243,14 @@ final class Ffi {
         try {
             MemorySegment out = (MemorySegment) VERSION.invokeExact();
             return out.reinterpret(Long.MAX_VALUE).getString(0); // static: never freed
+        } catch (Throwable e) { throw wrap(e); }
+    }
+
+    /** The JSON answer of {@code sekejap_upgrade}, or null on failure. */
+    static String upgrade(String path) {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment out = (MemorySegment) UPGRADE.invokeExact(str(a, path));
+            return takeString(out);
         } catch (Throwable e) { throw wrap(e); }
     }
 

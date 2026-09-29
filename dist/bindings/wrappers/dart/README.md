@@ -206,7 +206,7 @@ a UI.
 
 ## API mapping
 
-One Dart call per C function, all 59 of them. `docs/dist/C_ABI.md` is the
+One Dart call per C function, all 60 of them. `docs/dist/C_ABI.md` is the
 contract; `lib/src/bindings.dart` is the only file that names a C symbol.
 
 | C | Dart |

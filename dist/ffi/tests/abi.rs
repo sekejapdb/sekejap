@@ -145,6 +145,40 @@ fn the_version_string_is_static_and_the_format_version_is_two() {
     assert_eq!(sekejap_format_version(), 2);
 }
 
+/// A 0.18 database upgrades once, keeps its original beside it, then opens;
+/// a second call and a missing path both answer "nothing moved".
+#[test]
+fn upgrade_moves_a_release_file_once_and_keeps_the_original() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let from = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/release-fixtures/0.18.3/checkpointed");
+    let db = dir.path().join("db");
+    std::fs::create_dir(&db).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() != "EXPECTED.json" {
+            std::fs::copy(entry.path(), db.join(entry.file_name())).unwrap();
+        }
+    }
+    let path = c(db.to_str().unwrap());
+
+    let first = take_json(unsafe { sekejap_upgrade(path.as_ptr()) });
+    assert_eq!(first["moved"], json!(true));
+    let backup = first["backup"].as_str().expect("the kept original");
+    assert!(std::path::Path::new(backup).is_dir(), "{backup}");
+
+    let handle = unsafe { sekejap_open(path.as_ptr()) };
+    assert!(!handle.is_null(), "{:?}", last(ptr::null_mut()));
+    unsafe { sekejap_close(handle) };
+
+    let again = take_json(unsafe { sekejap_upgrade(path.as_ptr()) });
+    assert_eq!(again, json!({"moved": false}));
+    let missing = c(dir.path().join("absent").to_str().unwrap());
+    let none = take_json(unsafe { sekejap_upgrade(missing.as_ptr()) });
+    assert_eq!(none, json!({"moved": false}));
+    assert!(unsafe { sekejap_upgrade(ptr::null()) }.is_null());
+}
+
 // ── §2 documents against a BTreeMap oracle ──────────────────────────────────
 
 #[test]

@@ -8,7 +8,7 @@ It runs inside your application, like SQLite, with no separate server to install
 
 It's available as a Rust/Python/Dart/Kotlin/Swift/Node.js/Go library, and a command-line tool.
 
-📝 **Changelog:** [CHANGELOG.md](CHANGELOG.md) — 0.18.0 makes graph queries ISO GQL inside `GRAPH_TABLE`, writes edges in SQL through edge tables, and adds PostGIS geometry input and output and named schemas. A 0.17 database opens as it is. 0.18.1: the API and every binding list tables in named schemas and describe edge tables. 0.18.2: `LIKE`/`ILIKE` with any pattern and no setup, keys from the declared primary key, `to_tsquery` prefixes. 0.18.3: ORDER BY on any column with several keys, NULL where PostgreSQL puts it, and row comparison for "load more". 0.18.4: a fix to the full-text index after updates and deletes. 0.18.5: 30 correctness and robustness fixes from a two-reviewer audit, among them a server that stopped accepting writes after 16 MiB of log, `EXCLUDED` defaults, reads inside a wire transaction, and a torn last log frame. 0.19.0: a new file format built to last (every catalog fact in one checksummed structure), columns with stable ids so `RENAME`/`DROP COLUMN` work on tables with rows and on edge tables, `ADD COLUMN ... DEFAULT` that reaches existing rows, schema moves and renames, and `sekejap-upgrade` to move a 0.18 database.
+📝 **Changelog:** [CHANGELOG.md](CHANGELOG.md) — 0.18.0 makes graph queries ISO GQL inside `GRAPH_TABLE`, writes edges in SQL through edge tables, and adds PostGIS geometry input and output and named schemas. A 0.17 database opens as it is. 0.18.1: the API and every binding list tables in named schemas and describe edge tables. 0.18.2: `LIKE`/`ILIKE` with any pattern and no setup, keys from the declared primary key, `to_tsquery` prefixes. 0.18.3: ORDER BY on any column with several keys, NULL where PostgreSQL puts it, and row comparison for "load more". 0.18.4: a fix to the full-text index after updates and deletes. 0.18.5: 30 correctness and robustness fixes from a two-reviewer audit, among them a server that stopped accepting writes after 16 MiB of log, `EXCLUDED` defaults, reads inside a wire transaction, and a torn last log frame. 0.19.0: a new file format built to last (every catalog fact in one checksummed structure), columns with stable ids so `RENAME`/`DROP COLUMN` work on tables with rows and on edge tables, `ADD COLUMN ... DEFAULT` that reaches existing rows, schema moves and renames, and `sekejap-upgrade` to move a 0.18 database. 0.19.1: the same upgrade as one call in the C ABI and every binding, so an application can run it at startup.
 
 📖 **Documentation:** [`docs/lang/GQL_PROFILE.md`](docs/lang/GQL_PROFILE.md) (graph queries, with examples), [`docs/lang/QL_CONTRACT.md`](docs/lang/QL_CONTRACT.md) (the query language), [`docs/dist/RUST_API.md`](docs/dist/RUST_API.md) (the Rust surface), and [`docs/core/GRAPH_CONTRACT.md`](docs/core/GRAPH_CONTRACT.md) (edge semantics).
 
@@ -111,7 +111,7 @@ flutter pub add sekejap             # or: dart pub add sekejap
 ```kotlin
 // desktop / server JVM, Kotlin or Java, over JDK FFM downcalls
 dependencies {
-  implementation("life.sekejap:sekejap-ffm:0.19.0")
+  implementation("life.sekejap:sekejap-ffm:0.19.1")
 }
 ```
 

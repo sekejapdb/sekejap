@@ -159,6 +159,16 @@ class Db private constructor(handle: Long) : AutoCloseable {
             fail("sekejap_open_memory")
         }
 
+        /**
+         * Move a database a 0.18 release wrote to the 0.19 format, once, before
+         * [open]; 0.19 opens no 0.18 file until then. Safe on every start: a 0.19
+         * file or a missing path is left alone. Answers JSON: `{"moved": false}`,
+         * or `{"moved": true, "backup": "<path>"}` where the untouched 0.18
+         * original now lives. Nothing may have the database open meanwhile.
+         */
+        @JvmStatic
+        fun upgrade(path: String): String = Ffi.upgrade(path) ?: fail("sekejap_upgrade")
+
         /** The library version, as `MAJOR.MINOR.PATCH`. */
         @JvmStatic
         fun version(): String = Ffi.version()
