@@ -81,6 +81,22 @@ fn read_frame(file: &dyn FileIo, off: u64) -> Result<Vec<u8>> {
     if &b[..8]!=MAGIC || crc32c::crc32c(&b)!=want {return Err(bad("page WAL frame checksum/magic"));}
     b[28..32].copy_from_slice(&want.to_le_bytes());Ok(b)
 }
+/// The damaged frame at `at` is a torn tail: it and every complete frame
+/// after it end in a zero sector (their last sector never landed), and none
+/// after it verifies (the log did not go on past the damage).
+fn torn_tail(file:&dyn FileIo,at:u64,len:u64)->bool {
+    const SECTOR:usize=512;
+    let mut next=at;
+    while next+FRAME as u64<=len {
+        let mut end=[0u8;SECTOR];
+        if file.read_at(&mut end,next+(FRAME-SECTOR) as u64).is_err() || end.iter().any(|b|*b!=0) {
+            return false;
+        }
+        if next>at && read_frame(file,next).is_ok() { return false; }
+        next+=FRAME as u64;
+    }
+    true
+}
 fn read_indexed_frame(file:&dyn FileIo,reference:FrameRef)->Result<Vec<u8>> {
     let bytes=read_frame(file,reference.offset as u64)?;
     if u32at(&bytes,28)!=reference.checksum {
@@ -421,9 +437,19 @@ impl Pager {
         s.hint_current=true;Ok(())
     }
     fn inspect(data:&dyn FileIo,wal:&dyn FileIo)->Result<State>{ Self::inspect_bounded(data,wal,None) }
-    // Strict posture always: a complete bad frame refuses. With `bound`, only
-    // `[0, bound)` is read (a reader pinned to a published prefix); without
-    // it the whole file, discarding an incomplete uncommitted tail.
+    // Strict posture: a complete bad frame refuses -- with ONE exception, a
+    // torn tail (finding vuln-f04). Frames are appended with no barrier until
+    // the commit, so a power loss can persist a frame's full length but not
+    // its bytes. A frame that fails its checksum ends the log when it lies
+    // past the last verified commit, no frame after it verifies, and it and
+    // every frame after it end in a zero sector -- their last sector never
+    // reached the disk (a written frame ends with the database identity, so
+    // bit rot in a frame that did land still refuses). Nothing acknowledged
+    // depends on such a tail, and the opener truncates it as it does a short
+    // one. Anywhere else damage refuses. With `bound`, only
+    // `[0, bound)` is read (a reader pinned to a published prefix, which is
+    // all committed) and the exception does not apply; without it the whole
+    // file, discarding an incomplete uncommitted tail.
     fn inspect_bounded(data:&dyn FileIo,wal:&dyn FileIo,bound:Option<u64>)->Result<State>{
         let disk = disk_header(data)?;
         let len=match bound {Some(b)=>b,None=>wal.len()?};
@@ -441,7 +467,13 @@ impl Pager {
         let mut pending_header = None;
         let mut floor_proven = false;
         while at+FRAME as u64<=len {
-            let b=read_frame(wal,at)?;
+            let b=match read_frame(wal,at) {
+                Ok(b)=>b,
+                Err(e)=>{
+                    if bound.is_none() && torn_tail(wal,at,len) { break; }
+                    return Err(e);
+                }
+            };
             if b[32+PAGE..] != identity { return Err(bad("WAL belongs to another database")); }
             if at == 0 {
                 tx = u64at(&b,16);
