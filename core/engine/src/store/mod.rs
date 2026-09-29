@@ -233,6 +233,10 @@ impl Backend {
     pub fn wal_bytes(&self) -> u64 {
         self.store.wal_bytes()
     }
+    /// The committed WAL has reached the size a fold is attempted at.
+    pub fn checkpoint_due(&self) -> bool {
+        self.store.checkpoint_due()
+    }
     /// The managed-byte allowance one transaction may occupy.
     pub fn wal_allowance(&self) -> u64 {
         self.store.wal_allowance()

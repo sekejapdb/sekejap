@@ -270,6 +270,16 @@ impl<'a> Connection<'a> {
         self.sink = Some(sink);
     }
 
+    /// Called by the server while the connection waits for its client: the
+    /// snapshot this connection keeps between statements holds a reader
+    /// slot, and while the service wants the log folded it is let go -- the
+    /// next statement mints a fresh one (finding vuln-f01).
+    pub fn idle(&mut self) {
+        if self.service.fold_wanted() {
+            self.reader = None;
+        }
+    }
+
     /// The pair this connection published in `BackendKeyData`.
     pub fn backend_key(&self) -> BackendKey {
         self.backend
@@ -367,6 +377,8 @@ impl<'a> Connection<'a> {
         if at > 0 {
             self.inbuf.drain(..at);
         }
+        // The round trip is over: let the snapshot go if a fold waits on it.
+        self.idle();
         out
     }
 
@@ -1001,7 +1013,9 @@ impl<'a> Connection<'a> {
         }
         self.refresh_reader()?;
         let snapshot = self.reader.as_ref().expect("refresh_reader mints one");
-        snapshot.with(|db| walk_on(db, sql, params, body, formats, budget, &mut cancelled))
+        snapshot
+            .try_with(|db| walk_on(db, sql, params, body, formats, budget, &mut cancelled))
+            .map_err(|e| types::wire_error(&ServiceError::Core(e)))?
     }
 
     /// Run a statement through the service's single WRITER, committing it
@@ -1513,20 +1527,22 @@ impl<'a> Connection<'a> {
         let Some(snapshot) = self.reader.as_ref() else {
             return (None, Vec::new());
         };
-        snapshot.with(|db| {
-            let db: &Database = db;
-            let Ok(prepared) =
-                sekejap_lang::prepare_sql_with(db, trimmed, &probe, budget, &mut || false)
-            else {
-                return (None, Vec::new());
-            };
-            let fields = if prepared.is_select() || prepared.is_aggregate() {
-                field_descriptions(db, &prepared)
-            } else {
-                vec![text_field("QUERY PLAN")]
-            };
-            (Some(fields), prepared.param_types())
-        })
+        snapshot
+            .try_with(|db| {
+                let db: &Database = db;
+                let Ok(prepared) =
+                    sekejap_lang::prepare_sql_with(db, trimmed, &probe, budget, &mut || false)
+                else {
+                    return (None, Vec::new());
+                };
+                let fields = if prepared.is_select() || prepared.is_aggregate() {
+                    field_descriptions(db, &prepared)
+                } else {
+                    vec![text_field("QUERY PLAN")]
+                };
+                (Some(fields), prepared.param_types())
+            })
+            .unwrap_or((None, Vec::new()))
     }
 
     /// The typed columns an `INSERT ... RETURNING` answers, compiled (never
@@ -1540,14 +1556,17 @@ impl<'a> Connection<'a> {
         let budget = self.budget();
         self.refresh_reader().ok()?;
         let snapshot = self.reader.as_ref()?;
-        snapshot.with(|db| {
-            let db: &Database = db;
-            let prepared =
-                sekejap_lang::prepare_sql_with(db, trimmed, params, budget, &mut || false).ok()?;
-            prepared
-                .returns_rows_from_a_write()
-                .then(|| field_descriptions(db, &prepared))
-        })
+        snapshot
+            .try_with(|db| {
+                let db: &Database = db;
+                let prepared =
+                    sekejap_lang::prepare_sql_with(db, trimmed, params, budget, &mut || false).ok()?;
+                prepared
+                    .returns_rows_from_a_write()
+                    .then(|| field_descriptions(db, &prepared))
+            })
+            .ok()
+            .flatten()
     }
 
     // ── §9.3 notifications ───────────────────────────────────────────────

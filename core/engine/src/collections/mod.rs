@@ -1419,6 +1419,12 @@ impl Database {
         let s = self.store()?;
         Ok((s.data_bytes(), s.wal_bytes()))
     }
+    /// The committed WAL has reached the size at which the automatic
+    /// checkpoint folds it. A holder of long-lived snapshots (the service)
+    /// asks this to know when to give their slots back for a fold.
+    pub fn checkpoint_due(&self) -> Result<bool> {
+        Ok(self.store()?.checkpoint_due())
+    }
     /// Distinct pages held by the WAL index since the last checkpoint: what a
     /// persisted `tracked_pages` policy bounds. `None` for snapshots.
     pub fn tracked_pages(&self) -> Result<Option<usize>> {

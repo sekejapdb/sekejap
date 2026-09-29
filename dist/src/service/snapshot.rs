@@ -26,7 +26,10 @@
 //! persisted `readers` slots -- the bound §1 says a service must refuse
 //! past, never block on.
 
-use sekejap_core::collections::Database;
+use kernel::store::Config;
+use sekejap_core::collections::{Database, Error as CoreError};
+use std::ops::{Deref, DerefMut};
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -40,17 +43,32 @@ pub const PUBLISH_INTERVAL_DEFAULT: Duration = Duration::from_millis(100);
 ///
 /// It holds one reader slot for as long as any `Arc` to it lives, which
 /// DEFERS the writer's checkpoint and blocks nothing.
+///
+/// The one exception is the service's own fold (finding vuln-f01): when a
+/// commit leaves the log due and NO caller holds the published view, the
+/// service gives that view's slot back, folds the log and publishes a fresh
+/// view. Nobody held the released one, so nobody saw it change; were it
+/// picked up again before the fresh view replaced it, it re-opens on the
+/// newest published transaction.
 pub struct Snapshot {
-    db: Mutex<Database>,
+    db: Mutex<Option<Database>>,
+    source: (PathBuf, Config),
     serial: u64,
     published_at: Instant,
     open_cost: Duration,
 }
 
 impl Snapshot {
-    pub(super) fn new(db: Database, serial: u64, published_at: Instant, open_cost: Duration) -> Self {
+    pub(super) fn new(
+        db: Database,
+        source: (PathBuf, Config),
+        serial: u64,
+        published_at: Instant,
+        open_cost: Duration,
+    ) -> Self {
         Self {
-            db: Mutex::new(db),
+            db: Mutex::new(Some(db)),
+            source,
             serial,
             published_at,
             open_cost,
@@ -87,12 +105,51 @@ impl Snapshot {
     /// also serves; this handle refuses every one of them with
     /// `Error::ReadOnly`, which is the engine's own single-writer rule doing
     /// the work rather than a second rule here.
+    ///
+    /// # Panics
+    ///
+    /// Only when this view was released for a fold and re-opening it fails;
+    /// [`Snapshot::try_with`] returns that error instead.
     pub fn with<T>(&self, body: impl FnOnce(&mut Database) -> T) -> T {
-        let mut guard = self.lock();
-        body(&mut guard)
+        self.try_with(body)
+            .unwrap_or_else(|e| panic!("a released snapshot could not be re-opened: {e}"))
     }
 
-    pub(super) fn lock(&self) -> MutexGuard<'_, Database> {
-        self.db.lock().unwrap_or_else(|e| e.into_inner())
+    /// [`Snapshot::with`], returning the error of re-opening a view the
+    /// service released for a fold instead of panicking.
+    pub fn try_with<T>(&self, body: impl FnOnce(&mut Database) -> T) -> Result<T, CoreError> {
+        let mut guard = self.lock()?;
+        Ok(body(&mut guard))
+    }
+
+    pub(super) fn lock(&self) -> Result<SnapshotGuard<'_>, CoreError> {
+        let mut guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let (path, config) = &self.source;
+            *guard = Some(Database::open_snapshot(path, *config)?);
+        }
+        Ok(SnapshotGuard(guard))
+    }
+
+    /// Give this view's reader slot back, for the service's fold. Waits for
+    /// a walk in progress on it to finish.
+    pub(super) fn release(&self) {
+        *self.db.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// The locked handle of a [`Snapshot`], always open.
+pub(super) struct SnapshotGuard<'a>(MutexGuard<'a, Option<Database>>);
+
+impl Deref for SnapshotGuard<'_> {
+    type Target = Database;
+    fn deref(&self) -> &Database {
+        self.0.as_ref().expect("Snapshot::lock opens it first")
+    }
+}
+
+impl DerefMut for SnapshotGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Database {
+        self.0.as_mut().expect("Snapshot::lock opens it first")
     }
 }

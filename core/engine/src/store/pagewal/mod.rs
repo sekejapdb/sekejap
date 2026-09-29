@@ -1238,6 +1238,9 @@ impl PageWalStore {
         snapshot_store(p,self._lock.clone(),&self.dir,self.cache,Some(slot))
     }
     pub fn wal_bytes(&self)->u64 {self.pager.as_ref().map_or(0,|p|p.state.lock().unwrap().end)}
+    /// The committed log has reached the size a fold is attempted at (the
+    /// same rule the automatic checkpoint uses). `false` for a snapshot.
+    pub fn checkpoint_due(&self)->bool {self.pager.as_ref().is_some_and(|p|p.checkpoint_due())}
     /// Bytes of WAL one transaction may ever occupy: the fixed managed-byte
     /// allowance (`WAL_CAP`), or the smaller `wal_bytes` policy when one is
     /// installed. `append` refuses past either, so a caller that must finish

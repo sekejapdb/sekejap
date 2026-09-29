@@ -910,3 +910,39 @@ fn a_dropped_writer_leaves_nothing_behind_with_no_subscriber() {
     assert!(db.get(fixture.collection, "k999999").unwrap().is_none(), "the abandoned put was committed");
     assert!(db.get(fixture.collection, "k000100").unwrap().is_some(), "the next writer's own commit holds");
 }
+
+/// Finding vuln-f01 (0.18.5): the service kept its published view -- one
+/// reader slot -- alive at every instant, minting the replacement before
+/// dropping the old one, so no checkpoint could ever exclude every reader.
+/// Committed frames piled up until the page-WAL's 16 MiB allowance refused
+/// every write. The service now folds the log at a commit that leaves it
+/// due: the published view gives its slot back, the log folds, and the view
+/// is minted again. About 24 MiB of commits, read between each, all land.
+#[test]
+fn the_service_folds_its_log_so_writing_never_stops() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("db");
+    {
+        let mut db = Database::create(&path, config()).unwrap();
+        use sekejap_lang::SqlDatabase;
+        db.sql("CREATE TABLE note (_key TEXT PRIMARY KEY, body TEXT) WITH (index: none)", &[]).unwrap();
+        db.commit().unwrap();
+    }
+    let service = ServiceDatabase::open(&path, config()).unwrap();
+    service.set_publish_interval(Duration::ZERO);
+    let body = "reef lagoon terrace ".repeat(150);
+    for batch in 0..400 {
+        let mut writer = service.writer();
+        let values: Vec<String> = (0..20).map(|i| format!("('n{batch:04}-{i:02}', '{body}')")).collect();
+        writer
+            .sql(&format!("INSERT INTO note (_key, body) VALUES {}", values.join(", ")), &[])
+            .unwrap_or_else(|e| panic!("batch {batch}: {e}"));
+        writer.commit().unwrap_or_else(|e| panic!("commit {batch}: {e}"));
+        drop(writer);
+        let reader = service.reader();
+        assert_eq!(
+            count_on(&service, &reader, &format!("SELECT _key FROM note WHERE _key = 'n{batch:04}-00'")),
+            1
+        );
+    }
+}

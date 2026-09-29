@@ -197,7 +197,7 @@ impl Db {
             }
             Backing::Service(s) => {
                 let snapshot: std::sync::Arc<Snapshot> = s.reader();
-                snapshot.with(|db| body(db))
+                snapshot.try_with(|db| body(db))?
             }
         }
     }
@@ -218,7 +218,7 @@ impl Db {
             }
             Backing::Service(s) => {
                 let snapshot: std::sync::Arc<Snapshot> = s.reader();
-                snapshot.with(|db| body(db))
+                snapshot.try_with(|db| body(db))?
             }
         }
     }

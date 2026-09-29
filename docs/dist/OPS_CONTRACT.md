@@ -128,6 +128,18 @@ to mint a snapshot past that bound rather than block: **a service that blocks a
 reader to honour a reader bound has broken L6 to satisfy L1**, and the refusal
 is the correct shape.
 
+**The fold point (0.18.5).** A deferred checkpoint must still happen: the
+page-WAL refuses every write once its committed log reaches its 16 MiB
+allowance. The published view holds a slot at every instant, so the service
+folds at a commit that leaves the log due (`Database::checkpoint_due`): when
+no caller holds the published view, the view gives its slot back, the log
+folds, and a fresh view is published. A slot held elsewhere defers the fold
+to a later commit and raises `ServiceDatabase::fold_wanted`; a wire
+connection then lets its own between-statement snapshot go at the end of a
+round trip or on the server's idle poll. A caller that keeps a view of its
+own for a long time holds the fold off, as a long reader holds off SQLite's
+WAL reset. Opening a service folds a log the last run left due.
+
 **BUILT.** `dist/src/service/mod.rs:142` (`ServiceDatabase`), `:173`
 (`open`), `:209` (`writer`), `:220` (`try_writer`, the named in-process
 refusal), `:249` (`reader`), `:259` (`open_reader`), `:504` (`close`), and

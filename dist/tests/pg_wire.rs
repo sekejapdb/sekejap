@@ -1470,3 +1470,27 @@ fn a_transaction_reads_its_own_writes() {
     assert!(first(&ask(&mut one, "COMMIT"), b'E').is_none());
     assert_eq!(name_of(&mut two, "k900000"), [[Some("new".to_owned())]]);
 }
+
+/// Finding vuln-f01 (0.18.5), the wire half: every connection keeps its own
+/// snapshot between statements, one reader slot each, so one idle
+/// connection that had read once held the log's fold off forever and the
+/// writers stopped at 16 MiB. A connection lets its snapshot go when the
+/// service wants a fold -- at the end of a round trip, or on the server's
+/// idle poll (`Connection::idle`) -- and the writes go on.
+#[test]
+fn an_idle_reader_connection_does_not_stop_the_log_folding() {
+    let fixture = build(4);
+    let mut reader = connect(&fixture.service, 1);
+    let mut writer = connect(&fixture.service, 2);
+    assert!(first(&ask(&mut writer, "CREATE TABLE note (_key TEXT PRIMARY KEY, body TEXT) WITH (index: none)"), b'E').is_none());
+    assert_eq!(rows_of(&ask(&mut reader, "SELECT id FROM place")).len(), 4);
+    let body = "reef lagoon terrace ".repeat(150);
+    for batch in 0..400 {
+        let values: Vec<String> = (0..20).map(|i| format!("('n{batch:04}-{i:02}', '{body}')")).collect();
+        let got = ask(&mut writer, &format!("INSERT INTO note (_key, body) VALUES {}", values.join(", ")));
+        assert!(first(&got, b'E').is_none(), "batch {batch}: {:?}", first(&got, b'E').map(|f| String::from_utf8_lossy(&f.body).into_owned()));
+        // The server's idle poll, while this connection waits for a query.
+        reader.idle();
+    }
+    assert_eq!(rows_of(&ask(&mut reader, "SELECT _key FROM note WHERE _key = 'n0399-19'")).len(), 1);
+}
