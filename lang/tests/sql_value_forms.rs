@@ -20,7 +20,10 @@
 //!   built; a `v` with an upper-case letter names none
 //!   (`lower_equality_is_a_row_check_without_its_expression_index`);
 //! * a LIKE inside OR is refused with a reason that does not claim the
-//!   trigram index is missing (`a_like_under_or_is_refused_without_blaming_the_index`).
+//!   trigram index is missing (`a_like_under_or_is_refused_without_blaming_the_index`);
+//! * a TEXT value too long for its column's btree is refused naming the
+//!   column, the index and the two ways out, and writes nothing
+//!   (`a_value_too_long_for_the_index_names_the_index_and_the_way_out`).
 
 use kernel::{
     io::IoMode,
@@ -232,4 +235,24 @@ fn a_like_under_or_is_refused_without_blaming_the_index() {
     let message = refusal(&mut db, "SELECT _key FROM people WHERE name ILIKE '%nna%' OR name ILIKE '%obb%'");
     assert!(!message.contains("has no index"), "{message}");
     assert!(message.contains("trigram index"), "{message}");
+}
+
+#[test]
+fn a_value_too_long_for_the_index_names_the_index_and_the_way_out() {
+    let dir = TempDir::new().unwrap();
+    let mut db = Database::create(&dir.path().join("b"), cfg()).unwrap();
+    run(&mut db, "CREATE TABLE profiles (_key TEXT PRIMARY KEY, bio TEXT)");
+    let long = "a".repeat(1_500);
+    let message = refusal(&mut db, &format!("INSERT INTO profiles (_key, bio) VALUES ('p', '{long}')"));
+    for needle in ["bio", "profiles_bio_btree", "1024", "DROP INDEX", "WITH (index:"] {
+        assert!(message.contains(needle), "`{needle}` missing from: {message}");
+    }
+    // A raw handle waits for the caller's ROLLBACK after a failed write, so
+    // nothing half-written can be committed (`sekejap::Db` rolls back itself).
+    run(&mut db, "ROLLBACK");
+    assert_eq!(keys(&mut db, "SELECT _key FROM profiles WHERE _key = 'p'"), Vec::<String>::new());
+    // The way out the message names works.
+    run(&mut db, "DROP INDEX profiles_bio_btree");
+    run(&mut db, &format!("INSERT INTO profiles (_key, bio) VALUES ('p', '{long}')"));
+    assert_eq!(row(&mut db, "SELECT bio FROM profiles WHERE _key = 'p'"), [SqlValue::Text(long)]);
 }

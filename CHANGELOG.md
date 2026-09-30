@@ -23,6 +23,11 @@ Fixes and small PostgreSQL forms found by running a real application on
 - Clearer refusals: a LIKE inside OR/AND/NOT no longer says it "has no
   index" when a trigram index serves it on its own, and the OFFSET refusal
   shows the keyset rewrite to copy.
+- **A TEXT value over 1024 bytes in an indexed column** is still refused
+  (a btree key holds at most 1024 bytes), but the refusal now names the
+  column and the index and the two ways out: `DROP INDEX <name>`, or
+  `CREATE TABLE ... WITH (index: [...])` to leave a long-text column out of
+  the automatic indexes. Indexing long values by prefix is planned for 0.20.
 
 ## 0.19.1
 

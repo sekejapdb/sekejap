@@ -1699,8 +1699,20 @@ impl Database {
                     }
                 }
             };
+            // A new value too long for a text key is refused naming the
+            // column, the index and the two ways out; the bare limit alone
+            // says nothing about which of a table's automatic indexes met it.
+            let too_long = |error: Error| match error {
+                Error::InvalidInput(message) if message.contains("exceeds 1024") => {
+                    Error::InvalidInput(format!(
+                        "`{}` is longer than 1024 UTF-8 bytes, which the btree index `{}` over it cannot hold as a key. A column holding long text (a bio, a description) needs no btree: `DROP INDEX {}`, or leave the column out of the automatic indexes with `CREATE TABLE ... WITH (index: [...])`",
+                        i.field, i.name, i.name
+                    ))
+                }
+                other => other,
+            };
             let a = old.map(&derived).transpose()?;
-            let b = new.map(&derived).transpose()?;
+            let b = new.map(&derived).transpose().map_err(too_long)?;
             if a == b {
                 continue;
             }
