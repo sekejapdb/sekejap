@@ -49,6 +49,12 @@ jobs:
       # --workspace: default-members is core/engine alone, so without it the
       # kernel, the SQL layer, dist and its doc examples never ran here.
       - run: cargo test --release --workspace --no-fail-fast --features ${{ env.FEATURES }}
+      # Every target under every feature, as the release publishes them: the
+      # feature-gated dev-bench tools of sekejap-dist are built by nothing
+      # above, and a break in them failed the 0.19.0 publish after CI was
+      # green.
+      - name: Build every target with every feature
+        run: cargo build --release --workspace --all-features --all-targets
       # The one thing the Rust suite cannot prove about the C ABI: that a C
       # COMPILER accepts the generated header and links the library. `make
       # check` compiles examples/smoke.c against the freshly built libsekejap

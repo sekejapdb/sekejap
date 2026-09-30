@@ -24,7 +24,10 @@
 //!
 //! * `REINDEX DATABASE` on a copy -- the upgrader's rebuild -- keeps every
 //!   answer, every row identity and the feature word
-//!   (`a_release_file_reindexes_to_the_same_answers`).
+//!   (`a_release_file_reindexes_to_the_same_answers`);
+//! * a 0.18 file is refused until `sekejap-upgrade` moves it, and moves with
+//!   the same answers; a 0.19 file is left alone by the upgrade and opens as
+//!   it is (`a_019_release_file_needs_no_upgrade`).
 //!
 //! Not here: an OLDER binary reading the file after this build wrote to it
 //! (`L8-COMPAT` remaining, `docs/core/RELEASE_FIXTURES.md`).
@@ -57,6 +60,11 @@ const RELEASES: &[(&str, &str, &[&str])] = &[
     (
         "0.18.5",
         "fac2891114c37938dd7405967eb85b93018c338e15c909fd52bdc96a92b53a73",
+        &["checkpointed", "wal-pending"],
+    ),
+    (
+        "0.19.2",
+        "c1f45d9426cdea2be0e60bd38709c0e4f4c072f781d8db03b1035287f6929da7",
         &["checkpointed", "wal-pending"],
     ),
 ];
@@ -101,6 +109,17 @@ fn fixtures() -> Vec<Fixture> {
         }
     }
     out
+}
+
+/// Whether the fixture is a 0.18-format file, which this build opens only in
+/// 0.18 compatibility and moves with `sekejap-upgrade`.
+fn legacy(fx: &Fixture) -> bool {
+    fx.release.starts_with("0.18.")
+}
+
+/// 0.18 compatibility for a 0.18 fixture's own thread, nothing for a 0.19 one.
+fn pin(fx: &Fixture) -> Option<sekejap_core::internal::LegacyFormat> {
+    legacy(fx).then(sekejap_core::internal::LegacyFormat::pin)
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -210,9 +229,9 @@ fn every_preserved_file_is_the_one_the_release_wrote() {
 
 #[test]
 fn every_release_answer_is_this_builds_answer() {
-    // The 0.18 engine path, which 0.19 keeps for 0.18 compatibility only.
-    let _pin = sekejap_core::internal::LegacyFormat::pin();
     for fx in fixtures() {
+        // The 0.18 engine path, which 0.19 keeps for 0.18 compatibility only.
+        let _pin = pin(&fx);
         verify(&fx);
         let copy = copy(&fx);
         let mut db = Database::open(copy.path(), cfg()).unwrap_or_else(|e| panic!("{}: open: {e}", label(&fx)));
@@ -232,9 +251,9 @@ fn every_release_answer_is_this_builds_answer() {
 
 #[test]
 fn a_release_file_takes_writes_and_reopens() {
-    // The 0.18 engine path, which 0.19 keeps for 0.18 compatibility only.
-    let _pin = sekejap_core::internal::LegacyFormat::pin();
     for fx in fixtures() {
+        // The 0.18 engine path, which 0.19 keeps for 0.18 compatibility only.
+        let _pin = pin(&fx);
         let copy = copy(&fx);
         let (recorded, _) = {
             let db = Database::open(copy.path(), cfg()).unwrap();
@@ -286,9 +305,9 @@ fn a_release_file_takes_writes_and_reopens() {
 
 #[test]
 fn a_release_file_reindexes_to_the_same_answers() {
-    // The 0.18 engine path, which 0.19 keeps for 0.18 compatibility only.
-    let _pin = sekejap_core::internal::LegacyFormat::pin();
     for fx in fixtures() {
+        // The 0.18 engine path, which 0.19 keeps for 0.18 compatibility only.
+        let _pin = pin(&fx);
         let copy = copy(&fx);
         let mut db = Database::open(copy.path(), cfg()).unwrap();
         db.sql("REINDEX DATABASE", &[])
@@ -314,7 +333,7 @@ fn a_release_file_reindexes_to_the_same_answers() {
 #[test]
 fn a_release_file_upgrades_to_a_register_file_with_the_same_answers() {
     use sekejap_core::collections::rebuild::{upgrade_to_register, RebuildLimits};
-    for fx in fixtures() {
+    for fx in fixtures().into_iter().filter(legacy) {
         let copy = copy(&fx);
         let out = tempfile::tempdir().unwrap();
         let dest = out.path().join("upgraded");
@@ -341,12 +360,34 @@ fn a_release_file_upgrades_to_a_register_file_with_the_same_answers() {
 /// says so by name before it touches a byte.
 #[test]
 fn a_release_file_is_refused_by_name_until_upgraded() {
-    for fx in fixtures() {
+    for fx in fixtures().into_iter().filter(legacy) {
         let copy = copy(&fx);
         match Database::open(copy.path(), cfg()) {
             Err(e) => assert!(e.to_string().contains("sekejap-upgrade"), "{}: {e}", label(&fx)),
             Ok(_) => panic!("{}: a 0.18-format file opened without an upgrade", label(&fx)),
         }
+        verify(&fx);
+    }
+}
+
+/// A file a 0.19 release wrote is already in the current format: the upgrade
+/// every application may call on start leaves it byte for byte alone, and it
+/// opens with column ids and no upgrade at all.
+#[test]
+fn a_019_release_file_needs_no_upgrade() {
+    use sekejap_core::collections::upgrade::upgrade_format;
+    for fx in fixtures().into_iter().filter(|fx| !legacy(fx)) {
+        let copy = copy(&fx);
+        let moved = upgrade_format(copy.path(), Default::default())
+            .unwrap_or_else(|e| panic!("{}: upgrade: {e}", label(&fx)));
+        assert!(moved.is_none(), "{}: a 0.19 file was moved", label(&fx));
+        for (name, want) in fx.record["files"].as_object().unwrap() {
+            let bytes = fs::read(copy.path().join(name)).unwrap();
+            assert_eq!(sha256(&bytes), want["sha256"].as_str().unwrap(), "{}: the upgrade touched {name}", label(&fx));
+        }
+        let db = Database::open(copy.path(), cfg()).unwrap_or_else(|e| panic!("{}: open: {e}", label(&fx)));
+        assert!(db.has_column_ids(), "{}: a 0.19 file without column ids", label(&fx));
+        drop(db);
         verify(&fx);
     }
 }

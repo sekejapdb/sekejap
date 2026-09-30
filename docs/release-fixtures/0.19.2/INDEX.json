@@ -1,0 +1,118 @@
+{
+  "databases": [
+    {
+      "checkpointed": true,
+      "expected_sha256": "9ba4dd33128379fea64230ed30d70945f5a6eaef6de3a2465713c37be1bb4e24",
+      "files": {
+        "data": {
+          "bytes": 253952,
+          "sha256": "2cd7aef7c35b6ebc86dba909b9992255a66a11dce691fbd1bba9c4037bbfe86d"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "55a8615148c9b3da6884ff2bb37cab644b67fd260d8f3614d1b47cd7b03f2b0d"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "logical_features": "0x6bffff",
+      "name": "checkpointed"
+    },
+    {
+      "checkpointed": false,
+      "expected_sha256": "404a46e7b882fd98c0800765d1c677741e2e1e41bc1407d37f23dac855dd0892",
+      "files": {
+        "data": {
+          "bytes": 253952,
+          "sha256": "1500c3fb76a6a910925b312cdf7820820e3777f303274583477cc905d7975a05"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "a27dc1947277d3252cfda10ce29f7460aefddd2d33a17e9e3ce3a78dce1c471b"
+        },
+        "wal": {
+          "bytes": 99456,
+          "sha256": "15ceb63a04fa5d3c7c961bfa0f858398caee9124f58157717cf1e6620debd45e"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "logical_features": "0x6bffff",
+      "name": "wal-pending"
+    }
+  ],
+  "release": "0.19.2",
+  "revision": "9e3eccd04c73133f919737447448274707f2d963"
+}

@@ -29,6 +29,13 @@ labels, a dropped table, and rows that were updated, deleted and upserted.
 From 0.18.5 on, also a table whose shape changed while it held rows (ADD
 COLUMN, then DROP COLUMN), so its rows sit under three layouts -- the case the
 0.19 upgrader converts (`docs/core/SUPPORTIVE.md`).
+From 0.19.2 on, also what column ids made possible over rows: a rename, a
+drop and a re-add of the same name, an added column whose DEFAULT existing
+rows read, SET/DROP DEFAULT, SET NOT NULL, a property added to an edge
+table, a table moved to another schema, a renamed index, and an indexed TEXT
+value of exactly the 1024-byte key limit. A 0.19 fixture records the feature
+word a fresh open reads: a finished table drop clears its bit in the
+writer's memory only, and the census keeps the line.
 `INDEX.json` records each database's logical feature word.
 
 A value is recorded exactly: an integer as `{"int": n}`, a float by its bits
@@ -50,7 +57,10 @@ fixture passes by answering nothing.
 3. the copy takes inserts, updates (a point, a vector) and a delete,
    checkpoints and reopens with the feature word still unchanged, answers
    them through the release's indexes and graph, and still refuses what the
-   release refused (a dropped table, `23505`, `23502`).
+   release refused (a dropped table, `23505`, `23502`);
+4. a 0.18 file is refused by name until `sekejap-upgrade` moves it, and the
+   moved file answers every query as the release did; a 0.19 file is left
+   byte for byte alone by the upgrade and opens as it is.
 
 Not yet covered, and why `L8-COMPAT` stays pending: the RELEASED binary
 reading a copy after this build wrote to it (rollback), a fixture per earlier
@@ -93,6 +103,8 @@ fixture's own data and the database's random identity).
 | Release | Commit | Generated |
 |---|---|---|
 | 0.18.3 | `905124a` | 2026-09-28, from the tag, `--locked`, default retained features |
+| 0.18.5 | `f5dc6b2` | from the tag, `--locked`, default retained features |
+| 0.19.2 | `9e3eccd` | 2026-10-01, from the tag, `--locked`, default retained features |
 
 The 0.18.3 fixture also preserves one 0.18.3 behaviour: a text literal
 written into a `JSONB` column is stored as a JSON string, where PostgreSQL

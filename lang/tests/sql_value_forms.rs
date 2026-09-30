@@ -23,7 +23,10 @@
 //!   trigram index is missing (`a_like_under_or_is_refused_without_blaming_the_index`);
 //! * a TEXT value too long for its column's btree is refused naming the
 //!   column, the index and the two ways out, and writes nothing
-//!   (`a_value_too_long_for_the_index_names_the_index_and_the_way_out`).
+//!   (`a_value_too_long_for_the_index_names_the_index_and_the_way_out`);
+//! * a value a column DEFAULT fills is found through the column's index, for
+//!   a DEFAULT declared with the table and one added by ALTER
+//!   (`a_value_the_default_fills_is_found_through_the_index`).
 
 use kernel::{
     io::IoMode,
@@ -255,4 +258,24 @@ fn a_value_too_long_for_the_index_names_the_index_and_the_way_out() {
     run(&mut db, "DROP INDEX profiles_bio_btree");
     run(&mut db, &format!("INSERT INTO profiles (_key, bio) VALUES ('p', '{long}')"));
     assert_eq!(row(&mut db, "SELECT bio FROM profiles WHERE _key = 'p'"), [SqlValue::Text(long)]);
+}
+
+#[test]
+fn a_value_the_default_fills_is_found_through_the_index() {
+    let dir = TempDir::new().unwrap();
+    let mut db = Database::create(&dir.path().join("d"), cfg()).unwrap();
+    run(&mut db, "CREATE TABLE pass (_key TEXT PRIMARY KEY, owner TEXT, tier TEXT DEFAULT 'basic')");
+    run(&mut db, "INSERT INTO pass (_key, owner) VALUES ('a', 'Made')");
+    run(&mut db, "INSERT INTO pass (_key, owner, tier) VALUES ('b', 'Putu', 'gold')");
+    assert_eq!(keys(&mut db, "SELECT _key FROM pass WHERE tier = 'basic'"), ["a"], "declared with the table");
+
+    run(&mut db, "CREATE TABLE later (_key TEXT PRIMARY KEY, owner TEXT)");
+    run(&mut db, "INSERT INTO later (_key, owner) VALUES ('old', 'Made')");
+    run(&mut db, "ALTER TABLE later ADD COLUMN tier TEXT DEFAULT 'basic'");
+    run(&mut db, "INSERT INTO later (_key, owner) VALUES ('new', 'Wayan')");
+    assert_eq!(
+        row(&mut db, "SELECT tier FROM later WHERE _key = 'new'"),
+        [SqlValue::Text("basic".into())]
+    );
+    assert_eq!(keys(&mut db, "SELECT _key FROM later WHERE tier = 'basic'"), ["new", "old"], "added later");
 }

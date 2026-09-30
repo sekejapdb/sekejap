@@ -124,6 +124,59 @@ fn vector(v: &[f64; 4]) -> String {
     format!("[{}, {}, {}, {}]", v[0], v[1], v[2], v[3])
 }
 
+/// What a 0.19 release adds on top of [`populate`], run only when the release
+/// being written is 0.19 or later (`is_019`): column ids -- a rename and a
+/// drop over rows, an added column whose DEFAULT the existing rows read, SET
+/// and DROP DEFAULT, SET NOT NULL -- a property added to an edge table, a
+/// table moved to another schema, an index renamed, and an indexed TEXT
+/// value of exactly the 1024-byte key limit. Plain SQL, so the file still
+/// builds against every release.
+const SCHEMA_019: &[&str] = &[
+    "CREATE TABLE travel.pass (_key TEXT PRIMARY KEY, holder TEXT, days INT, note TEXT)",
+    "INSERT INTO travel.pass (_key, holder, days, note) VALUES ('p1', 'Made', 3, 'dawn'), ('p2', 'Ketut', 5, NULL), ('p3', 'Nyoman', 1, 'dusk')",
+    "ALTER TABLE travel.pass RENAME COLUMN holder TO owner",
+    "ALTER TABLE travel.pass DROP COLUMN note",
+    "ALTER TABLE travel.pass ADD COLUMN tier TEXT DEFAULT 'basic'",
+    "ALTER TABLE travel.pass ALTER COLUMN days SET DEFAULT 2",
+    "INSERT INTO travel.pass (_key, owner) VALUES ('p4', 'Wayan')",
+    "ALTER TABLE travel.pass ALTER COLUMN days DROP DEFAULT",
+    "ALTER TABLE travel.pass ALTER COLUMN owner SET NOT NULL",
+    "INSERT INTO travel.pass (_key, owner, tier) VALUES ('p5', 'Putu', 'gold')",
+    "ALTER TABLE travel.pass ADD COLUMN note TEXT",
+    "UPDATE travel.pass SET note = 'renewed' WHERE _key = 'p1'",
+    "ALTER TABLE guided ADD COLUMN visits INT DEFAULT 1",
+    "CREATE TABLE memo (_key TEXT PRIMARY KEY, body TEXT)",
+    "ALTER TABLE memo SET SCHEMA travel",
+    "ALTER INDEX place_name_lower RENAME TO place_name_folded",
+];
+
+/// Whether `release` is 0.19 or later.
+fn is_019(release: &str) -> bool {
+    !release.starts_with("0.18.")
+}
+
+fn populate_019(db: &mut Database) {
+    for sql in SCHEMA_019 {
+        run(db, sql);
+    }
+    // Exactly the 1024-byte scalar text key limit, and one byte under it.
+    let full = "m".repeat(1024);
+    let under = "n".repeat(1023);
+    run(db, &format!("INSERT INTO travel.memo (_key, body) VALUES ('full', '{full}'), ('under', '{under}'), ('short', 'a short memo')"));
+    run(db, "COMMIT");
+}
+
+/// The questions a 0.19 fixture adds.
+const QUERIES_019: &[&str] = &[
+    "SELECT _key, owner, days, tier, note FROM travel.pass ORDER BY _key",
+    "SELECT _key FROM travel.pass WHERE owner = 'Ketut'",
+    "SELECT _key FROM travel.pass WHERE tier = 'basic' ORDER BY _key",
+    "SELECT guide, place, score, note, visits FROM guided WHERE guide = 'nyoman' ORDER BY place",
+    "SELECT _key, length(body) AS n FROM travel.memo ORDER BY body",
+    "SELECT _key FROM travel.memo WHERE body > 'm' ORDER BY body",
+    "SELECT _key FROM place WHERE rating >= 4.7 ORDER BY rating DESC, _key",
+];
+
 fn populate(db: &mut Database) {
     for sql in SCHEMA {
         run(db, sql);
@@ -308,9 +361,10 @@ pub(crate) fn cell(value: &SqlValue) -> Value {
     }
 }
 
-fn answers(db: &mut Database) -> Value {
+fn answers(db: &mut Database, release: &str) -> Value {
     let mut out = Vec::new();
-    for sql in QUERIES {
+    let extra: &[&str] = if is_019(release) { QUERIES_019 } else { &[] };
+    for sql in QUERIES.iter().chain(extra) {
         let SqlResult::Rows { columns, rows } = run(db, sql) else {
             panic!("`{sql}` answered no rows")
         };
@@ -360,6 +414,9 @@ fn main() {
         let mut db = Database::create(&dir, cfg()).expect("create");
         let features;
         populate(&mut db);
+        if is_019(release) {
+            populate_019(&mut db);
+        }
         assert!(db.checkpoint().expect("checkpoint"), "the checkpoint was deferred");
         if name == "wal-pending" {
             // A published reader keeps the next commit in the WAL: no
@@ -368,15 +425,27 @@ fn main() {
             for sql in PENDING {
                 run(&mut db, sql);
             }
-            write_json(&dir.join("EXPECTED.json"), &answers(&mut db));
+            write_json(&dir.join("EXPECTED.json"), &answers(&mut db, release));
             features = format!("{:#x}", logical_features(&db));
             drop(db);
             drop(pin);
         } else {
-            write_json(&dir.join("EXPECTED.json"), &answers(&mut db));
+            write_json(&dir.join("EXPECTED.json"), &answers(&mut db, release));
             features = format!("{:#x}", logical_features(&db));
             drop(db);
         }
+        // The word a fresh open reads, which is what a later build compares
+        // with. On a 0.19 file a finished table drop clears its bit in the
+        // writer's memory only: the census keeps the line, and every open
+        // reads it back (`docs/core/SUPPORTIVE.md` 2.i).
+        let features = if is_019(release) {
+            let db = Database::open(&dir, cfg()).expect("reopen");
+            let word = format!("{:#x}", logical_features(&db));
+            drop(db);
+            word
+        } else {
+            features
+        };
         let expected = fs::read(dir.join("EXPECTED.json")).unwrap();
         index.push(json!({
             "name": name,
