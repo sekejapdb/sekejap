@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.19.3
+
+Stability: what an application sends is now tested as it sends it, and the
+0.19 file format is pinned.
+
+- **"Load more" on a timestamp column.** `WHERE (at, _key) < ($1, $2)` with
+  the ISO text a page printed was refused, because the column stores
+  microseconds; the text is now read as the timestamp it spells, as
+  PostgreSQL reads a text parameter against `timestamptz`.
+- **A preserved 0.19.2 release fixture** (`docs/release-fixtures/0.19.2`):
+  databases the tagged release wrote, including columns renamed, dropped and
+  re-added over rows, a DEFAULT existing rows read, a property added to an
+  edge table, a schema move, a renamed index and a 1024-byte key. Every later
+  release must open them with the same answers and no upgrade.
+- **Application-shaped tests** through `sekejap::Db` in service mode: first
+  start on an empty folder, sign-in by `lower(email)`, trigram search, a
+  keyset feed, `->>`, upsert, `now()`, a follower count through the graph,
+  reopen, and failed statements that leave the handle serving.
+- CI builds every target with every feature, as the release does.
+
 ## 0.19.2
 
 Fixes and small PostgreSQL forms found by running a real application on
