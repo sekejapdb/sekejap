@@ -338,10 +338,19 @@ impl Compiler<'_> {
             Predicate::RowCompare { columns, op, values } => {
                 let mut read = Vec::with_capacity(values.len());
                 for (column, value) in columns.iter().zip(values) {
-                    if !is_key_column(column) {
-                        self.kind_of(c, column)?;
+                    if is_key_column(column) {
+                        read.push(self.value_of(value)?);
+                        continue;
                     }
-                    read.push(self.value_of(value)?);
+                    self.kind_of(c, column)?;
+                    // A declared TIMESTAMPTZ/DATE stores microseconds and a
+                    // page prints it as ISO text, so "load more" hands that
+                    // text back: it is read as the timestamp it spells, as
+                    // PostgreSQL reads a text parameter against timestamptz.
+                    read.push(match self.time_column(c, column)? {
+                        Some(declared) => self.time_document_value(value, column, &declared)?,
+                        None => self.value_of(value)?,
+                    });
                 }
                 OwnedFilter::RowCompare {
                     fields: columns.clone(),
