@@ -2692,8 +2692,18 @@ impl Database {
             (keys, end)
         };
         let result = (|| {
-            for k in keys {
-                self.index_delete(&mut i, &k)?;
+            let mut end = end;
+            for (n, k) in keys.iter().enumerate() {
+                self.index_delete(&mut i, k)?;
+                // One index's postings can far outweigh the batch's entry
+                // count (a single term's list, a packed segment block), so a
+                // step bounded only by count can still write past the WAL
+                // allowance. Stop once the allowance is half spent and leave
+                // the rest for the next step, which re-ranges from here.
+                if n + 1 < keys.len() && self.wal_step_spent() {
+                    end = false;
+                    break;
+                }
             }
             if end {
                 // The tree's leaves and interiors were freed as the deletes

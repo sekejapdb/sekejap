@@ -8,7 +8,11 @@ impl Compiler<'_> {
         if_exists: bool,
         cascade: bool,
     ) -> SqlResult2<Option<WritePlan>> {
-        let found = crate::find(self.db, table);
+        // Resolve even a DROPPING collection, so a `DROP TABLE` on one a
+        // previous interrupted drop left behind resumes it rather than
+        // reporting it gone.
+        let (schema, bare) = crate::split_table(table);
+        let found = self.db.collection_in_any(schema, bare).map_err(SqlError::from);
         let collection = match found {
             Ok(Some(id)) => id,
             Ok(None) if if_exists => return Ok(None),

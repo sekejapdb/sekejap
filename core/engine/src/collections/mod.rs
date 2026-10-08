@@ -1786,6 +1786,21 @@ impl Database {
         self.user_writes_pending = true;
         Ok(())
     }
+    /// Has this uncommitted transaction written enough that a bounded,
+    /// resumable loop should commit and continue before the page-WAL
+    /// allowance refuses the next append? A drop step deletes until this is
+    /// true, then returns not-done so its caller commits and calls again --
+    /// which is what keeps dropping one large index (its postings are far
+    /// bigger than any entry count suggests) inside the 16 MiB WAL cap.
+    ///
+    /// The threshold is half the allowance, leaving room for the step's own
+    /// state-save commit and the tree rebalancing a run of deletes triggers.
+    pub(crate) fn wal_step_spent(&self) -> bool {
+        match self.store() {
+            Ok(s) => s.wal_bytes().saturating_mul(2) >= s.wal_allowance(),
+            Err(_) => false,
+        }
+    }
     pub(crate) fn ready_write(&self) -> Result<()> {
         self.store()?;
         if self.read_only {
@@ -2260,6 +2275,18 @@ impl Database {
     }
     /// The collection called `name` in `schema`. One point read.
     pub fn collection_in(&self, schema: &str, name: &str) -> Result<Option<CollectionId>> {
+        self.collection_in_mode(schema, name, false)
+    }
+    /// The collection called `name` in `schema`, resolved even when it is
+    /// DROPPING. `collection`/`collection_in` refuse a DROPPING collection
+    /// through the live-only `catalog` funnel, which is right for every read
+    /// and write; `DROP TABLE` alone needs to see one, so it can RESUME a
+    /// drop a previous, interrupted `DROP TABLE` left behind rather than
+    /// report the table gone.
+    pub fn collection_in_any(&self, schema: &str, name: &str) -> Result<Option<CollectionId>> {
+        self.collection_in_mode(schema, name, true)
+    }
+    fn collection_in_mode(&self, schema: &str, name: &str, include_dropping: bool) -> Result<Option<CollectionId>> {
         let named = (schema != PUBLIC_SCHEMA).then_some(schema);
         if named.is_some_and(|s| s.as_bytes().contains(&SCHEMA_MARK))
             || name.as_bytes().contains(&SCHEMA_MARK)
@@ -2284,7 +2311,13 @@ impl Database {
             }
             CollectionId(u32::from_be_bytes(b.try_into().unwrap()))
         };
-        let c = self.catalog(id)?;
+        // The identity check reads through the live-only funnel by default;
+        // the drop path reads the same record whatever its state.
+        let c = if include_dropping {
+            self.catalog_any(id)?
+        } else {
+            self.catalog(id)?
+        };
         if c.name != name || c.schema.as_deref() != named {
             return Err(corrupt("collection-name identity"));
         }

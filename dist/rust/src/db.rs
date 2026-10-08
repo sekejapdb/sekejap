@@ -324,8 +324,11 @@ impl Db {
             let Some(id) = resolve(db, name)? else {
                 return Ok(false);
             };
-            db.begin_drop_collection_mode(id, DropMode::Cascade)?;
-            while !db.drop_collection_step(id, DROP_BATCH)?.done {}
+            // Resume-aware and committed per step: a drop too large to
+            // finish inside one WAL allowance (a full-text index, wide rows)
+            // is split across committed steps, and one left DROPPING by an
+            // earlier interrupted call is finished rather than refused.
+            db.drop_collection_finish(id, DropMode::Cascade, DROP_BATCH)?;
             Ok(true)
         });
         self.catalog_changed();

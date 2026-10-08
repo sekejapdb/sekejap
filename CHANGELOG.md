@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.19.4
+
+A `DROP TABLE` fix found by application dogfooding: a large table could fail
+its drop and be left unable to be read, written or dropped.
+
+- **A drop step stays inside the page-WAL allowance.** Removing a large index
+  (a full-text index over more text than the 16 MiB log holds) or a run of
+  wide rows is now split across committed steps, instead of one step
+  overflowing the log and failing the whole `DROP TABLE`.
+- **`DROP TABLE` finishes a drop already begun.** A drop interrupted (by the
+  bound above, or a crash) left the table marked DROPPING; a second
+  `DROP TABLE` now resumes it from its committed cursor rather than refusing
+  as "already DROPPING". The same holds across a reopen and for
+  `Db::drop_collection`, which now commits each step.
+- **An oversized `DELETE`/`UPDATE`** -- more than one transaction may hold --
+  is refused with the remedy (delete over key ranges, committing between, or
+  `DROP TABLE` for a whole table) rather than a bare resource-limit message.
+
 ## 0.19.3
 
 Stability: what an application sends is now tested as it sends it, and the

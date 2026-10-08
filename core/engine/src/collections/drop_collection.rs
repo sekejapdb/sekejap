@@ -389,6 +389,25 @@ impl Database {
         self.drop_collection_to_end(id, MAX_DROP_BATCH)
     }
 
+    /// Drop `id` to the end, beginning it when it is live and RESUMING it from
+    /// its committed cursor when a previous drop (interrupted, or a crash)
+    /// left it DROPPING. Every step commits, so one that is interrupted again
+    /// leaves a resumable drop and never a WAL past its allowance. This is the
+    /// call `DROP TABLE` and `Db::drop_collection` make, so a drop that could
+    /// not finish in one go finishes on the next attempt rather than refusing
+    /// as "already DROPPING".
+    pub fn drop_collection_finish(
+        &mut self,
+        id: CollectionId,
+        mode: DropMode,
+        budget: usize,
+    ) -> Result<u64> {
+        if self.drop_collection_state(id)?.is_none() {
+            self.begin_drop_collection_mode(id, mode)?;
+        }
+        self.drop_collection_to_end(id, budget)
+    }
+
     /// One step of the index phase: advance the drop of the first index the
     /// collection still has, cancelling a BUILDING one the way
     /// `begin_drop_index` already does.
@@ -429,10 +448,20 @@ impl Database {
         prefix: Vec<u8>,
     ) -> Result<DropProgress> {
         let keys = self.first_keys(&prefix, budget)?;
-        let end = keys.len() < budget;
-        let removed = keys.len() as u64;
-        for key in keys {
+        let mut end = keys.len() < budget;
+        let n = keys.len();
+        let mut removed = 0u64;
+        for (i, key) in keys.into_iter().enumerate() {
             self.writer()?.delete(&key)?;
+            removed += 1;
+            // A step bounded by entry count can still carry a run of large
+            // records past the WAL allowance; stop and let the caller commit
+            // before the next append is refused. The next step re-ranges from
+            // the prefix, so no cursor is needed.
+            if i + 1 < n && self.wal_step_spent() {
+                end = false;
+                break;
+            }
         }
         if end {
             return self.advance(c, state, removed);
@@ -463,15 +492,24 @@ impl Database {
         }
         let prefix = prefix(0x40, c.id);
         let keys = self.first_keys(&prefix, budget)?;
-        let end = keys.len() < budget;
-        let removed = keys.len() as u64;
-        for key in keys {
+        let mut end = keys.len() < budget;
+        let n = keys.len();
+        let mut removed = 0u64;
+        for (i, key) in keys.into_iter().enumerate() {
             let id = row_id(&key)?;
             if state.mode == DropMode::Cascade {
                 self.cascade_graph_delete(id)?;
             }
             self.writer()?.delete(&key)?;
             self.note_deleted(id);
+            removed += 1;
+            // Wide rows (long text, a vector sidecar) make a 256-row step
+            // outgrow the WAL allowance; stop and let the caller commit. The
+            // next step re-ranges from the prefix.
+            if i + 1 < n && self.wal_step_spent() {
+                end = false;
+                break;
+            }
         }
         if end {
             return self.advance(c, state, removed);

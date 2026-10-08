@@ -1585,13 +1585,16 @@ impl WritePlan {
                 mode,
             } => {
                 // The mark is committed by `begin_drop_collection_mode`
-                // itself, and every step after it is committed by
-                // `drop_collection_to_end`; a statement that is interrupted
-                // leaves a resumable drop, never a half-removed collection.
+                // itself, and every step after it is committed; a statement
+                // interrupted (by a WAL-bounded step, or a crash) leaves a
+                // resumable drop, never a half-removed collection. A second
+                // `DROP TABLE` on a collection already DROPPING RESUMES it
+                // from its committed cursor rather than refusing, so a drop
+                // too large to finish in one statement finishes on the next.
                 db.commit()?;
-                db.begin_drop_collection_mode(collection, mode)?;
-                let removed = db.drop_collection_to_end(
+                let removed = db.drop_collection_finish(
                     collection,
+                    mode,
                     sekejap_core::collections::MAX_DROP_BATCH,
                 )?;
                 let _ = name;
@@ -1841,7 +1844,22 @@ fn run_write(
     budget: QueryBudget,
     statement: &'static str,
 ) -> SqlResult2<u64> {
-    let progress = db.write_where(request, budget)?;
+    let progress = match db.write_where(request, budget) {
+        Ok(progress) => progress,
+        // One predicated write is one transaction, bounded by the 16 MiB
+        // page-WAL allowance. A DELETE or UPDATE touching more than that at
+        // once cannot be split without discarding the caller's own
+        // uncommitted work, so it is refused -- with the remedy, not just the
+        // limit's name.
+        Err(sekejap_core::collections::QueryError::Database(sekejap_core::collections::Error::Kernel(k)))
+            if k.to_string().contains("page-WAL") =>
+        {
+            return Err(SqlError::engine(format!(
+                "{statement}: this one statement writes more than the 16 MiB a single transaction may hold. A predicated write is one transaction and is not split, because that would commit rows the caller has not. Run it over key ranges instead -- `WHERE _key >= $a AND _key < $b` (or your own bound) -- committing between, or `DROP TABLE` to remove a whole table in bounded steps."
+            )));
+        }
+        Err(e) => return Err(SqlError::from(e)),
+    };
     if !progress.done {
         return Err(SqlError::engine(format!(
             "{statement}: the `rows_written` budget of {} was reached after {} row(s); the statement is refused rather than truncated. The rows written so far are uncommitted -- ROLLBACK discards them, or raise the budget and run it again.",
