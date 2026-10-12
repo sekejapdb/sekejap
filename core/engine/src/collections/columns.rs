@@ -277,6 +277,9 @@ impl Database {
             if column_rules::has_constant(&cat.rules) {
                 self.enable_logical_feature(column_rules::CONSTANT_DEFAULT_FEATURE)?;
             }
+            if column_rules::has_references(&cat.rules) {
+                self.enable_logical_feature(column_rules::FK_CONSTRAINT_FEATURE)?;
+            }
             self.persist_catalog(&cat)?;
             self.catalog_changed();
             Ok(())

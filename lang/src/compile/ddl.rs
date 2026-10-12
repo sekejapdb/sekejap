@@ -571,6 +571,7 @@ impl Compiler<'_> {
         Ok(ColumnRule {
             default: Some(DefaultValue::Constant(typed)),
             not_null: rule.not_null,
+            references: rule.references.clone(),
         })
     }
 
@@ -682,6 +683,20 @@ impl Compiler<'_> {
                 });
             }
             AlterAction::AddColumn(column) => {
+                // A REFERENCES on the added column was parsed and then thrown
+                // away, so the statement looked like it enforced a foreign key
+                // and enforced nothing. Entity-table foreign keys are the 0.20
+                // item; until they exist the construct is refused by name
+                // rather than silently accepted.
+                if column.references.is_some() {
+                    return Err(SqlError::coded(
+                        "0A000",
+                        format!(
+                            "ALTER TABLE {table} ADD COLUMN {} ... REFERENCES: a foreign key on an entity table is not built yet (the 0.20 item); it was being accepted and the reference discarded, which promised a check that was never made. Create the column without REFERENCES for now",
+                            column.name
+                        ),
+                    ));
+                }
                 if column.name.starts_with('_') {
                     return Err(SqlError::unsupported(format!(
                         "column `{}`: names beginning with `_` are reserved (`_id`, `_key`, `_collection`)",

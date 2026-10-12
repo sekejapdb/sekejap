@@ -177,7 +177,9 @@ pub use catalog::{
     IndexState, JSON_EXPRESSION_FEATURE,
     IndexTree, ScalarPredicate, TextAnalyzer, MAX_INDEXES,
 };
-pub use column_rules::{ColumnRule, DefaultValue, COLUMN_RULES_FEATURE, CONSTANT_DEFAULT_FEATURE};
+pub use column_rules::{
+    ColumnRule, DefaultValue, COLUMN_RULES_FEATURE, CONSTANT_DEFAULT_FEATURE, FK_CONSTRAINT_FEATURE,
+};
 pub use drop_collection::{DropMode, DropPhase, DropProgress, DropState, MAX_DROP_BATCH};
 pub use row_count::{RowCountProgress, RowCountRecord, ROW_COUNT_FEATURE};
 pub use write_set::{
@@ -1146,6 +1148,7 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | crate::index::graph::edge_table::EDGE_TABLE_FEATURE
     | KEY_SPEC_FEATURE
     | column_rules::CONSTANT_DEFAULT_FEATURE
+    | column_rules::FK_CONSTRAINT_FEATURE
     | crate::index::graph::property_graph::PROPERTY_GRAPH_FEATURE
     | catalog::JSON_EXPRESSION_FEATURE
     | SCHEMA_FEATURE
@@ -2123,6 +2126,9 @@ impl Database {
             }
             if column_rules::has_constant(&c.rules) {
                 self.enable_logical_feature(column_rules::CONSTANT_DEFAULT_FEATURE)?;
+            }
+            if column_rules::has_references(&c.rules) {
+                self.enable_logical_feature(column_rules::FK_CONSTRAINT_FEATURE)?;
             }
             self.persist_layout(&layout, c.id)?;
             self.persist_catalog(&c)?;

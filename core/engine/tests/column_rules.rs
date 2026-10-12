@@ -24,7 +24,7 @@ use kernel::{
 use sekejap_core::{
     collections::{
         ColumnRule, CollectionOptions, Database, DefaultValue, COLUMN_RULES_FEATURE,
-        SUPPORTED_LOGICAL_FEATURES,
+        FK_CONSTRAINT_FEATURE, SUPPORTED_LOGICAL_FEATURES,
     },
     internal::{admit_logical_features, logical_features, parse_uuid, sha1},
     Kind,
@@ -51,7 +51,7 @@ fn micros_now() -> i64 {
 }
 
 fn rule(default: Option<DefaultValue>, not_null: bool) -> ColumnRule {
-    ColumnRule { default, not_null }
+    ColumnRule { default, not_null, references: None }
 }
 
 /// RFC 4122 Appendix C: the DNS namespace.
@@ -651,4 +651,121 @@ fn a_constant_default_of_the_wrong_kind_is_refused() {
         );
         assert!(refused.is_err(), "{kind:?} DEFAULT {value}");
     }
+}
+
+// ── entity foreign keys (0.20, FK CONSTRAINT FORMAT 1) ─────────────────────
+
+/// A column rule can carry a REFERENCES target -- an entity foreign key. The
+/// target name survives a reopen, and the file rides its own additive bit
+/// (`FK_CONSTRAINT_FEATURE`), set only when a foreign key is first recorded, so
+/// a file without one is unchanged.
+#[test]
+fn a_reference_rule_round_trips_and_rides_its_own_bit() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("db");
+    let c = {
+        let mut db = Database::create(&path, cfg()).unwrap();
+        // The referenced table.
+        db.create_collection_rules(
+            "country",
+            vec![("name".into(), Kind::Text)],
+            Vec::new(),
+            Vec::new(),
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            logical_features(&db) & FK_CONSTRAINT_FEATURE,
+            0,
+            "a table with no foreign key does not carry the bit"
+        );
+        // The referencing entity table: `region` is a foreign key to `country`.
+        let c = db
+            .create_collection_rules(
+                "institution",
+                vec![("name".into(), Kind::Text), ("region".into(), Kind::Text)],
+                Vec::new(),
+                vec![(
+                    "region".into(),
+                    ColumnRule {
+                        default: None,
+                        not_null: true,
+                        references: Some("country".into()),
+                    },
+                )],
+                Default::default(),
+            )
+            .unwrap();
+        db.commit().unwrap();
+        assert_eq!(
+            logical_features(&db) & FK_CONSTRAINT_FEATURE,
+            FK_CONSTRAINT_FEATURE,
+            "the first foreign key sets the bit"
+        );
+        c
+    };
+    // The target name and the NOT NULL flag survive a reopen.
+    let db = Database::open(&path, cfg()).unwrap();
+    let info = db.collection_info(c).unwrap();
+    let (_, fk) = info
+        .rules
+        .iter()
+        .find(|(f, _)| f == "region")
+        .expect("the foreign-key rule survived the reopen");
+    assert_eq!(fk.references.as_deref(), Some("country"));
+    assert!(fk.not_null, "the NOT NULL flag survived beside the reference");
+}
+
+/// A file that carries a foreign key is refused at ADMISSION by a binary that
+/// predates `FK_CONSTRAINT_FEATURE`, as `Unsupported`, not as `Corrupt`
+/// (Law 8). The older binary is this build's mask with the bit removed, put
+/// through the production admission decision.
+#[test]
+fn a_foreign_key_file_is_unsupported_to_a_binary_that_predates_the_bit() {
+    assert_eq!(FK_CONSTRAINT_FEATURE, 0x1000000);
+    assert_eq!(
+        SUPPORTED_LOGICAL_FEATURES & FK_CONSTRAINT_FEATURE,
+        FK_CONSTRAINT_FEATURE,
+        "the mask this build publishes must contain the bit it writes"
+    );
+    let older = SUPPORTED_LOGICAL_FEATURES & !FK_CONSTRAINT_FEATURE;
+
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("db");
+    let mut db = Database::create(&path, cfg()).unwrap();
+    db.create_collection_rules(
+        "country",
+        vec![("name".into(), Kind::Text)],
+        Vec::new(),
+        Vec::new(),
+        Default::default(),
+    )
+    .unwrap();
+    db.create_collection_rules(
+        "institution",
+        vec![("region".into(), Kind::Text)],
+        Vec::new(),
+        vec![(
+            "region".into(),
+            ColumnRule { default: None, not_null: true, references: Some("country".into()) },
+        )],
+        Default::default(),
+    )
+    .unwrap();
+    db.commit().unwrap();
+    let written = logical_features(&db);
+    drop(db);
+    assert_eq!(written & FK_CONSTRAINT_FEATURE, FK_CONSTRAINT_FEATURE);
+
+    // This build opens the file it wrote.
+    admit_logical_features(written, SUPPORTED_LOGICAL_FEATURES).unwrap();
+    Database::open(&path, cfg()).unwrap();
+
+    // The binary that predates the bit refuses it whole, as Unsupported.
+    let refused = admit_logical_features(written, older).unwrap_err();
+    assert!(
+        matches!(refused, sekejap_core::collections::Error::Unsupported(ref m)
+            if m.contains(&format!("{written:#x}"))),
+        "an intact newer file must be Unsupported and name its feature word: {refused:?}"
+    );
 }

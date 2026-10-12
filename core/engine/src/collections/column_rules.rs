@@ -71,6 +71,12 @@ pub enum DefaultValue {
 pub struct ColumnRule {
     pub default: Option<DefaultValue>,
     pub not_null: bool,
+    /// An entity foreign key: the NAME of the collection this column's value
+    /// names a row of by its external key (0.20, behind
+    /// [`FK_CONSTRAINT_FEATURE`]). The key is TEXT, so a referencing column is
+    /// TEXT; the existence check and the delete rules are the write path's,
+    /// not this descriptor's. `None` for an ordinary column.
+    pub references: Option<String>,
 }
 
 /// Bit 3 of the catalog packet's frozen flags byte: the record carries a
@@ -105,11 +111,26 @@ pub const COLUMN_RULES_FEATURE: u64 = 0x1000;
 /// cleared; a file with no constant default never carries it.
 pub const CONSTANT_DEFAULT_FEATURE: u64 = 0x200000;
 
+/// The collection-header bit that says a column rule carries a REFERENCES
+/// target -- an entity foreign key ("FK CONSTRAINT FORMAT 1", 0.20).
+///
+/// Its own bit, not `COLUMN_RULES_FEATURE`, because a binary that knows the
+/// rules tail but not the reference byte would read the target name as damage:
+/// it must refuse the file as `Unsupported` at admission instead (Law 8). Set
+/// in the same transaction as the first foreign key, never cleared; a file
+/// with no foreign key never carries it.
+pub const FK_CONSTRAINT_FEATURE: u64 = 0x1000000;
+
 /// True when any rule's default is a constant.
 pub(super) fn has_constant(rules: &[(String, ColumnRule)]) -> bool {
     rules
         .iter()
         .any(|(_, rule)| matches!(rule.default, Some(DefaultValue::Constant(_))))
+}
+
+/// True when any rule carries a REFERENCES target (an entity foreign key).
+pub(super) fn has_references(rules: &[(String, ColumnRule)]) -> bool {
+    rules.iter().any(|(_, rule)| rule.references.is_some())
 }
 
 // ── the descriptor tail ───────────────────────────────────────────────────
@@ -188,15 +209,16 @@ fn decode_constant(mut read: impl FnMut(usize) -> Result<Vec<u8>>) -> Result<Val
 }
 const RULE_NOT_NULL: u8 = 1;
 const RULE_HAS_DEFAULT: u8 = 2;
+const RULE_HAS_REFERENCES: u8 = 4;
 
 /// One rule entry, appended to `out`.
 pub(super) fn encode_rule(out: &mut Vec<u8>, field: &str, rule: &ColumnRule) -> Result<()> {
     if field.is_empty() || field.len() > 255 {
         return Err(invalid("a column rule names a field of 1..255 bytes"));
     }
-    if rule.default.is_none() && !rule.not_null {
+    if rule.default.is_none() && !rule.not_null && rule.references.is_none() {
         return Err(invalid(format!(
-            "the column rule for `{field}` sets neither a DEFAULT nor NOT NULL"
+            "the column rule for `{field}` sets neither a DEFAULT, NOT NULL nor REFERENCES"
         )));
     }
     out.push(field.len() as u8);
@@ -205,6 +227,11 @@ pub(super) fn encode_rule(out: &mut Vec<u8>, field: &str, rule: &ColumnRule) -> 
         if rule.not_null { RULE_NOT_NULL } else { 0 }
             | if rule.default.is_some() {
                 RULE_HAS_DEFAULT
+            } else {
+                0
+            }
+            | if rule.references.is_some() {
+                RULE_HAS_REFERENCES
             } else {
                 0
             },
@@ -228,6 +255,15 @@ pub(super) fn encode_rule(out: &mut Vec<u8>, field: &str, rule: &ColumnRule) -> 
             encode_constant(out, value)?;
         }
     }
+    // The REFERENCES target, after the default so an older reader that stops
+    // at the default never reads it: a target name of 1..255 bytes.
+    if let Some(target) = &rule.references {
+        if target.is_empty() || target.len() > 255 {
+            return Err(invalid("a REFERENCES target names a collection of 1..255 bytes"));
+        }
+        out.push(target.len() as u8);
+        out.extend_from_slice(target.as_bytes());
+    }
     Ok(())
 }
 
@@ -238,7 +274,7 @@ pub(super) fn decode_rule(
     let n = read(1)?[0] as usize;
     let field = String::from_utf8(read(n)?).map_err(super::corrupt)?;
     let flags = read(1)?[0];
-    if field.is_empty() || flags & !(RULE_NOT_NULL | RULE_HAS_DEFAULT) != 0 {
+    if field.is_empty() || flags & !(RULE_NOT_NULL | RULE_HAS_DEFAULT | RULE_HAS_REFERENCES) != 0 {
         return Err(super::corrupt("catalog column rule entry"));
     }
     let default = if flags & RULE_HAS_DEFAULT == 0 {
@@ -261,10 +297,27 @@ pub(super) fn decode_rule(
             _ => return Err(super::corrupt("catalog column rule generator")),
         })
     };
-    if default.is_none() && flags & RULE_NOT_NULL == 0 {
+    let references = if flags & RULE_HAS_REFERENCES == 0 {
+        None
+    } else {
+        let n = read(1)?[0] as usize;
+        let target = String::from_utf8(read(n)?).map_err(super::corrupt)?;
+        if target.is_empty() {
+            return Err(super::corrupt("catalog column rule REFERENCES target"));
+        }
+        Some(target)
+    };
+    if default.is_none() && flags & RULE_NOT_NULL == 0 && references.is_none() {
         return Err(super::corrupt("catalog column rule decides nothing"));
     }
-    Ok((field, ColumnRule { default, not_null: flags & RULE_NOT_NULL != 0 }))
+    Ok((
+        field,
+        ColumnRule {
+            default,
+            not_null: flags & RULE_NOT_NULL != 0,
+            references,
+        },
+    ))
 }
 
 /// Every rule names a field of the new layout, and names a `Kind` its
@@ -280,10 +333,24 @@ pub(super) fn check_rules(
                 "the column rule for `{field}` names a field the collection has not got"
             )));
         };
-        if rule.default.is_none() && !rule.not_null {
+        if rule.default.is_none() && !rule.not_null && rule.references.is_none() {
             return Err(invalid(format!(
-                "the column rule for `{field}` sets neither a DEFAULT nor NOT NULL"
+                "the column rule for `{field}` sets neither a DEFAULT, NOT NULL nor REFERENCES"
             )));
+        }
+        // A foreign key names a row by its external key, which is TEXT, so the
+        // referencing column is TEXT.
+        if let Some(target) = &rule.references {
+            if target.is_empty() || target.len() > 255 {
+                return Err(invalid(format!(
+                    "the REFERENCES target of `{field}` names a collection of 1..255 bytes"
+                )));
+            }
+            if !matches!(kind, Kind::Text) {
+                return Err(invalid(format!(
+                    "`{field}` REFERENCES {target}: a foreign key names a row by its external key, which is TEXT, and `{field}` is {kind:?}"
+                )));
+            }
         }
         match (&rule.default, kind) {
             (None, _) => {}
@@ -428,6 +495,7 @@ pub(super) fn encode_key_spec(b: &mut Vec<u8>, key: &super::KeySpec) -> Result<(
             &ColumnRule {
                 default: Some(default.clone()),
                 not_null: false,
+                references: None,
             },
         )?;
     }

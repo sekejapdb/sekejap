@@ -40,7 +40,7 @@ fn a_table_lives_in_the_register_only() {
             "orders",
             vec![("at".into(), Kind::Int), ("qty".into(), Kind::Int)],
             vec![("at".into(), "TIMESTAMPTZ".into())],
-            vec![("qty".into(), ColumnRule { default: Some(DefaultValue::Constant(json!(1))), not_null: true })],
+            vec![("qty".into(), ColumnRule { default: Some(DefaultValue::Constant(json!(1))), not_null: true, references: None })],
             CollectionOptions { timestamps: true },
         )
         .unwrap();
