@@ -29,6 +29,12 @@ pub(crate) enum CompiledRow {
     Str { func: StrFunc, args: Vec<CompiledRow> },
     Add(Box<CompiledRow>, Box<CompiledRow>),
     Sub(Box<CompiledRow>, Box<CompiledRow>),
+    /// `t2 - t1` over two declared timestamps: a number of SECONDS (a DOUBLE),
+    /// since this engine has no interval type (QL_CONTRACT §4.2).
+    SecondsBetween {
+        left: Box<CompiledRow>,
+        right: Box<CompiledRow>,
+    },
     Concat(Box<CompiledRow>, Box<CompiledRow>),
     /// A §4.4 geometry output function over one shape.
     Geo { func: GeoFunc, arg: Box<CompiledRow> },
@@ -50,6 +56,7 @@ impl CompiledRow {
                 GeoFunc::Srid => Some("INT"),
                 GeoFunc::AsText | GeoFunc::AsEwkt | GeoFunc::AsGeoJson(_) => Some("TEXT"),
             },
+            Self::SecondsBetween { .. } => Some("FLOAT8"),
             _ => None,
         }
     }
@@ -110,6 +117,16 @@ fn want_int(value: &SqlValue, what: &str) -> SqlResult2<i64> {
         SqlValue::Float(f) if f.fract() == 0.0 => Ok(*f as i64),
         other => Err(SqlError::Parameter(format!(
             "{what} takes a whole number and the row holds {other:?}"
+        ))),
+    }
+}
+
+fn want_number(value: &SqlValue, what: &str) -> SqlResult2<f64> {
+    match value {
+        SqlValue::Int(n) => Ok(*n as f64),
+        SqlValue::Float(f) => Ok(*f),
+        other => Err(SqlError::Parameter(format!(
+            "{what} takes a number and the row holds {other:?}"
         ))),
     }
 }
@@ -249,12 +266,29 @@ impl CompiledRow {
                 if nullish(&x) || nullish(&y) {
                     return Ok(SqlValue::Null);
                 }
-                let (x, y) = (want_int(&x, "date arithmetic")?, want_int(&y, "date arithmetic")?);
-                SqlValue::Int(if matches!(self, Self::Add(_, _)) {
-                    x.saturating_add(y)
-                } else {
-                    x.saturating_sub(y)
-                })
+                let add = matches!(self, Self::Add(_, _));
+                // Two whole numbers (date microseconds among them) stay whole;
+                // any real operand gives a real, as in PostgreSQL.
+                match (&x, &y) {
+                    (SqlValue::Int(x), SqlValue::Int(y)) => SqlValue::Int(if add {
+                        x.saturating_add(*y)
+                    } else {
+                        x.saturating_sub(*y)
+                    }),
+                    _ => {
+                        let (x, y) = (want_number(&x, "arithmetic")?, want_number(&y, "arithmetic")?);
+                        SqlValue::Float(if add { x + y } else { x - y })
+                    }
+                }
+            }
+            Self::SecondsBetween { left, right } => {
+                let (a, b) = (left.eval(values)?, right.eval(values)?);
+                if nullish(&a) || nullish(&b) {
+                    return Ok(SqlValue::Null);
+                }
+                let micros = want_int(&a, "timestamp subtraction")?
+                    .saturating_sub(want_int(&b, "timestamp subtraction")?);
+                SqlValue::Float(micros as f64 / functions::MICROS_PER_SECOND as f64)
             }
             Self::Concat(a, b) => {
                 let (x, y) = (a.eval(values)?, b.eval(values)?);
@@ -381,6 +415,20 @@ impl Compiler<'_> {
             .map(|declared| declared == "DATE"))
     }
 
+    /// True when a row expression's value is a timestamp INSTANT: a declared
+    /// TIMESTAMPTZ/DATE column, the clock, or a cast/constructor that makes a
+    /// timestamp. Two such values subtract to a number of seconds, not raw
+    /// microseconds. An `interval` is a duration, not an instant, so it is
+    /// false: `ts - interval` is still a timestamp, not a count of seconds.
+    fn row_is_time(&self, c: CollectionId, expr: &RowExpr) -> SqlResult2<bool> {
+        Ok(match expr {
+            RowExpr::Column(name) => self.time_column(c, name)?.is_some(),
+            RowExpr::Now | RowExpr::CurrentDate => true,
+            RowExpr::ToTimestamp(_) | RowExpr::ToDate(_) | RowExpr::CastDate(_) => true,
+            _ => false,
+        })
+    }
+
     pub(super) fn row_function(
         &mut self,
         c: CollectionId,
@@ -501,10 +549,21 @@ impl Compiler<'_> {
                 Box::new(self.row_function(c, a, fields)?),
                 Box::new(self.row_function(c, b, fields)?),
             ),
-            RowExpr::Sub(a, b) => CompiledRow::Sub(
-                Box::new(self.row_function(c, a, fields)?),
-                Box::new(self.row_function(c, b, fields)?),
-            ),
+            RowExpr::Sub(a, b) => {
+                let left = self.row_function(c, a, fields)?;
+                let right = self.row_function(c, b, fields)?;
+                // Two declared timestamps subtract to a number of SECONDS (we
+                // have no interval type), the duration between them. Any other
+                // subtraction is ordinary numeric arithmetic.
+                if self.row_is_time(c, a)? && self.row_is_time(c, b)? {
+                    CompiledRow::SecondsBetween {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    }
+                } else {
+                    CompiledRow::Sub(Box::new(left), Box::new(right))
+                }
+            }
             RowExpr::Concat(a, b) => {
                 // `||` is a string operator, so a declared timestamp on
                 // either side of it is its ISO spelling -- the same rule

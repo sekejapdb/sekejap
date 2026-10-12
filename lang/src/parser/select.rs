@@ -427,6 +427,19 @@ impl Parser {
             let column = self.name_part(at)?;
             return Ok(SelectItem::Qualified { table, column });
         }
+        // A column that begins an arithmetic row expression (`arrived -
+        // departed`, `price + tax`): the §4.1 row-expression parser already
+        // reads `+` and `-` over columns, literals and the clock, so it owns
+        // the whole item. Detected NARROWLY -- a column name immediately
+        // followed by `+` or `-` -- so a ranking expression that begins with a
+        // NUMBER (`1 - (v <=> $1)`) is left to the ordering path below, where
+        // the vector operator it holds is understood.
+        if matches!(self.peek(), Tok::Word(_) | Tok::Quoted(_))
+            && matches!(self.peek_at(1), Tok::Plus | Tok::Minus)
+        {
+            let expr = self.row_expr()?;
+            return Ok(SelectItem::Function(Box::new(expr)));
+        }
         // A plain name, possibly qualified, is a column; anything else is an
         // expression, and the only expression a select list can hold here is
         // this statement's own ranking value.
