@@ -1116,7 +1116,9 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
 /// ([`crate::index::graph::property_graph::PROPERTY_GRAPH_FEATURE`]).
 /// `0x800000` TRIGRAM text indexes -- a text descriptor whose analyzer is 2
 /// ([`crate::index::text::TRIGRAM_FEATURE`]).
-/// The mask is therefore `0xffffff`.
+/// `0x1000000` entity FOREIGN KEYS -- a column rule with a REFERENCES target
+/// ([`column_rules::FK_CONSTRAINT_FEATURE`]).
+/// The mask is therefore `0x1ffffff`.
 /// Every one is additive: set in the same transaction as the first record
 /// that uses it, never cleared, and a file that declares a bit outside this
 /// mask is refused as `Unsupported` at admission (Law 8).
@@ -3063,11 +3065,75 @@ impl Database {
             document: doc,
         })
     }
+    /// The first row that holds `key` in an entity foreign key pointing at
+    /// collection `c`, as `(table, column)`, or `None` when nothing references
+    /// it -- the RESTRICT check the delete path runs before removing a row.
+    ///
+    /// Each referencing column has an automatic scalar index (its value is a
+    /// key, which the automatic btree holds), so the check seeks that index for
+    /// `key`, never scanning the table's rows. The catalog is small, so walking
+    /// its collections to find the referrers is bounded by the schema, not by
+    /// any table's size.
+    pub(crate) fn referencing_row(&self, c: CollectionId, key: &str) -> Result<Option<(String, String)>> {
+        let encoded = crate::scalar_key::encode(&Kind::Text, Some(&Value::from(key)))?;
+        for (schema, name) in self.list_qualified_collections()? {
+            let Some(cid) = self.collection_in(&schema, &name)? else {
+                continue;
+            };
+            let cat = self.catalog(cid)?;
+            if cat.rules.iter().all(|(_, rule)| rule.references.is_none()) {
+                continue;
+            }
+            let rschema = cat.schema.as_deref().unwrap_or(PUBLIC_SCHEMA);
+            let indexes = self.list_indexes(cid)?;
+            for (field, rule) in &cat.rules {
+                let Some(target) = &rule.references else {
+                    continue;
+                };
+                if self.collection_in(rschema, target)? != Some(c) {
+                    continue;
+                }
+                let Some(info) = indexes.iter().find(|ix| {
+                    ix.family == IndexFamily::Scalar && ix.field == *field && ix.expression.is_none()
+                }) else {
+                    // Without the automatic index the only honest check is a
+                    // scan, which the stop rule forbids; a foreign key keeps
+                    // its index, so this is a refusal to proceed, not damage.
+                    return Err(invalid(format!(
+                        "the foreign key `{field}` of `{name}` has no scalar index to seek; its delete-RESTRICT check needs one"
+                    )));
+                };
+                let mut prefix = catalog::ikey(catalog::SCALAR, info.id);
+                prefix.extend_from_slice(&encoded);
+                if let Some(range) = self.index_range(info, &prefix)? {
+                    if let Some(row) = range.into_iter().next() {
+                        let (k, _) = row?;
+                        if k.starts_with(&prefix) {
+                            return Ok(Some((name.clone(), field.clone())));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub fn delete(&mut self, c: CollectionId, key: &str) -> Result<bool> {
         self.user_write()?;
         let Some(e) = self.load_entity(c, key, true, false)? else {
             return Ok(false);
         };
+        // RESTRICT (the SQL default): a row another row still names by a foreign
+        // key cannot be deleted, as PostgreSQL's 23503.
+        if let Some((table, column)) = self.referencing_row(c, key)? {
+            return Err(Error::Constraint {
+                sqlstate: "23503",
+                message: format!(
+                    "delete on table \"{}\" violates foreign key: the row keyed \"{key}\" is still referenced by column \"{column}\" of table \"{table}\"",
+                    self.catalog(c)?.name
+                ),
+            });
+        }
         let result = (|| {
             self.cascade_graph_delete(e.entity.id)?;
             self.maintain_indexes(e.entity.id, Some(&e.entity.document), None, None)?;
@@ -3712,7 +3778,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0xffffff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x1ffffff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -3733,21 +3799,21 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0xffffff
+            0x1ffffff
         );
         // A bit outside the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
         // The probe is always the next bit above the mask. Both the vamana
         // graph (`0x8000`) and the JSON-path expression index (`0x10000`)
         // landed together, named schemas took `0x20000` and edge identity
-        // `0x40000`, so the mask is contiguous through bit 18 and the first
-        // unclaimed bit is `0x1000000` (edge tables took `0x80000`, key
-        // declarations `0x100000`, constant defaults `0x200000`, property
-        // graph definitions `0x400000`, trigram indexes `0x800000`), so the
-        // probe is `0x1000000`.
+        // `0x40000`, so the mask is contiguous through bit 18 and (edge tables
+        // took `0x80000`, key declarations `0x100000`, constant defaults
+        // `0x200000`, property graph definitions `0x400000`, trigram indexes
+        // `0x800000`, entity foreign keys `0x1000000`) the first unclaimed bit
+        // is `0x2000000`, so that is the probe.
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x1000000)),
-            Err(Error::Unsupported(m)) if m.contains("0x1ffffff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x2000000)),
+            Err(Error::Unsupported(m)) if m.contains("0x3ffffff")
         ));
     }
     /// Law 8 for the live row count, the same shape the declared-type bit's
@@ -3778,9 +3844,10 @@ mod tests {
             Err(Error::Unsupported(m)) if m.contains("0x2001")
         ));
         // And a bit past every implemented family is refused by this build
-        // too. `0x800000` is trigram indexes now, so the probe is `0x1000000`.
+        // too. `0x1000000` is entity foreign keys now, so the probe is
+        // `0x2000000`.
         assert!(matches!(
-            admit_features(1 | 0x1000000, SUPPORTED_LOGICAL_FEATURES),
+            admit_features(1 | 0x2000000, SUPPORTED_LOGICAL_FEATURES),
             Err(Error::Unsupported(_))
         ));
     }

@@ -117,7 +117,6 @@ fn a_mandatory_foreign_key_refuses_a_missing_value_23502() {
 }
 
 #[test]
-#[ignore = "bit 4: delete RESTRICT via the foreign key's scalar index, next commit"]
 fn a_referenced_row_is_protected_from_delete() {
     let dir = TempDir::new().unwrap();
     let mut db = Database::create(dir.path().join("fk"), cfg()).unwrap();

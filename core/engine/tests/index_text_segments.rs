@@ -380,9 +380,10 @@ fn the_packed_tier_is_admitted_only_behind_its_own_feature_bit() {
     // when edge identity took 0x40000, to 0x100000 when edge tables took
     // 0x80000, to 0x200000 when key declarations took 0x100000, to
     // 0x400000 when constant defaults took 0x200000, to 0x800000 when
-    // property graph definitions took 0x400000, and to 0x1000000 when
-    // trigram indexes took 0x800000.
-    set_features(&older, 0x2051 | 0x1000000);
+    // property graph definitions took 0x400000, to 0x1000000 when
+    // trigram indexes took 0x800000, and to 0x2000000 when entity foreign
+    // keys took 0x1000000.
+    set_features(&older, 0x2051 | 0x2000000);
     let before = files(&older);
     assert!(matches!(
         Database::open(&older, cfg()),

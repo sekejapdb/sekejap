@@ -29,7 +29,7 @@ pub(crate) const NEXT_INDEX: u64 = 3;
 
 /// 2.h/2.i: each legacy feature bit and the census line that stands for it.
 /// Bit 0x1 ("typed indexes exist") is the `NEXT` index-class line itself.
-pub(crate) const LEGACY: [(u64, &[u8; 4], u8, u32); 23] = [
+pub(crate) const LEGACY: [(u64, &[u8; 4], u8, u32); 24] = [
     (0x2, b"GRPH", 1, 0),
     (0x4, b"INDX", 1, 4),
     (0x8, b"INDX", 1, 7),
@@ -53,6 +53,7 @@ pub(crate) const LEGACY: [(u64, &[u8; 4], u8, u32); 23] = [
     (0x200000, b"COLM", 1, 3),
     (0x400000, b"MEMB", 1, 0),
     (0x800000, b"INDX", 1, 3),
+    (0x1000000, b"COLM", 1, 4),
 ];
 
 fn line(code: &[u8; 4], version: u8, variant: u32) -> CensusLine {

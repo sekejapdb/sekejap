@@ -228,6 +228,7 @@ fn the_layout_types_the_properties() {
             ColumnRule {
                 default: None,
                 not_null: true,
+                references: None,
             },
         )],
         &["a", "s"],
