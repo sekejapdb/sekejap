@@ -323,7 +323,13 @@ impl Compiler<'_> {
                 if_not_exists,
                 indexes,
                 ..
-            } if !primary_key.is_empty() || columns.iter().any(|c| c.references.is_some()) => {
+            } if (!primary_key.is_empty() || columns.iter().any(|c| c.references.is_some()))
+                // A table that names its own external key (`_key TEXT PRIMARY
+                // KEY`) is an ENTITY table, even with REFERENCES columns: those
+                // are its entity foreign keys (0.20), not the ends of an edge.
+                // An edge table has no `_key`; its key is its ends.
+                && !columns.iter().any(|c| c.name == "_key" && c.primary_key) =>
+            {
                 if !unique.is_empty() || columns.iter().any(|c| c.unique) {
                     return Err(SqlError::unsupported(format!(
                         "UNIQUE on edge table `{table}`: an edge table's uniqueness is its PRIMARY KEY (docs/core/EDGE_TABLES.md §3)"

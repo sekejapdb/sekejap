@@ -2562,6 +2562,47 @@ impl Database {
         }
         self.apply_column_rules(&catalog, doc)
     }
+
+    /// Refuse a row whose entity foreign key names no row of the referenced
+    /// table -- PostgreSQL's `23503 foreign_key_violation`, in its words
+    /// (0.20). A MISSING or NULL value references nothing and is the NOT NULL
+    /// concern, not this one; a present value must name a row of the target by
+    /// its external key, which is one mapping lookup, never a scan.
+    pub(crate) fn apply_foreign_keys(&self, c: &Catalog, doc: &Value) -> Result<()> {
+        for (field, rule) in &c.rules {
+            let Some(target_name) = &rule.references else {
+                continue;
+            };
+            let value = match doc.get(field) {
+                None | Some(Value::Null) => continue,
+                Some(value) => value,
+            };
+            let schema = c.schema.as_deref().unwrap_or(PUBLIC_SCHEMA);
+            let violation = |why: String| Error::Constraint {
+                sqlstate: "23503",
+                message: format!(
+                    "insert or update on table \"{}\" violates foreign key on column \"{field}\": {why}",
+                    c.name
+                ),
+            };
+            let Some(key) = value.as_str() else {
+                return Err(violation(format!(
+                    "a foreign key names a row by its external key, which is TEXT, and this value is {value}"
+                )));
+            };
+            let Some(target) = self.collection_in(schema, target_name)? else {
+                return Err(violation(format!(
+                    "the referenced table \"{target_name}\" does not exist"
+                )));
+            };
+            if self.store()?.get(&mapping_key(target, key))?.is_none() {
+                return Err(violation(format!(
+                    "key ({field})=({key}) is not present in table \"{target_name}\""
+                )));
+            }
+        }
+        Ok(())
+    }
     pub fn alter_collection(
         &mut self,
         id: CollectionId,
@@ -2874,6 +2915,7 @@ impl Database {
         }
         if !c.rules.is_empty() {
             self.apply_column_rules(c, &mut doc)?;
+            self.apply_foreign_keys(c, &doc)?;
         }
         doc[KEY_FIELD] = Value::from(key);
         let encoded = encode_dense_v3(&layout, &doc).map_err(invalid)?;

@@ -218,7 +218,46 @@ impl Compiler<'_> {
             // host can regenerate its DDL; the time types also read it to
             // print an instant back as ISO text.
             declared.push((column.name.clone(), column.declared.clone()));
-            if let Some(rule) = &column.rule {
+            // An entity foreign key (0.20): `col TEXT REFERENCES other` names a
+            // row of `other` by its external key. It is folded into the
+            // column's rule so it persists beside NOT NULL and DEFAULT; the
+            // existence check on write and the delete rules are the engine's.
+            let mut rule = column.rule.clone();
+            if let Some((target, key)) = &column.references {
+                if let Some(key) = key {
+                    if key != "_key" {
+                        return Err(SqlError::unsupported(format!(
+                            "`{}` REFERENCES {target} ({key}): a foreign key names a row by its external key, `_key`",
+                            column.name
+                        )));
+                    }
+                }
+                if !matches!(column.kind, Kind::Text) {
+                    return Err(SqlError::unsupported(format!(
+                        "`{}` REFERENCES {target}: a foreign key names a row by its external key, which is TEXT, and `{}` is {:?}",
+                        column.name, column.name, column.kind
+                    )));
+                }
+                let (schema, _) = crate::split_table(&table);
+                let qualified = crate::qualified(schema, target.clone());
+                if crate::find(self.db, &qualified)?.is_none() {
+                    return Err(SqlError::coded(
+                        "42P01",
+                        format!(
+                            "`{}` REFERENCES {target}: relation \"{target}\" does not exist",
+                            column.name
+                        ),
+                    ));
+                }
+                let mut folded = rule.unwrap_or_default();
+                folded.references = Some(target.clone());
+                self.notices.push(format!(
+                    "`{}` REFERENCES {target}: a value written here must name a row of `{target}` by its `_key`; the reference is checked on INSERT and UPDATE (23503)",
+                    column.name
+                ));
+                rule = Some(folded);
+            }
+            if let Some(rule) = &rule {
                 let rule = self.typed_rule(column, rule)?;
                 self.note_rule(&column.name, &column.declared, &rule);
                 rules.push((column.name.clone(), rule));
