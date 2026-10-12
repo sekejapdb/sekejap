@@ -121,6 +121,109 @@ impl Compiler<'_> {
                 }
             }
         };
+        let mut join_plan: Option<JoinPlan> = None;
+        if let Some(join) = &statement.join {
+            // One key-equality join: the driving collection `c` filters and
+            // orders as any SELECT does; each driving row is paired with the
+            // right row its key names. The right columns are projected from
+            // that fetched row (`Output::Right`), NULL for a LEFT miss.
+            let rc = collection(self.db, &join.table)?;
+            if self.db.edge_table(c).map_err(SqlError::from)?.is_some()
+                || self.db.edge_table(rc).map_err(SqlError::from)?.is_some()
+            {
+                return Err(SqlError::unsupported(
+                    "JOIN with an edge table: an edge table is already a join over the graph; `SELECT ... FROM <edge table>` reads it",
+                ));
+            }
+            // The driving key column must exist and be projected, so the row
+            // executor can read the right key from it.
+            self.kind_of(c, &join.left_column)?;
+            let Output::Field(left_key_at) = push_field(join.left_column.clone(), &mut fields) else {
+                unreachable!("push_field returns a field position");
+            };
+            let mut right_fields: Vec<String> = Vec::new();
+            for (item, alias) in &items {
+                match item {
+                    SelectItem::Id => {
+                        columns.push(alias.clone().unwrap_or_else(|| ID_COLUMN.to_owned()));
+                        outputs.push(Output::Id);
+                    }
+                    SelectItem::Key => {
+                        columns.push(alias.clone().unwrap_or_else(|| KEY_COLUMN.to_owned()));
+                        outputs.push(Output::Key);
+                    }
+                    SelectItem::Column(name) => {
+                        // An unqualified column names whichever side has it; a
+                        // name both tables carry is ambiguous.
+                        let in_left = self.kind_of(c, name).is_ok();
+                        let in_right = self.kind_of(rc, name).is_ok();
+                        match (in_left, in_right) {
+                            (true, true) => {
+                                return Err(SqlError::coded(
+                                    "42702",
+                                    format!("column reference \"{name}\" is ambiguous: both joined tables have it, so qualify it"),
+                                ))
+                            }
+                            (true, false) => {
+                                columns.push(alias.clone().unwrap_or_else(|| name.clone()));
+                                outputs.push(push_field(name.clone(), &mut fields));
+                            }
+                            (false, true) => {
+                                columns.push(alias.clone().unwrap_or_else(|| name.clone()));
+                                right_fields.push(name.clone());
+                                outputs.push(Output::Right(right_fields.len() - 1));
+                            }
+                            (false, false) => {
+                                return Err(SqlError::coded(
+                                    "42703",
+                                    format!("column \"{name}\" does not exist in either joined table"),
+                                ))
+                            }
+                        }
+                    }
+                    SelectItem::Qualified { table, column } => {
+                        if *table == join.left {
+                            self.kind_of(c, column)?;
+                            columns.push(alias.clone().unwrap_or_else(|| column.clone()));
+                            if column == ID_COLUMN {
+                                outputs.push(Output::Id);
+                            } else if is_key_column(column) {
+                                outputs.push(Output::Key);
+                            } else {
+                                outputs.push(push_field(column.clone(), &mut fields));
+                            }
+                        } else if *table == join.right {
+                            if column == ID_COLUMN || is_key_column(column) {
+                                return Err(SqlError::unsupported(format!(
+                                    "`{table}.{column}` in a join: the joined table's key is `{}.{}`; select that",
+                                    join.left, join.left_column
+                                )));
+                            }
+                            self.kind_of(rc, column)?;
+                            columns.push(alias.clone().unwrap_or_else(|| column.clone()));
+                            right_fields.push(column.clone());
+                            outputs.push(Output::Right(right_fields.len() - 1));
+                        } else {
+                            return Err(SqlError::unsupported(format!(
+                                "`{table}` is neither `{}` nor `{}`, the two tables of this join",
+                                join.left, join.right
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(SqlError::unsupported(
+                            "this select item is not served with a JOIN yet: select the columns of the two tables (qualified where a name is ambiguous), or the driver's `_id`/`_key`",
+                        ))
+                    }
+                }
+            }
+            join_plan = Some(JoinPlan {
+                right: rc,
+                left_key_at,
+                left_outer: matches!(join.kind, crate::ast::JoinKind::Left),
+                right_fields,
+            });
+        } else {
         for (item, alias) in items {
             match item {
                 SelectItem::Star => {
@@ -236,7 +339,13 @@ impl Compiler<'_> {
                         function.written()
                     )))
                 }
+                // The parser drops a qualified column's qualifier when there is
+                // no join, so only the join branch above ever sees one.
+                SelectItem::Qualified { .. } => unreachable!(
+                    "a qualified column in a plain SELECT is normalized to its column in the parser"
+                ),
             }
+        }
         }
 
         if outputs.iter().any(|output| *output == Output::Key) {
@@ -272,6 +381,7 @@ impl Compiler<'_> {
             functions,
             rewrites: std::mem::take(&mut self.rewrites),
             row_functions: std::mem::take(&mut self.row_functions),
+            join: join_plan,
         })
     }
 

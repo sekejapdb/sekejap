@@ -742,7 +742,10 @@ impl PreparedSql {
             loop {
                 let page = prepared.next_page(page_rows, budget, &mut *cancelled)?;
                 for row in &page.rows {
-                    body(&select.row(db, row)?)?;
+                    // An INNER join drops a row with no match (`None`).
+                    if let Some(row) = select.row(db, row)? {
+                        body(&row)?;
+                    }
                 }
                 if page.done || page.rows.is_empty() {
                     break;
@@ -900,7 +903,9 @@ impl PreparedSql {
             loop {
                 let page = prepared.next_page(PAGE, QueryBudget::unlimited(), || false)?;
                 for row in &page.rows {
-                    out.push(select.row(db, row)?);
+                    if let Some(row) = select.row(db, row)? {
+                        out.push(row);
+                    }
                 }
                 if page.done || page.rows.is_empty() {
                     break;

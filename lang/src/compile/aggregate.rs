@@ -165,6 +165,11 @@ impl Compiler<'_> {
         {
             return Ok(None);
         }
+        if statement.join.is_some() {
+            return Err(SqlError::unsupported(
+                "an aggregate, DISTINCT, GROUP BY or HAVING with a JOIN: the first release folds and joins separately; join in one statement and aggregate its result in another",
+            ));
+        }
         let Source::Table(table) = &statement.source else {
             return Err(SqlError::unsupported(
                 "an aggregate over FROM ALL: the aggregate atomic folds the candidates of ONE collection's plan",
@@ -327,6 +332,11 @@ impl Compiler<'_> {
                         "{what} with an aggregate: the only expressions a folded answer reports are its group key and its accumulators"
                     )))
                 }
+                // A qualified column only survives the parser when a JOIN is
+                // present, and an aggregate with a JOIN was refused above.
+                SelectItem::Qualified { .. } => unreachable!(
+                    "a qualified column reaches aggregation only with a JOIN, which is refused"
+                ),
             }
         }
         if group_expr.is_some() && !outputs.contains(&AggOutput::Key) && accumulators.is_empty() {

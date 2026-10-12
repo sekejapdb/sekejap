@@ -205,11 +205,11 @@ impl Compiler<'_> {
             // (`rows.rs`).
             Stmt::Gql(graph) => Plan::Gql(self.gql(&graph)?),
             Stmt::ExplainGql(graph) => Plan::ExplainGql(self.gql(&graph)?),
-            Stmt::Select(select) if self.edge_source(&select)?.is_some() => {
+            Stmt::Select(select) if select.join.is_none() && self.edge_source(&select)?.is_some() => {
                 let (c, table, edge) = self.edge_source(&select)?.expect("checked by the guard");
                 Plan::EdgeRows(self.edge_select(c, &table, &edge, &select)?)
             }
-            Stmt::Explain(select) if self.edge_source(&select)?.is_some() => {
+            Stmt::Explain(select) if select.join.is_none() && self.edge_source(&select)?.is_some() => {
                 let (c, table, edge) = self.edge_source(&select)?.expect("checked by the guard");
                 Plan::ExplainText(self.edge_select(c, &table, &edge, &select)?.render())
             }

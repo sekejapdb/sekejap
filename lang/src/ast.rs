@@ -623,6 +623,13 @@ pub(super) enum SelectItem {
     /// The external key, which lives in the row like any other field.
     Key,
     Column(String),
+    /// A column named with its table or alias (`tour.title`). Kept whole so a
+    /// JOIN can resolve which side it belongs to; a plain SELECT treats it as
+    /// the column, the qualifier naming its one source.
+    Qualified {
+        table: String,
+        column: String,
+    },
     /// The ranking value of this statement's own `ORDER BY`, under an alias.
     /// `key` is the written expression as an ORDER BY key (ascending), or
     /// `None` when it is none; only an expression equal to the ORDER BY's
@@ -728,10 +735,33 @@ pub(super) enum Source {
     All,
 }
 
+/// One binary key-equality join (0.20). The first release serves exactly this:
+/// `INNER`/`LEFT JOIN right ON right._key = left.col`, the left side driving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum JoinKind {
+    Inner,
+    Left,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Join {
+    pub(super) kind: JoinKind,
+    /// The right (looked-up) table, a qualified name.
+    pub(super) table: String,
+    /// The name columns use for the right side: its alias, else its base name.
+    pub(super) right: String,
+    /// The name columns use for the driving side: its alias, else its base name.
+    pub(super) left: String,
+    /// The driving column whose value equals the right row's external key.
+    pub(super) left_column: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct SelectStmt {
     pub(super) items: Vec<(SelectItem, Option<String>)>,
     pub(super) source: Source,
+    /// One key-equality join over the source, or `None` for a plain SELECT.
+    pub(super) join: Option<Join>,
     pub(super) predicates: Vec<Expr>,
     /// `SELECT DISTINCT`, which is a group with no accumulators.
     pub(super) distinct: bool,

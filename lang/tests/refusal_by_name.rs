@@ -58,8 +58,10 @@ const NATURAL_POSITION: &[(&str, &str)] = &[
         "SELECT _id FROM place WHERE kind = 'park' LIMIT 5 OFFSET 5",
     ),
     (
+        // INNER and LEFT key-equality joins are served (0.20); FULL is one of
+        // the shapes still refused by name.
         "JOIN",
-        "SELECT _id FROM place JOIN place2 ON place._id = place2._id",
+        "SELECT _id FROM place FULL JOIN place2 ON place2._key = place.other",
     ),
     ("WITH", "WITH t AS (SELECT _id FROM place) SELECT _id FROM t"),
     ("VALUES", "VALUES (1), (2)"),

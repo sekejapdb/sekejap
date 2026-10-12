@@ -60,13 +60,16 @@ impl Parser {
         self.expect_word("FROM")?;
         // A `FROM GRAPH_TABLE` never reaches here: `gql_relation_ahead`
         // sends the statement to the GQL relation's own SELECT.
+        // The name columns use for the driving side: its alias, else the table
+        // itself. A JOIN resolves a qualified column against it.
+        let mut left_alias = String::new();
         let source = if self.word().as_deref() == Some("ALL") && !matches!(self.peek_at(1), Tok::Dot) {
             self.bump();
             Source::All
         } else {
             let table = self.source_name()?;
-            if self.eat_word("AS") {
-                let _ = self.name()?;
+            left_alias = if self.eat_word("AS") {
+                self.name()?
             } else if matches!(self.peek(), Tok::Word(_) | Tok::Quoted(_))
                 && !matches!(
                     self.word().as_deref(),
@@ -75,24 +78,21 @@ impl Parser {
                         | Some("INNER") | Some("LEFT") | Some("RIGHT") | Some("FULL")
                         | Some("CROSS") | Some("NATURAL") | Some("WINDOW")
                 ) {
-                // A bare table alias (`FROM pg_class c`). Read and dropped
-                // for the same reason `AS` is: one source, so a qualified
-                // column has one thing it can mean.
-                let _ = self.name()?;
-            }
+                // A bare table alias (`FROM pg_class c`).
+                self.name()?
+            } else {
+                table.clone()
+            };
             Source::Table(table)
         };
-        if let Some(word) = self.word() {
-            if matches!(
-                word.as_str(),
-                "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "NATURAL"
-            ) {
-                return Err(refuse::refuse("JOIN"));
-            }
-            if word == "," {
-                return Err(refuse::refuse("JOIN"));
-            }
-        }
+        // One binary key-equality join, or a refusal for the shapes the first
+        // release does not serve (RIGHT/FULL/CROSS/NATURAL, a second join, a
+        // comma join).
+        let join = if matches!(source, Source::Table(_)) {
+            self.join_clause(&left_alias)?
+        } else {
+            None
+        };
         if matches!(self.peek(), Tok::Comma) {
             return Err(refuse::refuse("JOIN"));
         }
@@ -145,9 +145,32 @@ impl Parser {
         // refused by name with their own tier and reason rather than ending
         // the statement as a syntax error (QL_CONTRACT §2, §7 item 10).
         self.guard_here()?;
+        // With no join, a qualified column names its one source, so the
+        // qualifier is dropped and the item is an ordinary column -- every
+        // compile path below sees only the shapes it already handled. Only the
+        // join path keeps `Qualified`, where the qualifier chooses a side.
+        let items = if join.is_none() {
+            items
+                .into_iter()
+                .map(|(item, alias)| {
+                    let item = match item {
+                        SelectItem::Qualified { column, .. } if column == ID_COLUMN => SelectItem::Id,
+                        SelectItem::Qualified { column, .. } if is_key_column(&column) => {
+                            SelectItem::Key
+                        }
+                        SelectItem::Qualified { column, .. } => SelectItem::Column(column),
+                        other => other,
+                    };
+                    (item, alias)
+                })
+                .collect()
+        } else {
+            items
+        };
         Ok(SelectStmt {
             items,
             source,
+            join,
             predicates,
             distinct,
             group,
@@ -156,6 +179,98 @@ impl Parser {
             then_by,
             limit,
         })
+    }
+
+    /// With the cursor on a join keyword (or not), the one binary join the
+    /// first release serves: `[INNER] JOIN right [AS a] ON right._key =
+    /// left.col`, or the same equality written the other way round. `LEFT
+    /// [OUTER] JOIN` keeps the unmatched driving rows. RIGHT/FULL/CROSS/NATURAL,
+    /// a non-key join and a second join are refused by name.
+    fn join_clause(&mut self, left: &str) -> SqlResult2<Option<Join>> {
+        let kind = match self.word().as_deref() {
+            Some("JOIN") => {
+                self.bump();
+                JoinKind::Inner
+            }
+            Some("INNER") => {
+                self.bump();
+                self.expect_word("JOIN")?;
+                JoinKind::Inner
+            }
+            Some("LEFT") => {
+                self.bump();
+                self.eat_word("OUTER");
+                self.expect_word("JOIN")?;
+                JoinKind::Left
+            }
+            Some("RIGHT") | Some("FULL") | Some("CROSS") | Some("NATURAL") => {
+                return Err(refuse::refuse("JOIN"))
+            }
+            _ => return Ok(None),
+        };
+        let table = self.source_name()?;
+        let base = table.rsplit('.').next().unwrap_or(&table).to_owned();
+        let right = if self.eat_word("AS") {
+            self.name()?
+        } else if matches!(self.peek(), Tok::Word(_) | Tok::Quoted(_))
+            && self.word().as_deref() != Some("ON")
+        {
+            self.name()?
+        } else {
+            base
+        };
+        self.expect_word("ON")?;
+        let (t1, c1) = self.qualified_pair()?;
+        self.expect(&Tok::Eq)?;
+        let (t2, c2) = self.qualified_pair()?;
+        // One side names the right table's `_key`; the other is the driving
+        // column whose value it equals.
+        let unknown = |table: &str| {
+            SqlError::unsupported(format!(
+                "JOIN ... ON: `{table}` is neither the driving table nor the joined one"
+            ))
+        };
+        let left_column = if t2 == right && is_key_column(&c2) {
+            if t1 != left {
+                return Err(unknown(&t1));
+            }
+            c1
+        } else if t1 == right && is_key_column(&c1) {
+            if t2 != left {
+                return Err(unknown(&t2));
+            }
+            c2
+        } else {
+            return Err(SqlError::unsupported(
+                "JOIN ... ON: the first release joins on the right table's `_key` only -- write `ON <right>._key = <left>.<column>`, or the same equality the other way round",
+            ));
+        };
+        if matches!(
+            self.word().as_deref(),
+            Some("JOIN") | Some("INNER") | Some("LEFT") | Some("RIGHT") | Some("FULL")
+                | Some("CROSS") | Some("NATURAL")
+        ) {
+            return Err(SqlError::unsupported(
+                "a second JOIN: the first release serves one binary join; write it as two statements",
+            ));
+        }
+        Ok(Some(Join {
+            kind,
+            table,
+            right,
+            left: left.to_owned(),
+            left_column,
+        }))
+    }
+
+    /// `table.column` (or `alias.column`): the two parts of a qualified
+    /// reference, kept whole so a JOIN can say which side it is.
+    fn qualified_pair(&mut self) -> SqlResult2<(String, String)> {
+        let at = self.here();
+        let table = self.name_part(at)?;
+        self.expect(&Tok::Dot)?;
+        let column = self.name_part(at)?;
+        Ok((table, column))
     }
 
     /// `GROUP BY col` or `GROUP BY col / n`. One key: a second one would be a
@@ -297,6 +412,20 @@ impl Parser {
         if self.at_row_function() || self.row_expression_ahead() {
             let expr = self.row_expr()?;
             return Ok(SelectItem::Function(Box::new(expr)));
+        }
+        // A qualified column (`tour.title`): kept whole, so a JOIN can resolve
+        // which side it names. A plain SELECT reads the qualifier as its one
+        // source. Not a function call (`t.f(`), not a three-part name.
+        if matches!(self.peek(), Tok::Word(_) | Tok::Quoted(_))
+            && matches!(self.peek_at(1), Tok::Dot)
+            && matches!(self.peek_at(2), Tok::Word(_) | Tok::Quoted(_))
+            && !matches!(self.peek_at(3), Tok::LParen | Tok::Dot)
+        {
+            let at = self.here();
+            let table = self.name_part(at)?;
+            self.expect(&Tok::Dot)?;
+            let column = self.name_part(at)?;
+            return Ok(SelectItem::Qualified { table, column });
         }
         // A plain name, possibly qualified, is a column; anything else is an
         // expression, and the only expression a select list can hold here is

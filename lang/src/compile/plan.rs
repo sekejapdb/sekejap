@@ -597,6 +597,26 @@ pub(crate) enum Output {
     /// Evaluated over the values this same row already projected, so it reads
     /// nothing extra.
     Row(usize),
+    /// A column of the joined (right) table, by its position in
+    /// [`JoinPlan::right_fields`]. Filled from the right row the driving row's
+    /// key names, or NULL when a LEFT join found none (0.20).
+    Right(usize),
+}
+
+/// The right side of a key-equality join: the looked-up table, which driving
+/// field holds its key, whether unmatched driving rows are kept (LEFT), and
+/// the right columns the select list projects.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct JoinPlan {
+    pub(crate) right: CollectionId,
+    /// The position in [`SelectPlan::fields`] of the driving column whose value
+    /// is the right row's external key.
+    pub(crate) left_key_at: usize,
+    /// A LEFT join keeps a driving row with no match, the right columns NULL;
+    /// an INNER join drops it.
+    pub(crate) left_outer: bool,
+    /// The right fields [`Output::Right`] indexes into.
+    pub(crate) right_fields: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -618,6 +638,8 @@ pub(crate) struct SelectPlan {
     pub(crate) rewrites: Vec<String>,
     /// One line per projected ROW function, for EXPLAIN.
     pub(crate) row_functions: Vec<String>,
+    /// A key-equality join over the driving collection, or `None`.
+    pub(crate) join: Option<JoinPlan>,
 }
 
 impl SelectPlan {
@@ -637,8 +659,9 @@ impl SelectPlan {
         }
     }
 
-    /// One returned row, as this statement's columns.
-    pub(crate) fn row(&self, db: &Database, row: &QueryRow) -> SqlResult2<SqlRow> {
+    /// One returned row, as this statement's columns, or `None` when an INNER
+    /// join found no right row for it (the row is dropped).
+    pub(crate) fn row(&self, db: &Database, row: &QueryRow) -> SqlResult2<Option<SqlRow>> {
         let mut key = None;
         if self.reads_keys() {
             key = db
@@ -653,6 +676,23 @@ impl SelectPlan {
             .iter()
             .map(|(_, value)| projected(value))
             .collect();
+        // The joined row the driving row's key names, fetched once. An INNER
+        // join with no match drops the row; a LEFT join keeps it with the
+        // right columns NULL.
+        let right = if let Some(join) = &self.join {
+            let matched = match fields.get(join.left_key_at) {
+                Some(SqlValue::Text(key)) => {
+                    db.get(join.right, key).map_err(SqlError::from)?.map(|e| e.document)
+                }
+                _ => None,
+            };
+            if matched.is_none() && !join.left_outer {
+                return Ok(None);
+            }
+            matched
+        } else {
+            None
+        };
         let mut values = Vec::with_capacity(self.outputs.len());
         for output in &self.outputs {
             values.push(match output {
@@ -661,9 +701,16 @@ impl SelectPlan {
                 Output::Key => key.clone().map_or(SqlValue::Missing, SqlValue::Text),
                 Output::OrderValue => order_value(&row.order),
                 Output::Row(at) => self.functions[*at].eval(&fields)?,
+                Output::Right(at) => {
+                    let field = &self.join.as_ref().expect("a Right output needs a join").right_fields[*at];
+                    match right.as_ref().and_then(|doc| doc.get(field)) {
+                        None | Some(serde_json::Value::Null) => SqlValue::Null,
+                        Some(value) => json_value(value),
+                    }
+                }
             });
         }
-        Ok(SqlRow { id: row.id, values })
+        Ok(Some(SqlRow { id: row.id, values }))
     }
 
     /// Prepare the query this plan compiled to and hand it to `body`.
@@ -2171,5 +2218,20 @@ impl SelectPlan {
             filter.rebind(binder)?;
         }
         self.order.rebind(binder)
+    }
+}
+
+/// A stored JSON value as a SQL value -- the mapping [`projected`] uses for a
+/// `ProjectedValue::Value`, over the right row of a join (0.20).
+fn json_value(value: &serde_json::Value) -> SqlValue {
+    match value {
+        serde_json::Value::Null => SqlValue::Null,
+        serde_json::Value::Bool(b) => SqlValue::Bool(*b),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => SqlValue::Int(i),
+            None => SqlValue::Float(n.as_f64().unwrap_or(f64::NAN)),
+        },
+        serde_json::Value::String(s) => SqlValue::Text(s.clone()),
+        other => SqlValue::Json(other.clone()),
     }
 }

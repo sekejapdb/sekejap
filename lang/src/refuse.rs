@@ -32,7 +32,7 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("#>", Tier::Two, "QL_CONTRACT §4.1: JSON path extraction is a row function (p3 item 2). `#>` walks a path array and is the same missing surface `->` and `->>` name."),
     ("#>>", Tier::Two, "QL_CONTRACT §4.1: JSON path extraction is a row function (p3 item 2). `#>>` walks a path array and returns text; it is the same missing surface `->` and `->>` name."),
     // ── §2 statements ────────────────────────────────────────────────────
-    ("JOIN", Tier::Two, "QL_CONTRACT §4.8: INNER/LEFT JOIN on key equality is a key lookup per driving row, scheduled after GROUP BY; a join on a non-key column and FULL OUTER JOIN are Tier 3 (they need a hash join with spill). A pattern is never compiled to a join."),
+    ("JOIN", Tier::Two, "QL_CONTRACT §4.8: INNER and LEFT JOIN on the right table's _key are served (0.20), a key lookup per driving row; RIGHT/FULL/CROSS/NATURAL joins, a comma join and a second join need a hash join with spill and are Tier 3. A pattern is never compiled to a join."),
     ("OFFSET", Tier::Two, "QL_CONTRACT §5 deviation 4: OFFSET is a keyset continuation, never a skip count. The continuation is the prepared query's own next page; a skip count would read and discard rows, which is work proportional to the skip. The next page is a row comparison on the ORDER BY columns against the last row returned: `ORDER BY name, _key LIMIT 20 OFFSET 20` becomes `WHERE (name, _key) > ($last_name, $last_key) ORDER BY name, _key LIMIT 20`."),
     ("UNION", Tier::Three, "QL_CONTRACT §2: UNION has no atomic; recursion is a GRAPH_TABLE pattern."),
     ("INTERSECT", Tier::Three, "QL_CONTRACT §2: no atomic."),
