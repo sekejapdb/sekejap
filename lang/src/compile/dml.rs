@@ -1,5 +1,17 @@
 use super::*;
 
+/// The driver a write pass takes. A WHERE that holds a key filter (an equality
+/// or a range on `_key`) drives by the key: the pass visits only the keys it
+/// names, so a patch to an indexed column cannot re-file a posting the walk is
+/// standing on. Without one the engine chooses, which is what it still does.
+fn write_driver(filters: &[OwnedFilter]) -> CandidateDriver {
+    if filters.iter().any(|f| matches!(f, OwnedFilter::Key { .. })) {
+        CandidateDriver::Keys
+    } else {
+        CandidateDriver::Auto
+    }
+}
+
 impl Compiler<'_> {
     // ── writes ───────────────────────────────────────────────────────────
 
@@ -367,10 +379,18 @@ impl Compiler<'_> {
         }
         Ok(WritePlan::UpdateWhere {
             collection: c,
+            // A WHERE with an equality (or range) on the key drives the pass by
+            // the key, as a SELECT does, not by a scalar index the planner
+            // might otherwise pick -- which, when that index is over a column
+            // the patch SETS, it would then refuse to move. Driving by the key
+            // visits at most the keys named, so a patch to an indexed column
+            // cannot make the walk meet a row twice. This is the compare-and-set
+            // `UPDATE t SET state = ... WHERE _key = $1 AND state = ...` a queue
+            // is built on.
+            driver: write_driver(&filters),
             filters,
             sets,
             fields,
-            driver: CandidateDriver::Auto,
         })
     }
 
@@ -399,9 +419,9 @@ impl Compiler<'_> {
         }
         Ok(WritePlan::DeleteWhere {
             collection: c,
+            driver: write_driver(&filters),
             filters,
             cascade,
-            driver: CandidateDriver::Auto,
         })
     }
 
