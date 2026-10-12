@@ -1046,6 +1046,8 @@ pub(super) enum Stmt {
         table: String,
         assignments: Vec<(String, Literal)>,
         key: Literal,
+        /// `RETURNING _key, *, col`: empty when the statement has none.
+        returning: Vec<ReturningItem>,
     },
     /// `UPDATE t SET ... WHERE <any predicate>` (QL_CONTRACT §2, T1 since
     /// `Database::update_where`). The key-equality form above stays its own
@@ -1056,6 +1058,8 @@ pub(super) enum Stmt {
         table: String,
         assignments: Vec<(String, SetValue)>,
         predicates: Vec<Expr>,
+        /// `RETURNING _key, *, col`: empty when the statement has none.
+        returning: Vec<ReturningItem>,
     },
     Delete {
         table: String,

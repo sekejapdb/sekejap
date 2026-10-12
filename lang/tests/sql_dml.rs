@@ -398,10 +398,11 @@ fn begin_bulk_and_end_bulk_nest_and_only_the_outermost_close_commits() {
 }
 
 #[test]
-fn a_predicated_write_refuses_returning_and_a_patched_key_by_name() {
+fn a_predicated_write_refuses_delete_returning_and_a_patched_key_by_name() {
     let f = open();
+    // `DELETE ... RETURNING` (the deleted rows' OLD values are a separate
+    // slice) and a patched key stay refused by name.
     for (text, needle) in [
-        ("UPDATE rows SET label = 'x' WHERE amount < 5 RETURNING _key", "RETURNING"),
         ("DELETE FROM rows WHERE amount < 5 RETURNING _key", "RETURNING"),
         ("UPDATE rows SET _key = 'x' WHERE amount < 5", "_key"),
     ] {
@@ -415,4 +416,10 @@ fn a_predicated_write_refuses_returning_and_a_patched_key_by_name() {
         );
         assert!(format!("{error}").contains(needle), "`{text}` -> {error}");
     }
+    // A predicated `UPDATE ... RETURNING` is served now (0.20): it prepares.
+    f.db.sql_prepare(
+        "UPDATE rows SET label = 'x' WHERE amount < 5 RETURNING _key",
+        &[],
+    )
+    .expect("a predicated UPDATE ... RETURNING prepares");
 }

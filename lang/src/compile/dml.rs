@@ -277,8 +277,10 @@ impl Compiler<'_> {
         table: &str,
         assignments: &[(String, Literal)],
         key: &Literal,
+        returning: &[ReturningItem],
     ) -> SqlResult2<WritePlan> {
         let c = collection(self.db, table)?;
+        let returning = self.returning(c, table, returning)?;
         let declared_key = self.declared_key_column(c)?;
         let mut patch = Map::new();
         for (column, literal) in assignments {
@@ -299,6 +301,7 @@ impl Compiler<'_> {
             collection: c,
             key: self.text_of(key)?,
             patch: Value::Object(patch),
+            returning,
         })
     }
 
@@ -468,8 +471,10 @@ impl Compiler<'_> {
         table: &str,
         assignments: &[(String, SetValue)],
         predicates: &[Expr],
+        returning: &[ReturningItem],
     ) -> SqlResult2<WritePlan> {
         let c = collection(self.db, table)?;
+        let returning = self.returning(c, table, returning)?;
         let declared_key = self.declared_key_column(c)?;
         let mut fields: Vec<String> = Vec::new();
         let mut sets = Vec::with_capacity(assignments.len());
@@ -497,6 +502,10 @@ impl Compiler<'_> {
         for expr in predicates {
             filters.push(self.where_filter(c, expr)?);
         }
+        // `_key >= $a AND _key <= $b` is ONE key range, the same fold a SELECT
+        // with that WHERE makes -- so the key-driven pass walks one range and
+        // the engine is never handed two separate key filters.
+        super::predicates::merge_key_bounds(&mut filters);
         Ok(WritePlan::UpdateWhere {
             collection: c,
             // A WHERE with an equality (or range) on the key drives the pass by
@@ -511,6 +520,7 @@ impl Compiler<'_> {
             filters,
             sets,
             fields,
+            returning,
         })
     }
 
@@ -532,6 +542,8 @@ impl Compiler<'_> {
         for expr in predicates {
             filters.push(self.where_filter(c, expr)?);
         }
+        // `_key >= $a AND _key <= $b` is ONE key range, as it is for a SELECT.
+        super::predicates::merge_key_bounds(&mut filters);
         if filters.is_empty() {
             self.notices.push(format!(
                 "DELETE FROM {table} names no predicate, so every row of the collection matches and the candidate walk is the entity cursor -- a SCAN by definition (QL_CONTRACT §6). `DROP TABLE` removes the collection itself in bounded, resumable steps."
@@ -558,8 +570,9 @@ impl Compiler<'_> {
                 table,
                 assignments,
                 predicates,
+                returning,
             } => {
-                let plan = self.update_where(&table, &assignments, &predicates)?;
+                let plan = self.update_where(&table, &assignments, &predicates, &returning)?;
                 let WritePlan::UpdateWhere { sets, .. } = &plan else {
                     unreachable!("update_where compiles to UpdateWhere")
                 };

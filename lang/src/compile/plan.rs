@@ -951,6 +951,9 @@ pub(crate) enum WritePlan {
         collection: CollectionId,
         key: String,
         patch: Value,
+        /// `RETURNING`: empty for none. The one row read back AFTER the write,
+        /// so a value the patch did not touch reports its stored value.
+        returning: Returning,
     },
     Delete {
         collection: CollectionId,
@@ -967,6 +970,10 @@ pub(crate) enum WritePlan {
         /// in the order `CompiledRow::Field` numbers them.
         fields: Vec<String>,
         driver: CandidateDriver,
+        /// `RETURNING`: empty for none. The matched rows are collected before
+        /// the write and read back after it, so RETURNING reports their NEW
+        /// values.
+        returning: Returning,
     },
     /// `DELETE FROM t WHERE <any predicate> [RESTRICT|CASCADE]`:
     /// `Database::write_where` with `WriteAction::Delete`.
@@ -1445,12 +1452,37 @@ impl WritePlan {
                 collection,
                 key,
                 patch,
+                returning,
             } => {
                 if db.get(collection, &key)?.is_none() {
-                    return Ok(SqlResult::Affected(0));
+                    // A key that is not there changes nothing; RETURNING then
+                    // answers no row, as in PostgreSQL.
+                    return Ok(if returning.is_empty() {
+                        SqlResult::Affected(0)
+                    } else {
+                        SqlResult::Rows {
+                            columns: returning.columns,
+                            rows: Vec::new(),
+                        }
+                    });
                 }
                 db.update(collection, &key, &patch)?;
-                SqlResult::Affected(1)
+                if returning.is_empty() {
+                    SqlResult::Affected(1)
+                } else {
+                    // Read back after the write, so a column the patch left
+                    // alone reports its stored value.
+                    let row = db.get(collection, &key)?.ok_or_else(|| {
+                        SqlError::unsupported("UPDATE ... RETURNING: the row just written is not found")
+                    })?;
+                    SqlResult::Rows {
+                        columns: returning.columns.clone(),
+                        rows: vec![SqlRow {
+                            id: row.id,
+                            values: returning.row(&row),
+                        }],
+                    }
+                }
             }
             Self::Delete { collection, key } => {
                 let gone = db.delete(collection, &key)?;
@@ -1462,7 +1494,37 @@ impl WritePlan {
                 sets,
                 fields,
                 driver,
+                returning,
             } => {
+                // For RETURNING, collect the rows the filter matches BEFORE the
+                // write -- their ids do not change under an UPDATE, so they
+                // name the rows to read back afterwards for their NEW values.
+                // One writer, so the set the write visits is the set read here.
+                let returning_ids: Vec<EntityId> = if returning.is_empty() {
+                    Vec::new()
+                } else {
+                    with_borrowed_filters(&filters, &mut |borrowed| {
+                        let mut prepared = db.prepare_query(QueryRequest {
+                            collection,
+                            filters: borrowed,
+                            order: QueryOrder::Driver,
+                            projection: Projection::Ids,
+                            total_limit: None,
+                            driver,
+                        })?;
+                        let mut ids = Vec::new();
+                        loop {
+                            let page = prepared.next_page(crate::PAGE, budget, || false)?;
+                            for row in &page.rows {
+                                ids.push(row.id);
+                            }
+                            if page.done || page.rows.is_empty() {
+                                break;
+                            }
+                        }
+                        Ok(ids)
+                    })?
+                };
                 // The row expressions become the `&mut dyn FnMut` closures
                 // the engine's `UpdatePatch` takes. They are built here, on
                 // this call's stack, because the patch borrows them for the
@@ -1514,7 +1576,25 @@ impl WritePlan {
                         "UPDATE",
                     )
                 })?;
-                SqlResult::Affected(written)
+                if returning.is_empty() {
+                    SqlResult::Affected(written)
+                } else {
+                    // Read each matched row back after the write, for its new
+                    // values. A row the write somehow lost is skipped.
+                    let mut out = Vec::with_capacity(returning_ids.len());
+                    for id in returning_ids {
+                        if let Some(entity) = db.get_by_id(id).map_err(SqlError::from)? {
+                            out.push(SqlRow {
+                                id,
+                                values: returning.row(&entity),
+                            });
+                        }
+                    }
+                    SqlResult::Rows {
+                        columns: returning.columns.clone(),
+                        rows: out,
+                    }
+                }
             }
             Self::DeleteWhere {
                 collection,

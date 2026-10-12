@@ -115,27 +115,7 @@ impl Parser {
         } else {
             None
         };
-        let mut returning = Vec::new();
-        if self.eat_word("RETURNING") {
-            loop {
-                if self.eat(&Tok::Star) {
-                    returning.push(ReturningItem::Star);
-                } else {
-                    let at = self.here();
-                    let name = self.name()?;
-                    if !matches!(self.peek(), Tok::Comma | Tok::Eof | Tok::Semicolon) {
-                        return Err(SqlError::syntax(
-                            format!("RETURNING {name} ...: RETURNING takes column names and `*`; an expression is not supported"),
-                            at,
-                        ));
-                    }
-                    returning.push(ReturningItem::Column(name));
-                }
-                if !self.eat(&Tok::Comma) {
-                    break;
-                }
-            }
-        }
+        let returning = self.returning_items()?;
         Ok(Stmt::Insert {
             table,
             columns,
@@ -180,20 +160,22 @@ impl Parser {
             .collect();
         if let Some(literals) = literals {
             if let Some(key) = self.key_equality_ahead()? {
-                self.no_returning("UPDATE")?;
+                let returning = self.returning_items()?;
                 return Ok(Stmt::Update {
                     table,
                     assignments: literals,
                     key,
+                    returning,
                 });
             }
         }
         let predicates = self.where_clause()?;
-        self.no_returning("UPDATE")?;
+        let returning = self.returning_items()?;
         Ok(Stmt::UpdateWhere {
             table,
             assignments,
             predicates,
+            returning,
         })
     }
 
@@ -266,6 +248,33 @@ impl Parser {
             )));
         }
         Ok(())
+    }
+
+    /// `RETURNING _key, *, col` -- column names and `*`, no expression. Empty
+    /// when the statement has no RETURNING. Shared by INSERT and UPDATE.
+    fn returning_items(&mut self) -> SqlResult2<Vec<ReturningItem>> {
+        let mut returning = Vec::new();
+        if self.eat_word("RETURNING") {
+            loop {
+                if self.eat(&Tok::Star) {
+                    returning.push(ReturningItem::Star);
+                } else {
+                    let at = self.here();
+                    let name = self.name()?;
+                    if !matches!(self.peek(), Tok::Comma | Tok::Eof | Tok::Semicolon) {
+                        return Err(SqlError::syntax(
+                            format!("RETURNING {name} ...: RETURNING takes column names and `*`; an expression is not supported"),
+                            at,
+                        ));
+                    }
+                    returning.push(ReturningItem::Column(name));
+                }
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        Ok(returning)
     }
 
     /// One `SET column = <value>`.

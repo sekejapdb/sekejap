@@ -282,7 +282,13 @@ impl Compiler<'_> {
                 table,
                 assignments,
                 predicates,
+                returning,
             } if self.edge_table_of(&table)?.is_some() => {
+                if !returning.is_empty() {
+                    return Err(SqlError::unsupported(format!(
+                        "UPDATE {table} ... RETURNING: `{table}` is an edge table, whose rows are edges with no key to return; RETURNING is answered for a table of rows"
+                    )));
+                }
                 let (c, edge) = self.edge_table_of(&table)?.expect("checked by the guard");
                 Plan::Write(self.update_edges(c, &table, &edge, &assignments, &predicates)?)
             }
@@ -313,7 +319,8 @@ impl Compiler<'_> {
                 table,
                 assignments,
                 key,
-            } => Plan::Write(self.update(&table, &assignments, &key)?),
+                returning,
+            } => Plan::Write(self.update(&table, &assignments, &key, &returning)?),
             Stmt::Delete { table, key } => {
                 let collection = collection(self.db, &table)?;
                 let key = self.text_of(&key)?;
@@ -323,7 +330,8 @@ impl Compiler<'_> {
                 table,
                 assignments,
                 predicates,
-            } => Plan::Write(self.update_where(&table, &assignments, &predicates)?),
+                returning,
+            } => Plan::Write(self.update_where(&table, &assignments, &predicates, &returning)?),
             Stmt::DeleteWhere {
                 table,
                 predicates,

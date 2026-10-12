@@ -97,6 +97,8 @@
 //!              -- INSERT ... SELECT maps the query's columns by position onto
 //!                 the named columns
 //! update    := UPDATE name SET (name '=' set_value)+ WHERE where_tail
+//!                [RETURNING ('*' | name) (',' ('*' | name))*]
+//!              -- RETURNING reads each changed row back, its new values
 //! delete    := DELETE FROM (name | ALL) [WHERE conj] [RESTRICT | CASCADE]
 //! set_value := value | expression        -- a row function over the SAME row
 //! where_tail:= '_key' '=' value          -- one point write
@@ -542,7 +544,11 @@ impl PreparedSql {
             compile::Plan::Rows(rows) => &rows.columns,
             compile::Plan::EdgeRows(edges) => &edges.columns,
             compile::Plan::Gql(gql) | compile::Plan::ExplainGql(gql) => gql.plan.columns(),
-            compile::Plan::Write(compile::WritePlan::Insert { returning, .. }) => &returning.columns,
+            compile::Plan::Write(compile::WritePlan::Insert { returning, .. })
+            | compile::Plan::Write(compile::WritePlan::Update { returning, .. })
+            | compile::Plan::Write(compile::WritePlan::UpdateWhere { returning, .. }) => {
+                &returning.columns
+            }
             _ => &[],
         }
     }
@@ -801,7 +807,11 @@ impl PreparedSql {
     /// `None` for every statement that is not a row SELECT.
     pub fn source_collection(&self) -> Option<CollectionId> {
         match &self.plan {
-            compile::Plan::Write(compile::WritePlan::Insert { collection, .. }) => Some(*collection),
+            compile::Plan::Write(compile::WritePlan::Insert { collection, .. })
+            | compile::Plan::Write(compile::WritePlan::Update { collection, .. })
+            | compile::Plan::Write(compile::WritePlan::UpdateWhere { collection, .. }) => {
+                Some(*collection)
+            }
             _ => self.select_plan().map(|select| select.collection),
         }
     }
@@ -811,7 +821,11 @@ impl PreparedSql {
     pub fn returns_rows_from_a_write(&self) -> bool {
         matches!(
             &self.plan,
-            compile::Plan::Write(compile::WritePlan::Insert { returning, .. }) if !returning.columns.is_empty()
+            compile::Plan::Write(
+                compile::WritePlan::Insert { returning, .. }
+                | compile::WritePlan::Update { returning, .. }
+                | compile::WritePlan::UpdateWhere { returning, .. }
+            ) if !returning.columns.is_empty()
         )
     }
 
