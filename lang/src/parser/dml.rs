@@ -24,32 +24,40 @@ impl Parser {
             }
             self.expect(&Tok::RParen)?;
         }
-        self.expect_word("VALUES")?;
+        // `INSERT ... SELECT`: the rows come from a query, not a `VALUES`
+        // tuple list. The SELECT is parsed as its own statement and mapped by
+        // position onto the named columns while the INSERT compiles.
         let mut rows = Vec::new();
-        loop {
-            self.expect(&Tok::LParen)?;
-            let mut values = Vec::new();
+        let mut select = None;
+        if self.word().as_deref() == Some("SELECT") {
+            select = Some(Box::new(self.select()?));
+        } else {
+            self.expect_word("VALUES")?;
             loop {
-                values.push(self.value_literal()?);
+                self.expect(&Tok::LParen)?;
+                let mut values = Vec::new();
+                loop {
+                    values.push(self.value_literal()?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                if !columns.is_empty() && values.len() != columns.len() {
+                    return Err(SqlError::syntax(
+                        format!(
+                            "row {} has {} value(s) for {} column(s)",
+                            rows.len() + 1,
+                            values.len(),
+                            columns.len()
+                        ),
+                        self.here(),
+                    ));
+                }
+                rows.push(values);
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
-            }
-            self.expect(&Tok::RParen)?;
-            if !columns.is_empty() && values.len() != columns.len() {
-                return Err(SqlError::syntax(
-                    format!(
-                        "row {} has {} value(s) for {} column(s)",
-                        rows.len() + 1,
-                        values.len(),
-                        columns.len()
-                    ),
-                    self.here(),
-                ));
-            }
-            rows.push(values);
-            if !self.eat(&Tok::Comma) {
-                break;
             }
         }
         let on_conflict = if self.eat_word("ON") {
@@ -132,6 +140,7 @@ impl Parser {
             table,
             columns,
             rows,
+            select,
             on_conflict,
             returning,
         })

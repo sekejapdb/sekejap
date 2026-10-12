@@ -1010,6 +1010,10 @@ pub(super) enum Stmt {
         /// the table, in its order (edge tables only).
         columns: Vec<String>,
         rows: Vec<Vec<Literal>>,
+        /// `INSERT ... SELECT`: the source query, whose output columns map by
+        /// position onto the named `columns` (0.20). `None` is the `VALUES`
+        /// form above, which fills `rows` instead.
+        select: Option<Box<SelectStmt>>,
         /// `ON CONFLICT (...) DO NOTHING | DO UPDATE SET c = EXCLUDED.c`.
         on_conflict: Option<ConflictClause>,
         /// `RETURNING _key, *, col`: empty when the statement has none.

@@ -101,7 +101,7 @@ use row::*;
 
 pub(crate) use aggregate::AggregatePlan;
 pub(crate) use bind::{Binder, Rebind};
-pub(crate) use plan::{GqlSqlPlan, Plan, Returning, SelectPlan, WritePlan};
+pub(crate) use plan::{ColumnSink, GqlSqlPlan, Plan, Returning, SelectPlan, WritePlan};
 pub(crate) use row::bytea_text;
 pub(crate) use rows::RowsPlan;
 
@@ -234,10 +234,16 @@ impl Compiler<'_> {
                 table,
                 columns,
                 rows,
+                select,
                 on_conflict,
                 returning,
             } => match self.edge_table_of(&table)? {
                 Some((c, edge)) => {
+                    if select.is_some() {
+                        return Err(SqlError::unsupported(format!(
+                            "INSERT INTO {table} SELECT ...: `{table}` is an edge table, whose rows are edges; an edge table is filled from a `VALUES` tuple list"
+                        )));
+                    }
                     if !returning.is_empty() {
                         return Err(SqlError::unsupported(format!(
                             "INSERT INTO {table} ... RETURNING: `{table}` is an edge table, whose rows are edges with no key to return; RETURNING is answered for a table of rows"
@@ -248,10 +254,21 @@ impl Compiler<'_> {
                 None => {
                     if columns.is_empty() {
                         return Err(SqlError::unsupported(format!(
-                            "INSERT INTO {table} VALUES with no column list: name the columns, `_key` among them"
+                            "INSERT INTO {table} with no column list: name the columns, `_key` among them"
                         )));
                     }
-                    Plan::Write(self.insert(&table, &columns, &rows, on_conflict, &returning)?)
+                    match select {
+                        Some(select) => Plan::Write(self.insert_select(
+                            &table,
+                            &columns,
+                            *select,
+                            on_conflict,
+                            &returning,
+                        )?),
+                        None => {
+                            Plan::Write(self.insert(&table, &columns, &rows, on_conflict, &returning)?)
+                        }
+                    }
                 }
             },
             Stmt::Update { table, .. } | Stmt::Delete { table, .. }

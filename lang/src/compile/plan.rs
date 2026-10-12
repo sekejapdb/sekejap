@@ -899,6 +899,21 @@ impl Returning {
     }
 }
 
+/// Where one `INSERT ... SELECT` output column goes, aligned by position with
+/// the SELECT's columns.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ColumnSink {
+    /// This output column supplies the row's external key; it is drained for
+    /// the key and written into no document field.
+    Key,
+    /// A scalar target column, whose value is checked against this `Kind` when
+    /// the row is produced (the value is the row's, not the statement's).
+    Scalar { column: String, kind: Kind },
+    /// A declared TIMESTAMPTZ/DATE target, which reads the ISO text the SELECT
+    /// prints back to the microseconds it is stored as.
+    Time { column: String },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum WritePlan {
     Insert {
@@ -915,6 +930,22 @@ pub(crate) enum WritePlan {
         /// `RETURNING`: empty for none. A row the statement did not write
         /// (`DO NOTHING` on a taken key) returns nothing, as in PostgreSQL.
         returning: Returning,
+    },
+    /// `INSERT INTO t (cols) SELECT ...`: the compiled source query, and one
+    /// [`ColumnSink`] per output column saying where it goes. The SELECT runs
+    /// when this write runs, and each row is written through `Database::insert`
+    /// like one `VALUES` tuple (0.20).
+    InsertSelect {
+        collection: CollectionId,
+        select: Box<SelectPlan>,
+        /// One per SELECT output column, in order.
+        sinks: Vec<ColumnSink>,
+        /// The output column that supplies the key, or `None` to mint one per
+        /// row from the key's DEFAULT.
+        key_at: Option<usize>,
+        /// The named PRIMARY KEY column, which a minted key is also written
+        /// into (so the row carries it as a field, as the VALUES form does).
+        key_column: Option<String>,
     },
     Update {
         collection: CollectionId,
@@ -1082,10 +1113,10 @@ pub(super) fn field_value(row: &Value, name: &str) -> SqlValue {
 /// `Kind` before it is stored. The check is at RUN time because the value is
 /// the row's, not the statement's; a literal is checked while the statement
 /// compiles, where it belongs.
-fn stored_value(kind: &Kind, column: &str, value: SqlValue) -> Result<Value, String> {
+fn stored_value(kind: &Kind, column: &str, value: SqlValue, context: &str) -> Result<Value, String> {
     let mismatch = |what: &str| {
         Err(format!(
-            "UPDATE ... SET `{column}`: the column is {what} and the row expression produced a value that is not"
+            "{context} `{column}`: the column is {what} and the value produced is not"
         ))
     };
     Ok(match value {
@@ -1118,6 +1149,37 @@ fn stored_value(kind: &Kind, column: &str, value: SqlValue) -> Result<Value, Str
 
 fn engine_error(message: String) -> sekejap_core::collections::Error {
     sekejap_core::collections::Error::InvalidInput(message)
+}
+
+/// The external key an `INSERT ... SELECT` output column supplies. A text or a
+/// whole number names a key; a null is PostgreSQL's 23502, and anything else
+/// is not a key.
+fn insert_select_key(value: Option<&SqlValue>) -> SqlResult2<String> {
+    match value {
+        Some(SqlValue::Text(text)) => Ok(text.clone()),
+        Some(SqlValue::Int(i)) => Ok(i.to_string()),
+        None | Some(SqlValue::Null | SqlValue::Missing) => Err(SqlError::coded(
+            "23502",
+            "INSERT ... SELECT: the SELECT produced a null key, and the key column is not null",
+        )),
+        Some(_) => Err(SqlError::unsupported(
+            "INSERT ... SELECT: the SELECT produced a key that is not text",
+        )),
+    }
+}
+
+/// A declared TIMESTAMPTZ/DATE target's value for one `INSERT ... SELECT` row:
+/// the ISO text a SELECT prints, read back to stored microseconds; the stored
+/// integer itself, unchanged; or NULL.
+fn insert_select_time(value: &SqlValue, column: &str) -> SqlResult2<Value> {
+    match value {
+        SqlValue::Null | SqlValue::Missing => Ok(Value::Null),
+        SqlValue::Int(micros) => Ok(Value::from(*micros)),
+        SqlValue::Text(text) => Ok(Value::from(crate::functions::parse_timestamp(text)?)),
+        _ => Err(SqlError::unsupported(format!(
+            "INSERT ... SELECT into `{column}`: the column is a timestamp and the value produced is not"
+        ))),
+    }
 }
 
 impl WritePlan {
@@ -1312,6 +1374,73 @@ impl WritePlan {
                     }
                 }
             }
+            Self::InsertSelect {
+                collection,
+                select,
+                sinks,
+                key_at,
+                key_column,
+            } => {
+                // Run the source SELECT to exhaustion first, collecting its
+                // rows, because the write below needs the mutable borrow the
+                // read cannot hold. The same page loop `rows()` runs.
+                let produced: Vec<Vec<SqlValue>> = {
+                    let mut out = Vec::new();
+                    select.with_query(&*db, &mut |prepared| {
+                        loop {
+                            let page = prepared.next_page(crate::PAGE, budget, || false)?;
+                            for row in &page.rows {
+                                // An INNER join drops a driving row with no match.
+                                if let Some(row) = select.row(&*db, row)? {
+                                    out.push(row.values);
+                                }
+                            }
+                            if page.done || page.rows.is_empty() {
+                                break;
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    out
+                };
+                let mut affected = 0u64;
+                for values in produced {
+                    let key = match key_at {
+                        Some(at) => insert_select_key(values.get(at))?,
+                        None => db.mint_key(collection)?.ok_or_else(|| {
+                            SqlError::coded(
+                                "23502",
+                                "the INSERT names no key and the table declares no key DEFAULT",
+                            )
+                        })?,
+                    };
+                    let mut document = serde_json::Map::new();
+                    for (sink, value) in sinks.iter().zip(&values) {
+                        match sink {
+                            ColumnSink::Key => {}
+                            ColumnSink::Scalar { column, kind } => {
+                                let stored =
+                                    stored_value(kind, column, value.clone(), "INSERT ... SELECT into")
+                                        .map_err(SqlError::unsupported)?;
+                                document.insert(column.clone(), stored);
+                            }
+                            ColumnSink::Time { column } => {
+                                document.insert(column.clone(), insert_select_time(value, column)?);
+                            }
+                        }
+                    }
+                    // A minted key is written into the named PRIMARY KEY
+                    // column too, so the row carries it as a field.
+                    if key_at.is_none() {
+                        if let Some(column) = &key_column {
+                            document.insert(column.clone(), Value::String(key.clone()));
+                        }
+                    }
+                    db.insert(collection, &key, &Value::Object(document))?;
+                    affected += 1;
+                }
+                SqlResult::Affected(affected)
+            }
             Self::Update {
                 collection,
                 key,
@@ -1355,7 +1484,7 @@ impl WritePlan {
                             let produced = expr
                                 .eval(&values)
                                 .map_err(|e| engine_error(e.to_string()))?;
-                            stored_value(&kind, &column, produced).map_err(engine_error)
+                            stored_value(&kind, &column, produced, "UPDATE ... SET").map_err(engine_error)
                         }));
                     }
                 }

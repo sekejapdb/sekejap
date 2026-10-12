@@ -92,8 +92,10 @@
 //! operand   := var | var '.' name | number | string | TRUE | FALSE | NULL
 //!            | '$' n
 //!
-//! insert    := INSERT INTO name '(' names ')' VALUES '(' values ')'
-//!                                                  (',' '(' values ')')*
+//! insert    := INSERT INTO name '(' names ')'
+//!                ( VALUES '(' values ')' (',' '(' values ')')* | select )
+//!              -- INSERT ... SELECT maps the query's columns by position onto
+//!                 the named columns
 //! update    := UPDATE name SET (name '=' set_value)+ WHERE where_tail
 //! delete    := DELETE FROM (name | ALL) [WHERE conj] [RESTRICT | CASCADE]
 //! set_value := value | expression        -- a row function over the SAME row

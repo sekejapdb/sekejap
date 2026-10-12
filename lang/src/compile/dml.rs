@@ -112,6 +112,126 @@ impl Compiler<'_> {
         })
     }
 
+    /// `INSERT INTO t (cols) SELECT ...`: the source query's output columns map
+    /// BY POSITION onto the named `cols`, as in PostgreSQL. The SELECT compiles
+    /// to an ordinary row plan here and RUNS when the INSERT runs; each row it
+    /// produces is written like one `VALUES` tuple, through `Database::insert`,
+    /// so NOT NULL, foreign keys, unique keys and column DEFAULTs all hold the
+    /// same way the `VALUES` form holds them.
+    pub(super) fn insert_select(
+        &mut self,
+        table: &str,
+        columns: &[String],
+        select: SelectStmt,
+        on_conflict: Option<ConflictClause>,
+        returning: &[ReturningItem],
+    ) -> SqlResult2<WritePlan> {
+        let c = collection(self.db, table)?;
+        if !returning.is_empty() {
+            return Err(SqlError::unsupported(
+                "INSERT ... SELECT ... RETURNING: the rows a SELECT writes are not reported back yet; read them afterward with a SELECT",
+            ));
+        }
+        if on_conflict.is_some() {
+            return Err(SqlError::unsupported(
+                "INSERT ... SELECT ... ON CONFLICT: a conflict clause on a SELECT source is not built yet; the VALUES form takes one",
+            ));
+        }
+        // The source must be an ordinary row SELECT: an aggregate, a catalog
+        // relation or an edge table as the source is a separate slice.
+        if Self::catalog_source(&select).is_some() {
+            return Err(SqlError::unsupported(
+                "INSERT ... SELECT from a catalog relation is not built yet",
+            ));
+        }
+        if self.edge_source(&select)?.is_some() {
+            return Err(SqlError::unsupported(
+                "INSERT ... SELECT from an edge table is not built yet: an edge table's rows are edges, not a table of rows",
+            ));
+        }
+        if self.aggregate(&select)?.is_some() {
+            return Err(SqlError::unsupported(
+                "INSERT ... SELECT from an aggregate (COUNT/SUM/GROUP BY/DISTINCT) is not built yet",
+            ));
+        }
+        let source = self.select(select)?;
+        // One target column per SELECT output column, in order. A different
+        // count is PostgreSQL's 42601, raised while the statement compiles so
+        // nothing is written.
+        if source.columns.len() != columns.len() {
+            return Err(SqlError::coded(
+                crate::sqlstate::SYNTAX_ERROR,
+                format!(
+                    "INSERT has {} target column(s) but the SELECT produces {}",
+                    columns.len(),
+                    source.columns.len()
+                ),
+            ));
+        }
+        // Where the key comes from: `_key` or the named PRIMARY KEY among the
+        // columns, else the key's DEFAULT minted per row. The same rule the
+        // VALUES INSERT follows.
+        let spec = self.db.collection_info(c).map_err(SqlError::from)?.key;
+        let named = spec.as_ref().and_then(|k| k.column.clone());
+        let key_at = match columns.iter().position(|name| is_key_column(name)) {
+            Some(at) => Some(at),
+            None => match named.as_ref().and_then(|col| columns.iter().position(|n| n == col)) {
+                Some(at) => Some(at),
+                None if spec.as_ref().is_some_and(|k| k.default.is_some()) => None,
+                None => {
+                    let column = named.clone().unwrap_or_else(|| KEY_COLUMN.to_owned());
+                    return Err(SqlError::coded(
+                        "23502",
+                        format!(
+                            "null value in column \"{column}\" of relation \"{table}\" violates not-null constraint: the INSERT names no key; name `{column}`, or declare the key with DEFAULT ulid() / uuid4()"
+                        ),
+                    ));
+                }
+            },
+        };
+        // One sink per output column, in order. The key column is drained for
+        // the row key; a declared TIMESTAMPTZ/DATE reads the ISO text a SELECT
+        // prints back to its stored microseconds; a GEOMETRY/POINT/VECTOR has
+        // no round-trip through a SELECT yet and is refused by name.
+        let mut sinks = Vec::with_capacity(columns.len());
+        for (at, column) in columns.iter().enumerate() {
+            if Some(at) == key_at {
+                sinks.push(ColumnSink::Key);
+                continue;
+            }
+            let kind = self.kind_of(c, column)?;
+            if self.time_column(c, column)?.is_some() {
+                sinks.push(ColumnSink::Time {
+                    column: column.clone(),
+                });
+                continue;
+            }
+            match kind {
+                Kind::Geo | Kind::Point => {
+                    return Err(SqlError::unsupported(format!(
+                        "INSERT ... SELECT into `{column}`: a GEOMETRY/POINT value does not round-trip through a SELECT yet; write it with a VALUES tuple"
+                    )));
+                }
+                Kind::Vector(_) => {
+                    return Err(SqlError::unsupported(format!(
+                        "INSERT ... SELECT into `{column}`: a VECTOR value does not round-trip through a SELECT yet; write it with a VALUES tuple"
+                    )));
+                }
+                kind => sinks.push(ColumnSink::Scalar {
+                    column: column.clone(),
+                    kind,
+                }),
+            }
+        }
+        Ok(WritePlan::InsertSelect {
+            collection: c,
+            select: Box::new(source),
+            sinks,
+            key_at,
+            key_column: named,
+        })
+    }
+
     /// The columns an INSERT's `RETURNING` answers, each with how it is read
     /// back from the stored row: `_key` from the row's key, `*` as the
     /// columns `SELECT *` answers, a declared TIMESTAMPTZ/DATE as the ISO
