@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.20.0
+
+Relational shapes an application reaches for when the relationship is a
+mandatory label rather than a graph to walk: foreign keys, joins, and the
+writes that go with them. Additive -- a 0.19 database opens unchanged, and a
+0.20 database an older binary cannot serve is refused cleanly, never read as
+corrupt.
+
+- **Entity foreign keys.** A column declared `REFERENCES other` must name a
+  row of that table: enforced on `INSERT` and `UPDATE` (PostgreSQL's `23503`
+  when it does not), and a `DELETE` of a row still referenced is refused
+  (`RESTRICT`), the referencing table and column named. The check rides the
+  referencing column's automatic index, so it never scans.
+- **Key-equality JOIN.** `INNER`/`LEFT JOIN other ON other._key = t.col` reads
+  a table together with the rows its foreign key names, one key lookup per
+  row. The key may be written on either side of the `ON`. Other join kinds
+  (`RIGHT`/`FULL`/`CROSS`/`NATURAL`), a second join, a non-key join, and a
+  right-side filter are refused by name.
+- **Compare-and-set works.** A conditional update of the column it sets --
+  `UPDATE t SET status = 'running' WHERE _key = $1 AND status = 'queued'` --
+  was refused; a WHERE that names the key now drives the write by the key, so
+  the claim every job queue and state machine is built on affects the one row
+  the first caller claims and none for every later one.
+- **`INSERT ... SELECT`.** `INSERT INTO t (a, b) SELECT x, y FROM s` writes the
+  rows a query produces, mapped by position, through the same path a `VALUES`
+  insert takes -- so NOT NULL, foreign keys, unique keys and column DEFAULTs
+  all hold. A declared timestamp round-trips.
+- **`UPDATE ... RETURNING`.** A conditional update reports the rows it changed
+  with their new values, as `INSERT ... RETURNING` does. Both the keyed and
+  the predicated form serve it.
+- **Arithmetic in the select list.** `price + tax`, `n - 1`, and -- the one
+  dogfooding reported -- subtracting two timestamps, which gives the number of
+  seconds between them (there is no interval type).
+
 ## 0.19.4
 
 A `DROP TABLE` fix found by application dogfooding: a large table could fail
