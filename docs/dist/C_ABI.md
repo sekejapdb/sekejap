@@ -231,7 +231,7 @@ through the same door, with `-1` or `NULL` and the reason in
 
 ```sql refused
 -- refused 0A000: JOIN
-SELECT p.title FROM posts p JOIN people ON people._key = p.title
+SELECT p.title FROM posts p FULL JOIN people ON people._key = p.title
 ```
 
 A cached plan is the `Db::query` door: the statement text is looked up in the

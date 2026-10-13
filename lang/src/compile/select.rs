@@ -135,6 +135,17 @@ impl Compiler<'_> {
                     "JOIN with an edge table: an edge table is already a join over the graph; `SELECT ... FROM <edge table>` reads it",
                 ));
             }
+            // The driving (left) side of the join is a STORED column holding
+            // the right table's key -- a foreign key. The row's own `_key` /
+            // `_id` is not such a column (it is the identity, not a value
+            // field), so a join written on it is refused by name rather than
+            // failing to resolve a column that is not declared.
+            if is_key_column(&join.left_column) || join.left_column == ID_COLUMN {
+                return Err(SqlError::unsupported(format!(
+                    "JOIN ON {}.{} = {}._key: the left side of a join is a column holding the right table's key (a foreign key), not the row's own `{}`",
+                    join.left, join.left_column, join.table, join.left_column
+                )));
+            }
             // The driving key column must exist and be projected, so the row
             // executor can read the right key from it.
             self.kind_of(c, &join.left_column)?;

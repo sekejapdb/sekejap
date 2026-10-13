@@ -300,7 +300,7 @@ client is given (`docs/dist/WIRE_CONTRACT.md` §8) and the construct:
 
 ```sql refused
 -- refused 0A000: JOIN
-SELECT p.title FROM posts p JOIN people ON people._key = p.title
+SELECT p.title FROM posts p FULL JOIN people ON people._key = p.title
 ```
 
 The harness asserts the statement was refused AND that the refusal carries

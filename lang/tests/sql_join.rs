@@ -164,4 +164,14 @@ fn an_unsupported_join_is_refused() {
         "SELECT tour.title FROM tour FULL JOIN island ON island._key = tour.island",
     );
     assert!(!m.is_empty(), "FULL JOIN is refused: {m}");
+    // A join whose LEFT side is the row's own key is refused by name -- a
+    // clean message, not an internal "no column `_key`" error.
+    let m = refusal(
+        &mut db,
+        "SELECT tour._key FROM tour JOIN island ON island._key = tour._key",
+    );
+    assert!(
+        m.contains("foreign key") && !m.to_ascii_uppercase().contains("XX000"),
+        "a join on the left key is refused cleanly, not XX000: {m}"
+    );
 }

@@ -1645,7 +1645,7 @@ SELECT percentile_cont(0.5) AS p FROM place
 
 ```sql refused
 -- refused 0A000: JOIN
-SELECT p._key FROM place AS p INNER JOIN place AS q ON p._key = q._key
+SELECT p._key FROM place AS p FULL JOIN place AS q ON p._key = q._key
 ```
 
 ```sql

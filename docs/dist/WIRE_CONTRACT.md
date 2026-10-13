@@ -481,7 +481,7 @@ so the table above and these blocks cannot disagree:
 
 ```sql refused
 -- refused 0A000: JOIN
-SELECT p.title FROM posts p JOIN people ON people._key = p.title
+SELECT p.title FROM posts p FULL JOIN people ON people._key = p.title
 ```
 
 ```sql refused
