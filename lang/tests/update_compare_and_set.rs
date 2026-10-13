@@ -75,6 +75,34 @@ fn a_compare_and_set_claims_the_row_once() {
 }
 
 #[test]
+fn a_claim_that_sets_a_clock_is_not_refused() {
+    // The exact dogfood shape: two CONSTANT set values (a literal and the
+    // clock `now()`) and a key equality AND a predicate on the status column
+    // the claim sets. It drives by the key, so setting the indexed status is
+    // not refused.
+    let dir = TempDir::new().unwrap();
+    let mut db = Database::create(dir.path().join("q"), cfg()).unwrap();
+    run(&mut db, "CREATE TABLE step (_key TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'queued', started_at TIMESTAMPTZ)");
+    run(&mut db, "INSERT INTO step (_key) VALUES ('s1')");
+    let claim =
+        "UPDATE step SET status = 'running', started_at = now() WHERE _key = $1 AND status = 'queued'";
+    // The first worker claims it; a second finds it already running.
+    assert_eq!(affected(&mut db, claim, &[Param::Text("s1".into())]), 1);
+    assert_eq!(affected(&mut db, claim, &[Param::Text("s1".into())]), 0);
+    // It moved to running, and started_at was stamped (not null).
+    match one(&mut db, "SELECT status, started_at FROM step WHERE _key = 's1'").as_slice() {
+        [SqlValue::Text(status), started_at] => {
+            assert_eq!(status, "running");
+            assert!(
+                !matches!(started_at, SqlValue::Null | SqlValue::Missing),
+                "started_at was stamped by now(), got {started_at:?}"
+            );
+        }
+        other => panic!("unexpected row {other:?}"),
+    }
+}
+
+#[test]
 fn the_set_column_keeps_its_automatic_index() {
     let dir = TempDir::new().unwrap();
     let mut db = Database::create(dir.path().join("q"), cfg()).unwrap();
